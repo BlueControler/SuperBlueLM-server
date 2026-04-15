@@ -15,7 +15,7 @@ class MockPortalClient:
         self.current_package = "com.android.launcher"
         self.current_activity = "Launcher"
         self._running = True
-        self._next_number = 1
+        self._next_request_id = 1
 
     async def run(self, url: str = "ws://127.0.0.1:8765/ws/devices") -> None:
         async with connect(f"{url}/{self.device_id}") as websocket:
@@ -25,7 +25,7 @@ class MockPortalClient:
                     {
                         "type": "request",
                         "message": "connect",
-                        "number": self._next_number,
+                        "requestId": self._next_request_id,
                         "data": {
                             "token": "demo-token",
                             "width": self.width,
@@ -40,7 +40,7 @@ class MockPortalClient:
                 + "\n"
             )
             print("[client] -> connect")
-            self._next_number += 1
+            self._next_request_id += 1
 
             heartbeat = asyncio.create_task(self._heartbeat_loop(websocket))
             try:
@@ -49,14 +49,14 @@ class MockPortalClient:
                     if envelope["type"] != "request":
                         continue
                     print(
-                        f"[client] <- number={envelope.get('number')} "
+                        f"[client] <- requestId={envelope.get('requestId')} "
                         f"message={envelope['message']} data={envelope.get('data')}"
                     )
                     response = self._handle_server_request(
                         envelope["message"], envelope.get("data")
                     )
                     print(
-                        f"[client] -> number={envelope.get('number')} "
+                        f"[client] -> requestId={envelope.get('requestId')} "
                         f"message=actionResult data={response}"
                     )
                     await websocket.send(
@@ -65,7 +65,7 @@ class MockPortalClient:
                                 "type": "response",
                                 "message": "actionResult",
                                 "data": response,
-                                "number": envelope.get("number"),
+                                "requestId": envelope.get("requestId"),
                             }
                         )
                         + "\n"

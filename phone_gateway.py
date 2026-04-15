@@ -21,7 +21,7 @@ class MessageEnvelope(BaseModel):
     type: Literal["request", "response"]
     message: str
     data: Any = None
-    number: int | None = None
+    requestId: int | None = None
 
 
 class ConnectData(BaseModel):
@@ -71,7 +71,7 @@ class ConnectedDeviceSession:
         self._request_lock = asyncio.Lock()
         self._pending_response: asyncio.Future[MessageEnvelope] | None = None
         self._reader_task: asyncio.Task[None] | None = None
-        self._next_number: int | None = None
+        self._next_request_id: int | None = None
 
     async def start(self) -> None:
         self._reader_task = asyncio.create_task(self._reader_loop())
@@ -96,15 +96,15 @@ class ConnectedDeviceSession:
         async with self._request_lock:
             loop = asyncio.get_running_loop()
             self._pending_response = loop.create_future()
-            request_number = self._consume_next_number()
+            request_id = self._consume_next_request_id()
             payload = MessageEnvelope(
                 type="request",
                 message=message,
                 data=data,
-                number=request_number,
+                requestId=request_id,
             )
             print(
-                f"[server] -> device={self.device_id} number={request_number} "
+                f"[server] -> device={self.device_id} requestId={request_id} "
                 f"message={payload.message} data={payload.data}"
             )
             await self.websocket.send(payload.model_dump_json(exclude_none=True) + "\n")
@@ -114,12 +114,12 @@ class ConnectedDeviceSession:
                 self._pending_response = None
 
         print(
-            f"[server] <- device={self.device_id} number={response.number} "
+            f"[server] <- device={self.device_id} requestId={response.requestId} "
             f"message={response.message} data={response.data}"
         )
-        if response.number != request_number:
+        if response.requestId != request_id:
             raise DeviceGatewayError(
-                f"Expected response number {request_number}, got {response.number}."
+                f"Expected response requestId {request_id}, got {response.requestId}."
             )
 
         if response.message == "error":
@@ -176,12 +176,12 @@ class ConnectedDeviceSession:
                 current_package=connect_data.currentPackage,
                 activity=connect_data.activity,
             )
-            self._next_number = (envelope.number or 0) + 1
+            self._next_request_id = (envelope.requestId or 0) + 1
             self.ready.set()
             print(
                 f"[server] device connected: deviceId={self.device_id} "
                 f"size={connect_data.width}x{connect_data.height} "
-                f"numberStart={self._next_number}"
+                f"requestIdStart={self._next_request_id}"
             )
             return
 
@@ -196,17 +196,17 @@ class ConnectedDeviceSession:
             type="response",
             message="error",
             data=ErrorData(message=f"Unsupported client request: {envelope.message}").model_dump(),
-            number=envelope.number,
+            requestId=envelope.requestId,
         )
         await self.websocket.send(response.model_dump_json(exclude_none=True) + "\n")
 
-    def _consume_next_number(self) -> int:
-        if self._next_number is None:
+    def _consume_next_request_id(self) -> int:
+        if self._next_request_id is None:
             raise DeviceGatewayError(
-                f"Device {self.device_id} has not initialized the number sequence."
+                f"Device {self.device_id} has not initialized the requestId sequence."
             )
-        current = self._next_number
-        self._next_number += 1
+        current = self._next_request_id
+        self._next_request_id += 1
         return current
 
     def _update_device_info(

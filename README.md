@@ -33,4 +33,4 @@ python main.py --host 127.0.0.1 --port 8765
 3. 输入 `/quit` 停止服务。
 
 {"type":"request","message":"launch","requestId":2,"data":{"package":"com.android.settings"}}
-{"type": "request","message": "back","requestId":3,"data": null}
+{"type":"request","message":"back","requestId":3,"data":null}
