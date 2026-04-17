@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import suppress
+from typing import Any
 
 from websockets.asyncio.server import serve
 
@@ -14,7 +15,7 @@ async def agent_console_loop(gateway: DeviceGateway, stop_event: asyncio.Event) 
     print("[system] 输入自然语言任务并回车，Agent 会通过 websocket tools 操作已连接手机")
     print("[system] 输入 /quit 关闭服务")
 
-    conversation_messages: list[dict] = []
+    conversation_messages: list[dict[str, Any]] = []
     agent = build_agent(gateway)
 
     while not stop_event.is_set():
@@ -35,22 +36,33 @@ async def agent_console_loop(gateway: DeviceGateway, stop_event: asyncio.Event) 
 
         conversation_messages.append(build_observation_message(session, text))
         result = await agent.ainvoke({"messages": conversation_messages})
-
-        if isinstance(result, dict) and "messages" in result:
-            conversation_messages = list(result["messages"])
-            final_message = _extract_last_text(conversation_messages)
-            if final_message:
-                print(f"[assistant] {final_message}")
-        else:
-            print(f"[assistant] {result}")
+        conversation_messages, final_message = _consume_agent_result(conversation_messages, result)
+        if final_message:
+            print(f"[assistant] {final_message}")
 
 
-def _extract_last_text(messages: list[dict]) -> str | None:
+def _consume_agent_result(
+    conversation_messages: list[dict[str, Any]],
+    result: object,
+) -> tuple[list[dict[str, Any]], str | None]:
+    if isinstance(result, dict) and "messages" in result:
+        messages = list(result["messages"])
+        return messages, _extract_last_text(messages)
+
+    if isinstance(result, str):
+        return conversation_messages, result
+
+    return conversation_messages, str(result) if result is not None else None
+
+
+def _extract_last_text(messages: list[object]) -> str | None:
     for message in reversed(messages):
-        if message.get("role") != "assistant":
+        role = _get_field(message, "role")
+        message_type = _get_field(message, "type")
+        if role not in {"assistant", "tool"} and message_type not in {"ai", "tool"}:
             continue
 
-        content = message.get("content")
+        content = _get_field(message, "content")
         if isinstance(content, str):
             return content
         if isinstance(content, list):
@@ -63,6 +75,12 @@ def _extract_last_text(messages: list[dict]) -> str | None:
             if text:
                 return text
     return None
+
+
+def _get_field(message: object, field: str) -> object:
+    if isinstance(message, dict):
+        return message.get(field)
+    return getattr(message, field, None)
 
 
 async def run_server(host: str, port: int) -> None:
