@@ -8,7 +8,7 @@ from typing import Any
 
 from websockets.asyncio.server import serve
 
-from custom_deep_agent import build_agent, build_observation_message
+from custom_deep_agent import build_agent, build_state_snapshot_message, build_user_message
 from phone_gateway import DeviceGateway, DeviceGatewayError
 
 
@@ -35,7 +35,9 @@ async def agent_console_loop(gateway: DeviceGateway, stop_event: asyncio.Event) 
             print(f"[system] {exc}")
             continue
 
-        conversation_messages.append(build_observation_message(session, text))
+        await _ensure_initial_observation(session)
+        conversation_messages.append(build_user_message(text))
+        conversation_messages.append(build_state_snapshot_message(session))
         try:
             result = await agent.ainvoke({"messages": conversation_messages})
         except Exception as exc:
@@ -44,6 +46,21 @@ async def agent_console_loop(gateway: DeviceGateway, stop_event: asyncio.Event) 
         conversation_messages, final_message = _consume_agent_result(conversation_messages, result)
         if final_message:
             print(f"[assistant] {final_message}")
+
+
+async def _ensure_initial_observation(session) -> None:
+    device_info = session.device_info
+    if device_info is None:
+        return
+
+    if device_info.screenshot:
+        return
+
+    try:
+        await session.send_command("observe", None)
+        print(f"[system] 首轮缺少截图，已为设备 {session.device_id} 自动补一次 observe")
+    except Exception as exc:
+        print(f"[system] 自动补 observe 失败：{exc}")
 
 
 def _consume_agent_result(

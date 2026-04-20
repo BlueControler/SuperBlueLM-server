@@ -14,6 +14,8 @@ from phone_gateway import ConnectedDeviceSession, DeviceGateway
 from phone_tools import create_phone_tools
 from prompt_assets import SYSTEM_PROMPT, TOOL_PROMPT
 
+STATE_MESSAGE_PREFIX = "[PHONE_STATE]"
+
 
 def _message_content(message: Any) -> Any:
     if isinstance(message, dict):
@@ -104,6 +106,28 @@ def _remove_old_images_from_messages(messages: list[Any]) -> list[Any]:
     return filtered_messages
 
 
+def _is_phone_state_message(message: Any) -> bool:
+    content = _message_content(message)
+    if not isinstance(content, list) or not content:
+        return False
+
+    first = content[0]
+    return (
+        isinstance(first, dict)
+        and first.get("type") == "text"
+        and isinstance(first.get("text"), str)
+        and first["text"].startswith(STATE_MESSAGE_PREFIX)
+    )
+
+
+def _replace_phone_state_message(
+    messages: list[Any], session: ConnectedDeviceSession
+) -> list[Any]:
+    filtered_messages = [m for m in messages if not _is_phone_state_message(m)]
+    filtered_messages.append(build_state_snapshot_message(session))
+    return filtered_messages
+
+
 @before_model
 def remove_old_images(
     state: AgentState[StateT],
@@ -125,13 +149,39 @@ def remove_old_images(
     }
 
 
+def make_sync_phone_state_middleware(gateway: DeviceGateway):
+    @before_model
+    def sync_phone_state(
+        state: AgentState[StateT],
+        runtime: Runtime,
+    ) -> dict[str, Any] | None:
+        try:
+            session = gateway.get_default_device()
+        except Exception:
+            return None
+
+        messages = list(state["messages"])
+        updated_messages = _replace_phone_state_message(messages, session)
+        if updated_messages == messages:
+            return None
+
+        return {
+            "messages": [
+                RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                *updated_messages,
+            ],
+        }
+
+    return sync_phone_state
+
+
 def build_agent(gateway: DeviceGateway):
     model = _build_model()
     return create_deep_agent(
         model=model,
         tools=create_phone_tools(gateway),
         system_prompt=f"{SYSTEM_PROMPT}\n\n{TOOL_PROMPT}",
-        middleware=[remove_old_images],
+        middleware=[remove_old_images, make_sync_phone_state_middleware(gateway)],
     )
 
 
@@ -151,7 +201,11 @@ def _build_model():
     return "openai:gpt-5.4"
 
 
-def build_observation_message(session: ConnectedDeviceSession, user_text: str) -> dict[str, Any]:
+def build_user_message(user_text: str) -> dict[str, Any]:
+    return {"role": "user", "content": user_text}
+
+
+def build_state_snapshot_message(session: ConnectedDeviceSession) -> dict[str, Any]:
     if session.device_info is None:
         raise RuntimeError("Device session has no device_info yet.")
 
@@ -159,9 +213,10 @@ def build_observation_message(session: ConnectedDeviceSession, user_text: str) -
         {
             "type": "text",
             "text": (
-                "用户请求："
-                f"{user_text}\n\n"
+                f"{STATE_MESSAGE_PREFIX}\n"
                 "当前手机页面状态如下，请基于这些信息决定下一步：\n"
+                f"screenWidth={session.device_info.width}\n"
+                f"screenHeight={session.device_info.height}\n"
                 f"currentPackage={session.device_info.current_package}\n"
                 f"activity={session.device_info.activity}\n"
                 f"ui={session.device_info.ui}"
