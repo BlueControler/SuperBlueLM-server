@@ -15,19 +15,18 @@ class MockPortalClient:
         self.current_package = "com.android.launcher"
         self.current_activity = "Launcher"
         self._running = True
-        self._next_request_id = 1
 
-    async def run(self, url: str = "ws://127.0.0.1:8765/ws/devices") -> None:
-        async with connect(f"{url}/{self.device_id}") as websocket:
-            print(f"[client] connecting to {url}/{self.device_id}")
+    async def run(self, url: str = "ws://127.0.0.1:8765/adb") -> None:
+        target_url = self._build_ws_url(url)
+        async with connect(target_url) as websocket:
+            print(f"[client] connecting to {target_url}")
             await websocket.send(
                 json.dumps(
                     {
                         "type": "request",
                         "message": "connect",
-                        "requestId": self._next_request_id,
+                        "requestId": 1,
                         "data": {
-                            "token": "demo-token",
                             "width": self.width,
                             "height": self.height,
                             "screenshot": None,
@@ -40,7 +39,6 @@ class MockPortalClient:
                 + "\n"
             )
             print("[client] -> connect")
-            self._next_request_id += 1
 
             heartbeat = asyncio.create_task(self._heartbeat_loop(websocket))
             try:
@@ -77,6 +75,13 @@ class MockPortalClient:
                 except asyncio.CancelledError:
                     pass
 
+    def _build_ws_url(self, url: str) -> str:
+        if url.endswith("/adb"):
+            return url
+        if url.endswith("/ws/devices") or url.endswith("/ws/device"):
+            return f"{url}/{self.device_id}"
+        return url
+
     async def _heartbeat_loop(self, websocket) -> None:
         while self._running:
             await asyncio.sleep(1)
@@ -91,18 +96,27 @@ class MockPortalClient:
             self.current_package = data["package"]
             self.current_activity = "MainActivity"
             return self._result("launch")
+        if message == "listPackages":
+            return {
+                "packages": [
+                    "com.android.settings",
+                    "com.android.launcher",
+                    "com.example.demo",
+                ]
+            }
+        if message == "keyevent":
+            keyevent = data["keyevent"]
+            if keyevent == 3:
+                self.current_package = "com.android.launcher"
+                self.current_activity = "Launcher"
+            return self._result(f"keyevent:{keyevent}")
         if message in {
             "tap",
             "type",
             "swipe",
             "longPress",
             "doubleTap",
-            "back",
-            "home",
-            "wait",
-            "finish",
             "interact",
-            "takeOver",
         }:
             return self._result(message)
         return self._result(f"unsupported:{message}")

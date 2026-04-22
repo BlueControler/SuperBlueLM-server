@@ -29,13 +29,13 @@ class MessageEnvelope(BaseModel):
 
 
 class ConnectData(BaseModel):
-    token: str
     width: int = Field(ge=1)
     height: int = Field(ge=1)
     screenshot: str | None = None
     ui: str | None = None
     currentPackage: str | None = None
     activity: str | None = None
+    token: str | None = None
 
 
 class ActionResultData(BaseModel):
@@ -58,11 +58,11 @@ class DeviceInfo:
     device_id: str
     width: int
     height: int
-    token: str
     screenshot: str | None
     ui: str | None
     current_package: str | None
     activity: str | None
+    token: str | None = None
 
 
 class ConnectedDeviceSession:
@@ -72,8 +72,9 @@ class ConnectedDeviceSession:
         self.device_info: DeviceInfo | None = None
         self.ready = asyncio.Event()
         self.closed = asyncio.Event()
-        self._request_lock = asyncio.Lock()
-        self._pending_response: asyncio.Future[MessageEnvelope] | None = None
+        self._request_id_lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
+        self._pending_responses: dict[int, asyncio.Future[MessageEnvelope]] = {}
         self._reader_task: asyncio.Task[None] | None = None
         self._next_request_id: int | None = None
 
@@ -97,25 +98,27 @@ class ConnectedDeviceSession:
         if not self.ready.is_set():
             raise DeviceGatewayError(f"Device {self.device_id} has not completed connect.")
 
-        async with self._request_lock:
-            loop = asyncio.get_running_loop()
-            self._pending_response = loop.create_future()
+        loop = asyncio.get_running_loop()
+        async with self._request_id_lock:
             request_id = self._consume_next_request_id()
+            pending_response = loop.create_future()
+            self._pending_responses[request_id] = pending_response
             payload = MessageEnvelope(
                 type="request",
                 message=message,
                 data=data,
                 requestId=request_id,
             )
-            print(
-                f"[server] -> device={self.device_id} requestId={request_id} "
-                f"message={payload.message} data={payload.data}"
-            )
+        print(
+            f"[server] -> device={self.device_id} requestId={request_id} "
+            f"message={payload.message} data={payload.data}"
+        )
+        async with self._send_lock:
             await self.websocket.send(payload.model_dump_json(exclude_none=True) + "\n")
-            try:
-                response = await asyncio.wait_for(self._pending_response, timeout=timeout)
-            finally:
-                self._pending_response = None
+        try:
+            response = await asyncio.wait_for(pending_response, timeout=timeout)
+        finally:
+            self._pending_responses.pop(request_id, None)
 
         print(
             f"[server] <- device={self.device_id} requestId={response.requestId} "
@@ -139,14 +142,9 @@ class ConnectedDeviceSession:
         if response.message != "actionResult":
             raise DeviceGatewayError(f"Expected 'actionResult', got {response.message!r}.")
 
-        action_result = ActionResultData.model_validate(response.data)
-        self._update_device_info(
-            screenshot=action_result.screenshot,
-            ui=action_result.ui,
-            current_package=action_result.currentPackage,
-            activity=action_result.activity,
-        )
-        return action_result.model_dump()
+        action_result = response.data if isinstance(response.data, dict) else {"value": response.data}
+        self._update_device_info_from_payload(action_result)
+        return action_result
 
     async def _reader_loop(self) -> None:
         try:
@@ -165,10 +163,12 @@ class ConnectedDeviceSession:
             pass
         finally:
             self.closed.set()
-            if self._pending_response is not None and not self._pending_response.done():
-                self._pending_response.set_exception(
-                    DeviceGatewayError(f"Device {self.device_id} disconnected.")
-                )
+            for future in list(self._pending_responses.values()):
+                if not future.done():
+                    future.set_exception(
+                        DeviceGatewayError(f"Device {self.device_id} disconnected.")
+                    )
+            self._pending_responses.clear()
 
     async def _handle_client_request(self, envelope: MessageEnvelope) -> None:
         if not self.ready.is_set():
@@ -198,20 +198,20 @@ class ConnectedDeviceSession:
         await self.websocket.send(response.model_dump_json(exclude_none=True) + "\n")
 
     async def _handle_connect(self, envelope: MessageEnvelope) -> None:
-        if envelope.requestId is None:
-            raise ProtocolViolation("'connect' must carry requestId.")
+        if envelope.requestId != 1:
+            raise ProtocolViolation("'connect' must carry fixed requestId=1.")
         connect_data = ConnectData.model_validate(envelope.data)
         self.device_info = DeviceInfo(
             device_id=self.device_id,
             width=connect_data.width,
             height=connect_data.height,
-            token=connect_data.token,
             screenshot=connect_data.screenshot,
             ui=connect_data.ui,
             current_package=connect_data.currentPackage,
             activity=connect_data.activity,
+            token=connect_data.token,
         )
-        self._next_request_id = envelope.requestId + 1
+        self._next_request_id = 2
         self.ready.set()
         print(
             f"[server] device connected: deviceId={self.device_id} "
@@ -226,11 +226,12 @@ class ConnectedDeviceSession:
             raise ProtocolViolation("Client must not send 'pong'.")
         if envelope.requestId is None:
             raise ProtocolViolation("Business response must carry requestId.")
-        if self._pending_response is None or self._pending_response.done():
+        pending_response = self._pending_responses.get(envelope.requestId)
+        if pending_response is None or pending_response.done():
             raise ProtocolViolation(
-                f"Received unexpected response {envelope.message!r} without a pending server request."
+                f"Received unexpected response {envelope.message!r} with requestId={envelope.requestId}."
             )
-        self._pending_response.set_result(envelope)
+        pending_response.set_result(envelope)
 
     def _consume_next_request_id(self) -> int:
         if self._next_request_id is None:
@@ -259,6 +260,14 @@ class ConnectedDeviceSession:
         if activity is not None:
             self.device_info.activity = activity
 
+    def _update_device_info_from_payload(self, payload: dict[str, Any]) -> None:
+        self._update_device_info(
+            screenshot=payload.get("screenshot"),
+            ui=payload.get("ui"),
+            current_package=payload.get("currentPackage"),
+            activity=payload.get("activity"),
+        )
+
     @staticmethod
     def _parse(raw: str) -> MessageEnvelope:
         line = raw.strip()
@@ -275,7 +284,7 @@ class ConnectedDeviceSession:
 
 
 class DeviceGateway:
-    def __init__(self, path_prefix: str = "/ws/devices") -> None:
+    def __init__(self, path_prefix: str = "/adb") -> None:
         self.path_prefix = path_prefix.rstrip("/")
         self._devices: dict[str, ConnectedDeviceSession] = {}
         self._lock = asyncio.Lock()
@@ -318,12 +327,17 @@ class DeviceGateway:
             await session.stop()
 
     def _extract_device_id(self, path: str) -> str:
-        prefix = f"{self.path_prefix}/"
-        if not path.startswith(prefix):
-            raise DeviceGatewayError(
-                f"Invalid device path {path!r}. Expected prefix {self.path_prefix!r}."
-            )
-        device_id = path[len(prefix) :]
-        if not device_id:
-            raise DeviceGatewayError("Missing deviceId in websocket path.")
-        return device_id
+        normalized_path = path.split("?", 1)[0]
+        if normalized_path == self.path_prefix:
+            return "default"
+
+        for legacy_prefix in ("/ws/devices/", "/ws/device/"):
+            if normalized_path.startswith(legacy_prefix):
+                device_id = normalized_path[len(legacy_prefix) :]
+                if not device_id:
+                    raise DeviceGatewayError("Missing deviceId in websocket path.")
+                return device_id
+
+        raise DeviceGatewayError(
+            f"Invalid device path {path!r}. Expected {self.path_prefix!r} or a legacy device path."
+        )

@@ -10,7 +10,7 @@ from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
 clients: set[ServerConnection] = set()
-PATH_PATTERN = re.compile(r"^/ws/devices/(?P<device_id>[^/]+)$")
+PATH_PATTERN = re.compile(r"^(?:/adb|/ws/devices/(?P<device_id>[^/]+)|/ws/device/(?P<legacy_device_id>[^/]+))$")
 
 
 def _build_ssl_context(certfile: str | None, keyfile: str | None) -> ssl.SSLContext | None:
@@ -55,7 +55,7 @@ async def handle_client(websocket: ServerConnection) -> None:
         await websocket.close(code=1008, reason="invalid path")
         return
 
-    device_id = match.group("device_id")
+    device_id = match.group("device_id") or match.group("legacy_device_id") or "default"
     clients.add(websocket)
     peer = websocket.remote_address
     print(f"[connect] device {device_id} connected: {peer}")
@@ -93,7 +93,7 @@ async def run_server(host: str, port: int, certfile: str | None, keyfile: str | 
     scheme = "wss" if ssl_context else "ws"
 
     async with serve(handle_client, host, port, ssl=ssl_context):
-        print(f"[system] websocket server listening at {scheme}://{host}:{port}/ws/devices/{{deviceId}}")
+        print(f"[system] websocket server listening at {scheme}://{host}:{port}/adb")
         input_task = asyncio.create_task(console_input_loop(stop_event))
 
         try:

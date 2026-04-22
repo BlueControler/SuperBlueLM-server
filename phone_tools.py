@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -36,6 +37,21 @@ def create_phone_tools(gateway: DeviceGateway) -> list[Any]:
     @tool("observe", description="Get the latest screenshot and UI tree from the phone.")
     async def observe(device_id: str | None = None) -> str:
         return _dump_result(_summarize_result(await send("observe", None, device_id)))
+
+    @tool("list_packages", description="List installed app packages on the phone.")
+    async def list_packages(
+        package_type: str = "all",
+        device_id: str | None = None,
+    ) -> str:
+        return _dump_result(
+            {
+                "ok": True,
+                "type": package_type,
+                "packages": (await send("listPackages", {"type": package_type}, device_id)).get(
+                    "packages"
+                ),
+            }
+        )
 
     @tool("launch", description="Launch an Android app by package name.")
     async def launch(package: str, device_id: str | None = None) -> str:
@@ -85,17 +101,26 @@ def create_phone_tools(gateway: DeviceGateway) -> list[Any]:
 
     @tool("back", description="Go back once on the phone.")
     async def back(device_id: str | None = None) -> str:
-        return _dump_result(_summarize_result(await send("back", None, device_id)))
+        return _dump_result(
+            _summarize_result(await send("keyevent", {"keyevent": 4}, device_id))
+        )
 
     @tool("home", description="Return to the home screen.")
     async def home(device_id: str | None = None) -> str:
-        return _dump_result(_summarize_result(await send("home", None, device_id)))
+        return _dump_result(
+            _summarize_result(await send("keyevent", {"keyevent": 3}, device_id))
+        )
+
+    @tool("keyevent", description="Send a raw Android keyevent code.")
+    async def keyevent(keyevent: int, device_id: str | None = None) -> str:
+        return _dump_result(
+            _summarize_result(await send("keyevent", {"keyevent": keyevent}, device_id))
+        )
 
     @tool("wait", description="Wait for a number of seconds so the page can finish loading.")
     async def wait(duration: float, device_id: str | None = None) -> str:
-        return _dump_result(
-            _summarize_result(await send("wait", {"duration": duration}, device_id))
-        )
+        await asyncio.sleep(max(duration, 0))
+        return _dump_result(_summarize_result(await send("observe", None, device_id)))
 
     @tool(
         "interact",
@@ -112,7 +137,7 @@ def create_phone_tools(gateway: DeviceGateway) -> list[Any]:
         return_direct=True,
     )
     async def take_over(message: str, device_id: str | None = None) -> str:
-        await send("takeOver", {"message": message}, device_id)
+        await send("interact", {"message": message}, device_id)
         return message
 
     @tool(
@@ -121,11 +146,11 @@ def create_phone_tools(gateway: DeviceGateway) -> list[Any]:
         return_direct=True,
     )
     async def finish(message: str, device_id: str | None = None) -> str:
-        await send("finish", {"message": message}, device_id)
         return message
 
     return [
         observe,
+        list_packages,
         launch,
         tap,
         type_text,
@@ -134,6 +159,7 @@ def create_phone_tools(gateway: DeviceGateway) -> list[Any]:
         double_tap,
         back,
         home,
+        keyevent,
         wait,
         interact,
         take_over,

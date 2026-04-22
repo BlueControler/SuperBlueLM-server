@@ -151,7 +151,7 @@ async def run_server(host: str, port: int, certfile: str | None, keyfile: str | 
     scheme = "wss" if ssl_context else "ws"
 
     async with serve(gateway.handler, host, port, ssl=ssl_context):
-        print(f"[system] websocket server listening at {scheme}://{host}:{port}/ws/devices/{{deviceId}}")
+        print(f"[system] websocket server listening at {scheme}://{host}:{port}/adb")
         print("[system] waiting for mobile client connections...")
         input_task = asyncio.create_task(agent_console_loop(gateway, stop_event))
 

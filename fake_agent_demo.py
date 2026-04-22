@@ -19,7 +19,12 @@ def _tool_map(gateway: DeviceGateway) -> dict[str, object]:
 async def _call_tool(tool_map: dict[str, object], name: str, **kwargs) -> dict:
     tool = tool_map[name]
     result = await tool.ainvoke(kwargs)
-    return json.loads(result)
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except json.JSONDecodeError:
+            return {"message": result}
+    return result
 
 
 def _demo_remove_old_images() -> None:
@@ -55,10 +60,10 @@ async def run_fake_agent(task: str) -> None:
 
     async with serve(gateway.handler, host, port):
         client_task = asyncio.create_task(
-            MockPortalClient(device_id="demo-device").run(url=f"ws://{host}:{port}/ws/devices")
+            MockPortalClient(device_id="demo-device").run(url=f"ws://{host}:{port}/adb")
         )
         try:
-            session = await gateway.wait_for_device("demo-device", timeout=5.0)
+            session = await gateway.wait_for_device("default", timeout=5.0)
             print(f"[fake-agent] connected device: {session.device_id}")
             _demo_remove_old_images()
 
