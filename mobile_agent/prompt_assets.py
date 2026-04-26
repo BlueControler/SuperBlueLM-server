@@ -46,6 +46,36 @@ TOOL_PROMPT = """\
 """
 
 
+SYSTEM_TOOL_PROMPT = """\
+系统工具模块通过 ws://localhost:port/system 连接到 Agent 服务端。底层协议是 jsonl envelope，
+但模型只能调用封装后的工具，不要手写 WebSocket JSON、requestId 或 message envelope。
+
+可用系统工具：
+- list_apps(app_type): 对应 listApps，列出应用；app_type 只能是 all、third、system。
+- create_event(event): 对应 createEvent，创建日程，成功返回系统分配的 id。
+- list_events(start, end): 对应 listEvents，查询开始或结束时间落在区间内的日程，时间戳单位为毫秒。
+- update_event(event): 对应 updateEvent，更新已有日程；删除日程时将 status 设置为 cancelled。
+- list_reminders(event_id): 对应 listReminders，查询一个日程的全部提醒。
+- update_reminders(event_id, reminders): 对应 updateReminders，用传入列表覆盖旧提醒，空列表表示删除全部提醒。
+- get_location(): 对应 getLocation，获取 latitude、longitude、accuracy、timestamp。
+
+Event 字段按协议原名传入：title、description、eventLocation、dtstart、dtend、allDay、
+eventTimezone、duration、rrule、availability、status。创建日程时不要填写 _id；更新时必须带 _id。
+dtstart/dtend/timestamp 都是 Unix 毫秒时间戳。availability 只能是 busy、free、tentative。
+status 只能是 confirmed、tentative、cancelled。
+
+Reminder 字段按协议原名传入：minutes、method。method 只能是 alert 或 alarm。
+
+使用规则：
+1. 需要应用清单、日程、提醒、定位时，优先调用系统工具，不要通过手机 UI 绕路。
+2. 创建/更新日程前，缺少必要时间、标题或日程 ID 时，先 interact 询问用户补充。
+3. 修改提醒时要完整给出目标提醒列表，因为传入列表会覆盖旧提醒。
+4. 定位属于敏感能力；如果用户意图不明确，先 interact 确认用途。
+5. 传感器协议当前仍为待定，不要编造 sensor 请求；如果任务必须依赖传感器，应说明当前协议未定义。
+6. 系统工具返回 error 时，先向用户说明失败原因，不要伪造成功。
+"""
+
+
 TOOL_DEFINITIONS = [
     {
         "name": "observe",

@@ -15,7 +15,9 @@ from pydantic import SecretStr
 
 from .phone_gateway import ConnectedDeviceSession, DeviceGateway
 from .phone_tools import create_phone_tools
-from .prompt_assets import SYSTEM_PROMPT, TOOL_PROMPT
+from .prompt_assets import SYSTEM_PROMPT, SYSTEM_TOOL_PROMPT, TOOL_PROMPT
+from .system_gateway import SystemToolGateway
+from .system_tools import create_system_tools
 
 STATE_MESSAGE_PREFIX = "[PHONE_STATE]"
 
@@ -188,12 +190,18 @@ def make_sync_phone_state_middleware(gateway: DeviceGateway):
     return sync_phone_state
 
 
-def build_agent(gateway: DeviceGateway):
+def build_agent(gateway: DeviceGateway, system_gateway: SystemToolGateway | None = None):
     model = _build_model()
+    tools = list(create_phone_tools(gateway))
+    prompts = [SYSTEM_PROMPT, TOOL_PROMPT]
+    if system_gateway is not None:
+        tools.extend(create_system_tools(system_gateway))
+        prompts.append(SYSTEM_TOOL_PROMPT)
+
     return create_deep_agent(
         model=model,
-        tools=create_phone_tools(gateway),
-        system_prompt=f"{SYSTEM_PROMPT}\n\n{TOOL_PROMPT}",
+        tools=tools,
+        system_prompt="\n\n".join(prompts),
         middleware=[remove_old_images, make_sync_phone_state_middleware(gateway)],
     )
 

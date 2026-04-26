@@ -16,6 +16,7 @@ from mobile_agent.custom_deep_agent import (
     build_user_message,
 )
 from mobile_agent.phone_gateway import ConnectedDeviceSession, DeviceGateway, DeviceGatewayError
+from mobile_agent.system_gateway import SystemToolGateway
 
 MessagePayload: TypeAlias = dict[str, Any]
 MessageBlock: TypeAlias = MessagePayload | str
@@ -25,12 +26,16 @@ AgentMessages: TypeAlias = list[AgentMessage]
 InvokeResult: TypeAlias = dict[str, AgentMessages] | str | None
 
 
-async def agent_console_loop(gateway: DeviceGateway, stop_event: asyncio.Event) -> None:
+async def agent_console_loop(
+    gateway: DeviceGateway,
+    system_gateway: SystemToolGateway,
+    stop_event: asyncio.Event,
+) -> None:
     logger.info("输入自然语言任务并回车，Agent 会通过 websocket tools 操作已连接手机")
     logger.info("输入 /quit 关闭服务")
 
     conversation_messages: AgentMessages = []
-    agent = build_agent(gateway)
+    agent = build_agent(gateway, system_gateway)
 
     while not stop_event.is_set():
         text = await asyncio.to_thread(input, "agent> ")
@@ -183,14 +188,24 @@ def _build_ssl_context(certfile: str | None, keyfile: str | None) -> ssl.SSLCont
 
 async def run_server(host: str, port: int, certfile: str | None, keyfile: str | None) -> None:
     gateway = DeviceGateway()
+    system_gateway = SystemToolGateway()
     stop_event = asyncio.Event()
     ssl_context = _build_ssl_context(certfile, keyfile)
     scheme = "wss" if ssl_context else "ws"
 
-    async with serve(gateway.handler, host, port, ssl=ssl_context):
+    async def websocket_handler(websocket) -> None:
+        request = websocket.request
+        path = request.path.split("?", 1)[0] if request is not None else ""
+        if path == system_gateway.path:
+            await system_gateway.handler(websocket)
+            return
+        await gateway.handler(websocket)
+
+    async with serve(websocket_handler, host, port, ssl=ssl_context):
         logger.info(f"websocket server listening at {scheme}://{host}:{port}/adb")
+        logger.info(f"system tool websocket listening at {scheme}://{host}:{port}/system")
         logger.info("waiting for mobile client connections...")
-        input_task = asyncio.create_task(agent_console_loop(gateway, stop_event))
+        input_task = asyncio.create_task(agent_console_loop(gateway, system_gateway, stop_event))
 
         try:
             await stop_event.wait()
