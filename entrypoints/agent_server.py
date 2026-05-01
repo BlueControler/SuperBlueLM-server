@@ -12,7 +12,6 @@ from websockets.asyncio.server import serve
 
 from mobile_agent.custom_deep_agent import (
     build_agent,
-    build_state_snapshot_message,
     build_user_message,
 )
 from mobile_agent.phone_gateway import ConnectedDeviceSession, DeviceGateway, DeviceGatewayError
@@ -55,7 +54,6 @@ async def agent_console_loop(
 
         await _ensure_initial_observation(session)
         conversation_messages.append(build_user_message(text))
-        conversation_messages.append(build_state_snapshot_message(session))
         try:
             result = cast(
                 InvokeResult, await agent.ainvoke(cast(Any, {"messages": conversation_messages}))

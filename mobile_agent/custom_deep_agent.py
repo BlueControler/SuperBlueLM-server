@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Sequence
-from typing import TypeAlias, cast
+from collections.abc import Awaitable, Callable
+from typing import Annotated, Any, NotRequired, TypeAlias, cast
 
 from deepagents import create_deep_agent
 from dotenv import load_dotenv
-from langchain.agents.middleware.types import AgentState, StateT, before_model
-from langchain_core.messages import BaseMessage, HumanMessage, RemoveMessage
+from langchain.agents.middleware.types import (
+    AgentMiddleware,
+    AgentState,
+    ModelRequest,
+    ModelResponse,
+    PrivateStateAttr,
+)
+from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
-from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
 from pydantic import SecretStr
+from typing_extensions import TypedDict
 
 from .phone_gateway import ConnectedDeviceSession, DeviceGateway
 from .phone_tools import create_phone_tools
@@ -21,173 +27,99 @@ from .system_tools import create_system_tools
 
 STATE_MESSAGE_PREFIX = "[PHONE_STATE]"
 
-MessagePayload: TypeAlias = dict[str, object]
-MessageBlock: TypeAlias = MessagePayload | str
-MessageContent: TypeAlias = str | list[MessageBlock] | None
-AgentMessage: TypeAlias = BaseMessage | MessagePayload
-AgentMessages: TypeAlias = list[AgentMessage]
-MiddlewarePatch: TypeAlias = dict[str, list[RemoveMessage | AgentMessage]]
+ModelHandler: TypeAlias = Callable[[ModelRequest[Any]], ModelResponse[Any]]
+AsyncModelHandler: TypeAlias = Callable[[ModelRequest[Any]], Awaitable[ModelResponse[Any]]]
 
 
-def _message_content(message: AgentMessage) -> MessageContent:
-    if isinstance(message, dict):
-        content = message.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return cast(list[MessageBlock], content)
-        return None
-    if isinstance(message, BaseMessage):
-        return message.content
-    return None
+class PhoneSnapshot(TypedDict):
+    width: int
+    height: int
+    screenshot: str | None
+    ui: str | None
+    current_package: str | None
+    activity: str | None
 
 
-def _set_message_content(message: AgentMessage, content: MessageContent) -> AgentMessage:
-    if isinstance(message, dict):
-        new_message = dict(message)
-        new_message["content"] = content
-        return new_message
-
-    if isinstance(message, BaseMessage):
-        return message.model_copy(update={"content": content})
-
-    raise TypeError(f"Unsupported message type: {type(message)!r}")
+class MobileAgentState(AgentState[Any], total=False):
+    phone_snapshot: NotRequired[Annotated[PhoneSnapshot | None, PrivateStateAttr]]
 
 
-def _is_image_block(block: MessageBlock) -> bool:
-    if not isinstance(block, dict):
-        return False
-
-    block_type = block.get("type")
-    return (
-        block_type
-        in {
-            "image",
-            "image_url",
-            "input_image",
-            "image_base64",
-        }
-        or "image_url" in block
-    )
-
-
-def _find_latest_image_position(messages: Sequence[AgentMessage]) -> tuple[int, int] | None:
-    for message_index in range(len(messages) - 1, -1, -1):
-        content = _message_content(messages[message_index])
-        if not isinstance(content, list):
-            continue
-
-        for block_index in range(len(content) - 1, -1, -1):
-            if _is_image_block(content[block_index]):
-                return message_index, block_index
-    return None
-
-
-def _remove_old_images_from_messages(messages: Sequence[AgentMessage]) -> AgentMessages:
-    latest_image_position = _find_latest_image_position(messages)
-    if latest_image_position is None:
-        return list(messages)
-
-    latest_message_index, latest_block_index = latest_image_position
-    filtered_messages: AgentMessages = []
-
-    for message_index, message in enumerate(messages):
-        content = _message_content(message)
-        if not isinstance(content, list):
-            filtered_messages.append(message)
-            continue
-
-        new_content: list[MessageBlock] = []
-        for block_index, block in enumerate(content):
-            if not _is_image_block(block):
-                new_content.append(block)
-                continue
-
-            if message_index == latest_message_index and block_index == latest_block_index:
-                new_content.append(block)
-
-        if new_content:
-            filtered_messages.append(_set_message_content(message, new_content))
-            continue
-
-        # 历史消息如果只剩旧图片，直接删除，避免把空消息送给模型。
-        if any(_is_image_block(block) for block in content):
-            continue
-
-        filtered_messages.append(message)
-
-    return filtered_messages
-
-
-def _is_phone_state_message(message: AgentMessage) -> bool:
-    content = _message_content(message)
-    if not isinstance(content, list) or not content:
-        return False
-
-    first = content[0]
-    if not isinstance(first, dict):
-        return False
-
-    first_type = first.get("type")
-    first_text = first.get("text")
-    return (
-        first_type == "text"
-        and isinstance(first_text, str)
-        and first_text.startswith(STATE_MESSAGE_PREFIX)
-    )
-
-
-def _replace_phone_state_message(
-    messages: Sequence[AgentMessage], session: ConnectedDeviceSession
-) -> AgentMessages:
-    filtered_messages = [m for m in messages if not _is_phone_state_message(m)]
-    filtered_messages.append(build_state_snapshot_message(session))
-    return filtered_messages
-
-
-@before_model
-def remove_old_images(
-    state: AgentState[StateT],
-    runtime: Runtime,
-) -> MiddlewarePatch | None:
-    messages = list(state["messages"])
-    filtered_messages = _remove_old_images_from_messages(messages)
-
-    if filtered_messages == messages:
-        return None
+def build_phone_snapshot(session: ConnectedDeviceSession) -> PhoneSnapshot:
+    if session.device_info is None:
+        raise RuntimeError("Device session has no device_info yet.")
 
     return {
-        "messages": [
-            RemoveMessage(id=REMOVE_ALL_MESSAGES),
-            *filtered_messages,
-        ],
+        "width": session.device_info.width,
+        "height": session.device_info.height,
+        "screenshot": session.device_info.screenshot,
+        "ui": session.device_info.ui,
+        "current_package": session.device_info.current_package,
+        "activity": session.device_info.activity,
     }
 
 
-def make_sync_phone_state_middleware(phone_gateway: DeviceGateway):
-    @before_model
-    def sync_phone_state(
-        state: AgentState[StateT],
-        runtime: Runtime,
-    ) -> MiddlewarePatch | None:
+class SyncPhoneStateMiddleware(AgentMiddleware[MobileAgentState, Any, Any]):
+    state_schema = MobileAgentState
+
+    def __init__(self, phone_gateway: DeviceGateway) -> None:
+        self.phone_gateway = phone_gateway
+
+    def before_model(
+        self,
+        state: MobileAgentState,
+        runtime: Runtime[Any],
+    ) -> dict[str, PhoneSnapshot | None] | None:
+        snapshot = self._current_snapshot()
+        if state.get("phone_snapshot") == snapshot:
+            return None
+
+        return {"phone_snapshot": snapshot}
+
+    async def abefore_model(
+        self,
+        state: MobileAgentState,
+        runtime: Runtime[Any],
+    ) -> dict[str, PhoneSnapshot | None] | None:
+        return self.before_model(state, runtime)
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: ModelHandler,
+    ) -> ModelResponse[Any]:
+        return handler(self._with_phone_state_message(request))
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: AsyncModelHandler,
+    ) -> ModelResponse[Any]:
+        return await handler(self._with_phone_state_message(request))
+
+    def _with_phone_state_message(self, request: ModelRequest[Any]) -> ModelRequest[Any]:
+        snapshot = cast(PhoneSnapshot | None, request.state.get("phone_snapshot"))
+        if snapshot is None:
+            snapshot = self._current_snapshot()
+        if snapshot is None:
+            return request
+
+        return request.override(
+            messages=[
+                *request.messages,
+                build_phone_state_message(snapshot),
+            ],
+        )
+
+    def _current_snapshot(self) -> PhoneSnapshot | None:
         try:
-            session = phone_gateway.get_session()
+            session = self.phone_gateway.get_session()
         except Exception:
             return None
 
-        messages = list(state["messages"])
-        updated_messages = _replace_phone_state_message(messages, session)
-        if updated_messages == messages:
+        if session.device_info is None:
             return None
 
-        return {
-            "messages": [
-                RemoveMessage(id=REMOVE_ALL_MESSAGES),
-                *updated_messages,
-            ],
-        }
-
-    return sync_phone_state
+        return build_phone_snapshot(session)
 
 
 def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway):
@@ -201,7 +133,7 @@ def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway)
         model=model,
         tools=tools,
         system_prompt="\n\n".join([SYSTEM_PROMPT, TOOL_PROMPT, SYSTEM_TOOL_PROMPT]),
-        middleware=[remove_old_images, make_sync_phone_state_middleware(phone_gateway)],
+        middleware=[SyncPhoneStateMiddleware(phone_gateway)],  # pyright: ignore[reportArgumentType]
     )
 
 
@@ -226,26 +158,23 @@ def build_user_message(user_text: str) -> HumanMessage:
     return HumanMessage(content=user_text)
 
 
-def build_state_snapshot_message(session: ConnectedDeviceSession) -> HumanMessage:
-    if session.device_info is None:
-        raise RuntimeError("Device session has no device_info yet.")
-
+def build_phone_state_message(snapshot: PhoneSnapshot) -> HumanMessage:
     content: list[str | dict[str, object]] = [
         {
             "type": "text",
             "text": (
                 f"{STATE_MESSAGE_PREFIX}\n"
                 "当前手机页面状态如下，请基于这些信息决定下一步：\n"
-                f"screenWidth={session.device_info.width}\n"
-                f"screenHeight={session.device_info.height}\n"
-                f"currentPackage={session.device_info.current_package}\n"
-                f"activity={session.device_info.activity}\n"
-                f"ui={session.device_info.ui}"
+                f"screenWidth={snapshot['width']}\n"
+                f"screenHeight={snapshot['height']}\n"
+                f"currentPackage={snapshot['current_package']}\n"
+                f"activity={snapshot['activity']}\n"
+                f"ui={snapshot['ui']}"
             ),
         }
     ]
 
-    screenshot = session.device_info.screenshot
+    screenshot = snapshot["screenshot"]
     if screenshot:
         content.append(
             {
