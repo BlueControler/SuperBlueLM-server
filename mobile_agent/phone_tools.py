@@ -68,19 +68,27 @@ def create_phone_tools(gateway: DeviceGateway) -> list[Any]:
     async def double_tap(x: int, y: int) -> str:
         return _dump_result(_summarize_result(await send("doubleTap", {"x": x, "y": y})))
 
-    @tool("back", description="Go back once on the phone.")
+    @tool("back", description="Agent-level wrapper that sends Android keyevent 4 (BACK).")
     async def back() -> str:
         return _dump_result(_summarize_result(await send("keyevent", {"keyevent": 4})))
 
-    @tool("home", description="Return to the home screen.")
+    @tool("home", description="Agent-level wrapper that sends Android keyevent 3 (HOME).")
     async def home() -> str:
         return _dump_result(_summarize_result(await send("keyevent", {"keyevent": 3})))
 
-    @tool("keyevent", description="Send a raw Android keyevent code.")
+    @tool(
+        "keyevent",
+        description=(
+            "Send an Android keyevent code. Common codes: 3 HOME, 4 BACK, "
+            "66 ENTER, 67 DEL/BACKSPACE, 82 MENU, 187 APP_SWITCH/RECENTS, "
+            "24 VOLUME_UP, 25 VOLUME_DOWN, 26 POWER. Prefer back() and home() "
+            "for normal navigation."
+        ),
+    )
     async def keyevent(keyevent: int) -> str:
         return _dump_result(_summarize_result(await send("keyevent", {"keyevent": keyevent})))
 
-    @tool("wait", description="Wait for a number of seconds so the page can finish loading.")
+    @tool("wait", description="Wait for a number of seconds so the page can complete loading.")
     async def wait(duration: float) -> str:
         await asyncio.sleep(max(duration, 0))
         return _dump_result(_summarize_result(await send("observe", None)))
@@ -103,14 +111,6 @@ def create_phone_tools(gateway: DeviceGateway) -> list[Any]:
         await send("interact", {"message": message})
         return message
 
-    @tool(
-        "finish",
-        description="End the current task after the phone operation is complete.",
-        return_direct=True,
-    )
-    async def finish(message: str) -> str:
-        return message
-
     return [
         observe,
         launch,
@@ -125,5 +125,4 @@ def create_phone_tools(gateway: DeviceGateway) -> list[Any]:
         wait,
         interact,
         take_over,
-        finish,
     ]

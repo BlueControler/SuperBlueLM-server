@@ -25,7 +25,10 @@ def create_system_tools(gateway: SystemToolGateway) -> list[Any]:
 
     @tool(
         "list_apps",
-        description="List installed Android apps through the /system tool client. app_type is all, third, or system.",
+        description=(
+            "List installed Android apps through the /system tool client. "
+            "app_type is all, third, or system. Returns {packageName: appLabel}."
+        ),
     )
     async def list_apps(app_type: str = "all") -> str:
         return await send("listApps", {"type": app_type})

@@ -27,6 +27,9 @@ include = ["entrypoints*", "mobile_agent*"]
 [tool.setuptools.package-data]
 "*" = ["py.typed"]
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
 [dependency-groups]
 dev = [
     "anyio>=4.7.0",

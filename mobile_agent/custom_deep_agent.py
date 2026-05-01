@@ -21,7 +21,7 @@ from typing_extensions import TypedDict
 
 from .phone_gateway import ConnectedDeviceSession, DeviceGateway
 from .phone_tools import create_phone_tools
-from .prompt_assets import SYSTEM_PROMPT, SYSTEM_TOOL_PROMPT, TOOL_PROMPT
+from .prompt_assets import SYSTEM_PROMPT
 from .system_gateway import SystemToolGateway
 from .system_tools import create_system_tools
 
@@ -132,7 +132,7 @@ def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway)
     return create_deep_agent(
         model=model,
         tools=tools,
-        system_prompt="\n\n".join([SYSTEM_PROMPT, TOOL_PROMPT, SYSTEM_TOOL_PROMPT]),
+        system_prompt=SYSTEM_PROMPT,
         middleware=[SyncPhoneStateMiddleware(phone_gateway)],  # pyright: ignore[reportArgumentType]
     )
 
