@@ -19,6 +19,7 @@ from langgraph.runtime import Runtime
 from pydantic import SecretStr
 from typing_extensions import TypedDict
 
+from .external_tools import create_external_tools
 from .phone_gateway import ConnectedDeviceSession, DeviceGateway
 from .phone_tools import create_phone_tools
 from .prompt_assets import SYSTEM_PROMPT
@@ -127,6 +128,7 @@ def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway)
     tools = [
         *create_phone_tools(phone_gateway),
         *create_system_tools(system_gateway),
+        *create_external_tools(),
     ]
 
     return create_deep_agent(
