@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import os
 from collections.abc import Awaitable, Callable
 from typing import Annotated, Any, NotRequired, TypeAlias, cast
 
 from deepagents import create_deep_agent
-from dotenv import load_dotenv
 from langchain.agents.middleware.types import (
     AgentMiddleware,
     AgentState,
@@ -14,12 +12,11 @@ from langchain.agents.middleware.types import (
     PrivateStateAttr,
 )
 from langchain_core.messages import HumanMessage
-from langchain_openai import ChatOpenAI
 from langgraph.runtime import Runtime
-from pydantic import SecretStr
 from typing_extensions import TypedDict
 
 from .external_tools import create_external_tools
+from .local_model_runtime import build_cloud_model, model_runtime
 from .phone_gateway import ConnectedDeviceSession, DeviceGateway
 from .phone_tools import create_phone_tools
 from .prompt_assets import SYSTEM_PROMPT
@@ -123,6 +120,30 @@ class SyncPhoneStateMiddleware(AgentMiddleware[MobileAgentState, Any, Any]):
         return build_phone_snapshot(session)
 
 
+class RouteModelMiddleware(AgentMiddleware[MobileAgentState, Any, Any]):
+    state_schema = MobileAgentState
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: ModelHandler,
+    ) -> ModelResponse[Any]:
+        return handler(self._with_routed_model(request))
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: AsyncModelHandler,
+    ) -> ModelResponse[Any]:
+        return await handler(self._with_routed_model(request))
+
+    def _with_routed_model(self, request: ModelRequest[Any]) -> ModelRequest[Any]:
+        local_model = model_runtime.get_model_override()
+        if local_model is None:
+            return request
+        return request.override(model=local_model)
+
+
 def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway):
     model = _build_model()
     tools = [
@@ -135,25 +156,15 @@ def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway)
         model=model,
         tools=tools,
         system_prompt=SYSTEM_PROMPT,
-        middleware=[SyncPhoneStateMiddleware(phone_gateway)],  # pyright: ignore[reportArgumentType]
+        middleware=[
+            RouteModelMiddleware(),
+            SyncPhoneStateMiddleware(phone_gateway),
+        ],  # pyright: ignore[reportArgumentType]
     )
 
 
 def _build_model():
-    load_dotenv()
-    openai_key = os.getenv("OPENAI_API_KEY")
-    openai_model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-    openai_max_tokens = int(os.getenv("OPENAI_MAX_TOKENS", "4096"))
-    openai_base_url = os.getenv("OPENAI_BASE_URL") or None
-    if openai_key:
-        return ChatOpenAI(
-            api_key=SecretStr(openai_key),
-            base_url=openai_base_url,
-            model=openai_model,
-            max_tokens=openai_max_tokens,  # type: ignore
-        )
-
-    return "openai:gpt-5.4"
+    return build_cloud_model()
 
 
 def build_user_message(user_text: str) -> HumanMessage:

@@ -80,8 +80,38 @@ langgraph dev --port 2024
 - 系统工具客户端连接：`ws://127.0.0.1:2024/system`
 - 手机连接状态：`http://127.0.0.1:2024/adb/status`
 - 系统工具连接状态：`http://127.0.0.1:2024/system/status`
+- 网络/模型路由状态：`http://127.0.0.1:2024/network/status`
 
 LangSmith tracing 使用 `.env` 中的 `LANGSMITH_TRACING=true`、`LANGSMITH_PROJECT` 和 `LANGSMITH_API_KEY`。
+
+## 离线本地模型
+
+安装 llama.cpp 预编译包并下载默认 Gemma 4 GGUF 模型：
+
+```bash
+python -m entrypoints.llama_cpp_setup all
+```
+
+脚本会自动识别 Windows x64、Linux x64、Android arm64，也可以显式指定：
+
+```bash
+python -m entrypoints.llama_cpp_setup all --target linux-x64
+```
+
+如果 Hugging Face 需要授权，先设置 `HF_TOKEN` 或 `HUGGINGFACE_TOKEN`。默认文件会放到仓库内 `.local/`，也可以用环境变量覆盖：
+
+- `LLAMA_CPP_SERVER_BINARY`: `llama-server` 可执行文件路径
+- `LLAMA_CPP_MODEL_PATH`: GGUF 模型文件路径
+- `LLAMA_CPP_HOST` / `LLAMA_CPP_PORT`: 本地 llama.cpp server 地址，默认 `127.0.0.1:8080`
+- `LLAMA_CPP_MODEL_NAME`: OpenAI-compatible model 名称，默认 `gemma-4-E2B-it`
+
+切换网络状态：
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:2024/network/status -ContentType "application/json" -Body '{"connected": false}'
+```
+
+当 `connected=false` 时，服务会启动本地 `llama-server` 并让 agent graph 切到本地模型；当 `connected=true` 时，会切回云端并停止本地进程。
 
 如果看到 Windows 的 `WinError 10048`，表示端口已经被另一个进程占用。可以换端口：
 
