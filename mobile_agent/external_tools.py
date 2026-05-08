@@ -218,22 +218,42 @@ def create_external_tools(
     @tool(
         "feishu_cli_readonly",
         description=(
-            "Run a read-only Feishu/Lark CLI command. args must be a list of argv "
+            "Run a read-only Feishu/Lark CLI command. argv must be a list of argument "
             "items after lark-cli. Write actions such as send/create/update/delete are rejected."
         ),
     )
-    async def feishu_cli_readonly(args: list[str]) -> str:
-        return _dump(await _run_readonly_cli(FEISHU_CLI, args, runner))
+    async def feishu_cli_readonly(argv: list[str]) -> str:
+        return _dump(await _run_readonly_cli(FEISHU_CLI, argv, runner))
 
     @tool(
         "wecom_cli_readonly",
         description=(
-            "Run a read-only WeCom CLI command. args must be a list of argv items "
+            "Run a read-only WeCom CLI command. argv must be a list of argument items "
             "after wecom-cli. Write actions such as send/create/update/delete are rejected."
         ),
     )
-    async def wecom_cli_readonly(args: list[str]) -> str:
-        return _dump(await _run_readonly_cli(WECOM_CLI, args, runner))
+    async def wecom_cli_readonly(argv: list[str]) -> str:
+        return _dump(await _run_readonly_cli(WECOM_CLI, argv, runner))
+
+    @tool(
+        "feishu_cli",
+        description=(
+            "Run a full-access Feishu/Lark CLI command. argv must be a list of argument "
+            "items after lark-cli. This tool allows write operations supported by the CLI."
+        ),
+    )
+    async def feishu_cli(argv: list[str]) -> str:
+        return _dump(await _run_cli(FEISHU_CLI, argv, runner))
+
+    @tool(
+        "wecom_cli",
+        description=(
+            "Run a full-access WeCom CLI command. argv must be a list of argument items "
+            "after wecom-cli. This tool allows write operations supported by the CLI."
+        ),
+    )
+    async def wecom_cli(argv: list[str]) -> str:
+        return _dump(await _run_cli(WECOM_CLI, argv, runner))
 
     @tool(
         "amap_mcp_tool",
@@ -262,6 +282,8 @@ def create_external_tools(
     return [
         feishu_cli_readonly,
         wecom_cli_readonly,
+        feishu_cli,
+        wecom_cli,
         amap_mcp_tool,
         weather_query,
         external_tools_status,
@@ -282,18 +304,39 @@ async def _run_readonly_cli(
     return await runner.run(command=command, args=list(args), timeout=timeout)
 
 
+async def _run_cli(
+    spec: CliSpec,
+    args: Sequence[str],
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    validation_error = validate_cli_args(args)
+    if validation_error is not None:
+        return validation_error
+
+    command = os.getenv(spec.env_var, spec.default_command)
+    timeout = _tool_timeout()
+    return await runner.run(command=command, args=list(args), timeout=timeout)
+
+
+def validate_cli_args(args: Sequence[str]) -> dict[str, Any] | None:
+    if not isinstance(args, list):
+        return {"error": "invalid_args", "message": "argv must be a list of strings."}
+    if not args:
+        return {"error": "invalid_args", "message": "argv cannot be empty."}
+    if not all(isinstance(item, str) for item in args):
+        return {"error": "invalid_args", "message": "every argv item must be a string."}
+    if any("\x00" in item or "\n" in item or "\r" in item for item in args):
+        return {"error": "invalid_args", "message": "argv must not contain control separators."}
+    return None
+
+
 def validate_readonly_cli_args(
     args: Sequence[str],
     allowed_domains: frozenset[str],
 ) -> dict[str, Any] | None:
-    if not isinstance(args, list):
-        return {"error": "invalid_args", "message": "args must be a list of strings."}
-    if not args:
-        return {"error": "invalid_args", "message": "args cannot be empty."}
-    if not all(isinstance(item, str) for item in args):
-        return {"error": "invalid_args", "message": "every arg must be a string."}
-    if any("\x00" in item or "\n" in item or "\r" in item for item in args):
-        return {"error": "invalid_args", "message": "args must not contain control separators."}
+    validation_error = validate_cli_args(args)
+    if validation_error is not None:
+        return validation_error
 
     domain = _first_non_option(args)
     if domain is not None and domain not in allowed_domains:

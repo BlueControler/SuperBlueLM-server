@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -124,11 +125,15 @@ def test_external_tools_contract_contains_business_tools():
     assert list(tools) == [
         "feishu_cli_readonly",
         "wecom_cli_readonly",
+        "feishu_cli",
+        "wecom_cli",
         "amap_mcp_tool",
         "weather_query",
         "external_tools_status",
     ]
     assert "read-only" in tools["feishu_cli_readonly"].description
+    assert "full-access" in tools["feishu_cli"].description
+    assert "write operations" in tools["wecom_cli"].description
     assert "maps_weather" in tools["weather_query"].description
 
 
@@ -153,6 +158,38 @@ def test_readonly_cli_validation_rejects_unknown_domain():
 
     assert error is not None
     assert error["error"] == "disallowed_domain"
+
+
+@pytest.mark.anyio
+async def test_full_access_feishu_cli_allows_write_actions():
+    runner = FakeCommandRunner()
+    tools = _tool_by_name(create_external_tools(runner, FakeAmapClient()))
+
+    raw = await tools["feishu_cli"].ainvoke(
+        {"argv": ["im", "+messages-send", "--chat-id", "oc_xxx", "--text", "hello"]}
+    )
+
+    result = json.loads(raw)
+    assert result["ok"] is True
+    assert runner.calls == [
+        ("lark-cli", ["im", "+messages-send", "--chat-id", "oc_xxx", "--text", "hello"], 30.0)
+    ]
+
+
+@pytest.mark.anyio
+async def test_full_access_wecom_cli_allows_unknown_domains_and_write_actions():
+    runner = FakeCommandRunner()
+    tools = _tool_by_name(create_external_tools(runner, FakeAmapClient()))
+
+    raw = await tools["wecom_cli"].ainvoke(
+        {"argv": ["admin", "delete_user", '{"userid":"zhangsan"}']}
+    )
+
+    result = json.loads(raw)
+    assert result["ok"] is True
+    assert runner.calls == [
+        ("wecom-cli", ["admin", "delete_user", '{"userid":"zhangsan"}'], 30.0)
+    ]
 
 
 def test_amap_tool_whitelist_rejects_unknown_tool():
