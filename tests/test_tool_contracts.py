@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from entrypoints import deploy as project_deploy
+from entrypoints import setup as project_setup
 from mobile_agent.external_tools import (
     ALLOWED_AMAP_TOOLS,
     SafeCommandRunner,
@@ -67,15 +69,97 @@ def test_prompt_assets_do_not_export_duplicate_tool_definitions():
     assert "list_apps" not in prompt_assets.SYSTEM_PROMPT
 
 
+def test_local_model_prompt_keeps_tasks_simple():
+    assert "简单任务" in prompt_assets.LOCAL_MODEL_SYSTEM_PROMPT
+    assert "零次或一次工具调用" in prompt_assets.LOCAL_MODEL_SYSTEM_PROMPT
+    assert "高风险" in prompt_assets.LOCAL_MODEL_SYSTEM_PROMPT
+    assert "多步骤" in prompt_assets.LOCAL_MODEL_SYSTEM_PROMPT
+
+
 def test_custom_deep_agent_uses_only_base_system_prompt():
     source = (PROJECT_ROOT / "mobile_agent" / "custom_deep_agent.py").read_text(
         encoding="utf-8"
     )
 
-    assert "from .prompt_assets import SYSTEM_PROMPT" in source
-    assert "system_prompt=SYSTEM_PROMPT" in source
+    assert "SYSTEM_PROMPT" in source
+    assert "system_prompt=SYSTEM_PROMPT" not in source
+    assert 'system_prompt=""' in source
     assert "TOOL_PROMPT" not in source
     assert "SYSTEM_TOOL_PROMPT" not in source
+
+
+def test_custom_deep_agent_routes_cloud_and_local_prompts_separately():
+    source = (PROJECT_ROOT / "mobile_agent" / "custom_deep_agent.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "LOCAL_MODEL_SYSTEM_PROMPT" in source
+    assert "RoutedSystemPromptMiddleware" in source
+    assert "SystemMessage" in source
+    assert "model_runtime.status().get(\"mode\") == \"local\"" in source
+
+
+def test_unified_setup_exposes_llama_and_external_tool_actions():
+    assert "llama:all" in project_setup.SETUP_ACTIONS
+    assert "external:all" in project_setup.SETUP_ACTIONS
+    assert "check" in project_setup.SETUP_ACTIONS
+    assert "all" in project_setup.SETUP_ACTIONS
+
+    assert project_setup.normalize_legacy_action("llama", "all") == "llama:all"
+    assert project_setup.normalize_legacy_action("external", "check") == "external:check"
+
+
+def test_external_setup_documents_reusable_login_state():
+    assert "首次" in project_setup.EXTERNAL_AUTH_NOTICE
+    assert "登录态" in project_setup.EXTERNAL_AUTH_NOTICE
+    assert "后续" in project_setup.EXTERNAL_AUTH_NOTICE
+
+
+def test_deploy_plan_profiles_are_explicit_and_ordered():
+    core_plan = project_deploy.build_deploy_plan(profile="core", start=False)
+    local_plan = project_deploy.build_deploy_plan(profile="local", start=True)
+    full_plan = project_deploy.build_deploy_plan(profile="full", start=False)
+    default_args = project_deploy.parse_args([])
+
+    assert [step.name for step in core_plan] == [
+        "check-python-version",
+        "ensure-env-file",
+        "install-python-dependencies",
+        "check-unified-setup",
+    ]
+    assert [step.name for step in local_plan] == [
+        "check-python-version",
+        "ensure-env-file",
+        "check-server-port",
+        "install-python-dependencies",
+        "setup-local-model",
+        "check-unified-setup",
+        "start-langgraph-server",
+        "health-check-server",
+    ]
+    assert [step.name for step in full_plan] == [
+        "check-python-version",
+        "ensure-env-file",
+        "install-python-dependencies",
+        "setup-local-model",
+        "setup-external-tools",
+        "check-unified-setup",
+    ]
+    assert core_plan[-1].required is False
+    assert local_plan[-2].background is True
+    assert local_plan[-1].required is True
+    assert default_args.profile == "full"
+    assert default_args.start is True
+
+
+def test_deploy_wrappers_run_full_start_by_default():
+    powershell_script = (PROJECT_ROOT / "scripts" / "deploy.ps1").read_text(
+        encoding="utf-8"
+    )
+    shell_script = (PROJECT_ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+
+    assert "python -m entrypoints.deploy" in powershell_script
+    assert "python -m entrypoints.deploy" in shell_script
 
 
 def test_phone_tools_contract_matches_android_protocol():

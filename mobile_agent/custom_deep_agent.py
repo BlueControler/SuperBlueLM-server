@@ -11,7 +11,7 @@ from langchain.agents.middleware.types import (
     ModelResponse,
     PrivateStateAttr,
 )
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.runtime import Runtime
 from typing_extensions import TypedDict
 
@@ -19,7 +19,7 @@ from .external_tools import create_external_tools
 from .local_model_runtime import build_cloud_model, model_runtime
 from .phone_gateway import ConnectedDeviceSession, DeviceGateway
 from .phone_tools import create_phone_tools
-from .prompt_assets import SYSTEM_PROMPT
+from .prompt_assets import LOCAL_MODEL_SYSTEM_PROMPT, SYSTEM_PROMPT
 from .system_gateway import SystemToolGateway
 from .system_tools import create_system_tools
 
@@ -144,6 +144,38 @@ class RouteModelMiddleware(AgentMiddleware[MobileAgentState, Any, Any]):
         return request.override(model=local_model)
 
 
+class RoutedSystemPromptMiddleware(AgentMiddleware[MobileAgentState, Any, Any]):
+    state_schema = MobileAgentState
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: ModelHandler,
+    ) -> ModelResponse[Any]:
+        return handler(self._with_routed_system_prompt(request))
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: AsyncModelHandler,
+    ) -> ModelResponse[Any]:
+        return await handler(self._with_routed_system_prompt(request))
+
+    def _with_routed_system_prompt(self, request: ModelRequest[Any]) -> ModelRequest[Any]:
+        prompt = (
+            LOCAL_MODEL_SYSTEM_PROMPT
+            if model_runtime.status().get("mode") == "local"
+            else SYSTEM_PROMPT
+        )
+
+        return request.override(
+            messages=[
+                SystemMessage(content=prompt),
+                *request.messages,
+            ],
+        )
+
+
 def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway):
     model = _build_model()
     tools = [
@@ -155,9 +187,10 @@ def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway)
     return create_deep_agent(
         model=model,
         tools=tools,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt="",
         middleware=[
             RouteModelMiddleware(),
+            RoutedSystemPromptMiddleware(),
             SyncPhoneStateMiddleware(phone_gateway),
         ],  # pyright: ignore[reportArgumentType]
     )

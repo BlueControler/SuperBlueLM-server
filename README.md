@@ -59,6 +59,64 @@ pip install -e .
 pip install mypy ruff pytest "langgraph-cli[inmem]" anyio
 ```
 
+## 一键部署
+
+从仓库根目录执行一条命令即可完成完整部署：
+
+```bash
+python -m entrypoints.deploy
+```
+
+这条命令默认执行 `full` profile 并启动 LangGraph 服务，流程包括：
+
+1. 检查 Python 版本是否满足 `>=3.14`。
+2. 如果 `.env` 不存在，从 `.env.example` 创建。
+3. 检查启动端口是否可用。
+4. 安装 Python 依赖。
+5. 安装 llama.cpp 并下载默认本地模型。
+6. 安装并初始化飞书、企业微信外部工具。
+7. 检查统一 setup 状态。
+8. 启动 LangGraph 服务。
+9. 请求 `/network/status` 做部署后健康检查。
+
+Windows PowerShell 也可以使用：
+
+```powershell
+.\scripts\deploy.ps1
+```
+
+Linux/macOS 也可以使用：
+
+```bash
+sh scripts/deploy.sh
+```
+
+可选 profile 仍然保留，方便只部署一部分：
+
+- `core`: 安装 Python 依赖并检查本地模型、外部工具状态；可选组件缺失只会给出 warning。
+- `local`: 在 `core` 基础上安装 llama.cpp 并下载默认本地模型。
+- `full`: 在 `local` 基础上安装并初始化飞书、企业微信外部工具；该模式会触发 CLI 登录或初始化流程。
+
+飞书/企微 CLI 的授权是“首次部署需要人工处理，后续复用登录态”的模式：第一次执行 `full` 时，如果 CLI 要求扫码、浏览器登录或填写配置，需要按提示完成；完成后登录态通常保存在本机 CLI 配置目录里。之后在同一台机器、同一用户下再次执行一键部署，会优先复用已有登录态，一般不会重复登录。只有登录态过期、被清理、换机器或换系统用户时，才需要重新授权。
+
+例如只部署本地模型并启动：
+
+```bash
+python -m entrypoints.deploy --profile local --start --port 2024
+```
+
+如果只想打印完整部署步骤，不执行下载、登录或启动：
+
+```bash
+python -m entrypoints.deploy --dry-run
+```
+
+如果本机已装好依赖，可跳过依赖安装；如果只是临时诊断，也可以跳过 Python 版本保护：
+
+```bash
+python -m entrypoints.deploy --profile core --no-start --no-install-deps --allow-unsupported-python
+```
+
 ## 正式运行：LangGraph API
 
 项目的正式入口是 `langgraph dev`。它会读取 `langgraph.json`，同时启动：
@@ -89,13 +147,13 @@ LangSmith tracing 使用 `.env` 中的 `LANGSMITH_TRACING=true`、`LANGSMITH_PRO
 安装 llama.cpp 预编译包并下载默认 Gemma 4 GGUF 模型：
 
 ```bash
-python -m entrypoints.llama_cpp_setup all
+python -m entrypoints.setup llama:all
 ```
 
 脚本会自动识别 Windows x64、Linux x64、Android arm64，也可以显式指定：
 
 ```bash
-python -m entrypoints.llama_cpp_setup all --target linux-x64
+python -m entrypoints.setup llama:all --target linux-x64
 ```
 
 如果 Hugging Face 需要授权，先设置 `HF_TOKEN` 或 `HUGGINGFACE_TOKEN`。默认文件会放到仓库内 `.local/`，也可以用环境变量覆盖：
@@ -104,6 +162,21 @@ python -m entrypoints.llama_cpp_setup all --target linux-x64
 - `LLAMA_CPP_MODEL_PATH`: GGUF 模型文件路径
 - `LLAMA_CPP_HOST` / `LLAMA_CPP_PORT`: 本地 llama.cpp server 地址，默认 `127.0.0.1:8080`
 - `LLAMA_CPP_MODEL_NAME`: OpenAI-compatible model 名称，默认 `gemma-4-E2B-it`
+
+旧入口 `python -m entrypoints.llama_cpp_setup all` 仍可用，会转发到统一 setup。
+
+本地模型模式会额外注入一份更保守的系统提示词，只允许简单任务、零次或一次工具调用；多步骤、高风险或不确定任务会停止并要求用户确认或交还给更强模型。
+
+## 外部业务工具
+
+飞书、企业微信和高德 MCP 工具统一通过 setup 入口安装或检查：
+
+```bash
+python -m entrypoints.setup external:check
+python -m entrypoints.setup external:all
+```
+
+旧入口 `python -m entrypoints.external_tools_setup all` 仍可用，会转发到统一 setup。
 
 切换网络状态：
 

@@ -120,13 +120,13 @@ class LocalModelRuntime:
         if not server_binary.exists():
             raise LocalModelRuntimeError(
                 f"llama.cpp server binary not found: {server_binary}. "
-                "Run `python -m entrypoints.llama_cpp_setup all` first, or set "
+                "Run `python -m entrypoints.setup llama:all` first, or set "
                 "LLAMA_CPP_SERVER_BINARY."
             )
         if not model_path.exists():
             raise LocalModelRuntimeError(
                 f"local model file not found: {model_path}. "
-                "Run `python -m entrypoints.llama_cpp_setup all` first, or set "
+                "Run `python -m entrypoints.setup llama:all` first, or set "
                 "LLAMA_CPP_MODEL_PATH."
             )
 
