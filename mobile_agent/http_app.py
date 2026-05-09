@@ -10,10 +10,10 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
+from .gateways.phone import DeviceGatewayError
+from .gateways.system import SystemGatewayError
 from .local_model_runtime import LocalModelRuntimeError, model_runtime
-from .phone_gateway import DeviceGatewayError
 from .runtime import phone_gateway, system_gateway
-from .system_gateway import SystemGatewayError
 
 
 async def adb_websocket(websocket: WebSocket) -> None:

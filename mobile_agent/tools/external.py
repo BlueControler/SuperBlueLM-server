@@ -8,9 +8,11 @@ import shlex
 import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol
 
-from langchain_core.tools import tool
+from langchain_core.tools import BaseTool, tool
+
+from ..json_types import JsonObject, JsonValue
 
 MAX_OUTPUT_BYTES = 256 * 1024
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -97,13 +99,11 @@ class CommandRunner(Protocol):
         command: str,
         args: Sequence[str],
         timeout: float,
-    ) -> dict[str, Any]:
-        ...
+    ) -> JsonObject: ...
 
 
 class AmapClient(Protocol):
-    async def call_tool(self, tool_name: str, arguments: Mapping[str, Any]) -> Any:
-        ...
+    async def call_tool(self, tool_name: str, arguments: Mapping[str, JsonValue]) -> JsonValue: ...
 
 
 @dataclass(frozen=True)
@@ -134,7 +134,7 @@ class SafeCommandRunner:
         command: str,
         args: Sequence[str],
         timeout: float,
-    ) -> dict[str, Any]:
+    ) -> JsonObject:
         executable = _resolve_command(command)
         if executable is None:
             return {
@@ -168,7 +168,7 @@ class SafeCommandRunner:
         stderr_text = _decode_limited(stderr)
         return {
             "command": command,
-            "args": _redact_args(args),
+            "args": _to_jsonable(_redact_args(args)),
             "returncode": process.returncode,
             "stdout": _to_jsonable(_parse_or_text(_redact_text(stdout_text))),
             "stderr": _to_jsonable(_parse_or_text(_redact_text(stderr_text))),
@@ -177,7 +177,7 @@ class SafeCommandRunner:
 
 
 class AmapMcpClient:
-    async def call_tool(self, tool_name: str, arguments: Mapping[str, Any]) -> Any:
+    async def call_tool(self, tool_name: str, arguments: Mapping[str, JsonValue]) -> JsonValue:
         api_key = os.getenv("AMAP_MAPS_API_KEY")
         if not api_key:
             return {
@@ -211,7 +211,7 @@ class AmapMcpClient:
 def create_external_tools(
     command_runner: CommandRunner | None = None,
     amap_client: AmapClient | None = None,
-) -> list[Any]:
+) -> list[BaseTool]:
     runner = command_runner or SafeCommandRunner()
     amap = amap_client or AmapMcpClient()
 
@@ -262,7 +262,7 @@ def create_external_tools(
             "reverse geocode, IP location, weather, place search, route, and distance."
         ),
     )
-    async def amap_mcp_tool(tool_name: str, arguments: dict[str, Any]) -> str:
+    async def amap_mcp_tool(tool_name: str, arguments: JsonObject) -> str:
         return _dump(await call_amap_mcp_tool(amap, tool_name, arguments))
 
     @tool(
@@ -294,7 +294,7 @@ async def _run_readonly_cli(
     spec: CliSpec,
     args: Sequence[str],
     runner: CommandRunner,
-) -> dict[str, Any]:
+) -> JsonObject:
     validation_error = validate_readonly_cli_args(args, spec.allowed_domains)
     if validation_error is not None:
         return validation_error
@@ -308,7 +308,7 @@ async def _run_cli(
     spec: CliSpec,
     args: Sequence[str],
     runner: CommandRunner,
-) -> dict[str, Any]:
+) -> JsonObject:
     validation_error = validate_cli_args(args)
     if validation_error is not None:
         return validation_error
@@ -318,7 +318,7 @@ async def _run_cli(
     return await runner.run(command=command, args=list(args), timeout=timeout)
 
 
-def validate_cli_args(args: Sequence[str]) -> dict[str, Any] | None:
+def validate_cli_args(args: Sequence[str]) -> JsonObject | None:
     if not isinstance(args, list):
         return {"error": "invalid_args", "message": "argv must be a list of strings."}
     if not args:
@@ -333,7 +333,7 @@ def validate_cli_args(args: Sequence[str]) -> dict[str, Any] | None:
 def validate_readonly_cli_args(
     args: Sequence[str],
     allowed_domains: frozenset[str],
-) -> dict[str, Any] | None:
+) -> JsonObject | None:
     validation_error = validate_cli_args(args)
     if validation_error is not None:
         return validation_error
@@ -343,7 +343,7 @@ def validate_readonly_cli_args(
         return {
             "error": "disallowed_domain",
             "domain": domain,
-            "allowed_domains": sorted(allowed_domains),
+            "allowed_domains": _to_jsonable(sorted(allowed_domains)),
         }
 
     for arg in args:
@@ -361,22 +361,22 @@ def validate_readonly_cli_args(
 async def call_amap_mcp_tool(
     amap_client: AmapClient,
     tool_name: str,
-    arguments: Mapping[str, Any],
-) -> Any:
+    arguments: Mapping[str, JsonValue],
+) -> JsonValue:
     if tool_name not in ALLOWED_AMAP_TOOLS:
         return {
             "error": "disallowed_mcp_tool",
             "tool_name": tool_name,
-            "allowed_tools": sorted(ALLOWED_AMAP_TOOLS),
+            "allowed_tools": _to_jsonable(sorted(ALLOWED_AMAP_TOOLS)),
         }
     return await amap_client.call_tool(tool_name, arguments)
 
 
-async def query_weather(amap_client: AmapClient, city: str) -> Any:
+async def query_weather(amap_client: AmapClient, city: str) -> JsonValue:
     return await call_amap_mcp_tool(amap_client, "maps_weather", {"city": city})
 
 
-def external_tools_status_payload() -> dict[str, Any]:
+def external_tools_status_payload() -> JsonObject:
     lark_bin = os.getenv("LARK_CLI_BIN", "lark-cli")
     wecom_bin = os.getenv("WECOM_CLI_BIN", "wecom-cli")
     amap_command = os.getenv("AMAP_MCP_COMMAND", "npx")
@@ -391,7 +391,7 @@ def external_tools_status_payload() -> dict[str, Any]:
     }
 
 
-def _command_status(command: str) -> dict[str, Any]:
+def _command_status(command: str) -> JsonObject:
     resolved = _resolve_command(command)
     return {"command": command, "available": resolved is not None, "path": resolved}
 
@@ -471,12 +471,12 @@ def _decode_limited(value: bytes) -> str:
     return text
 
 
-def _parse_or_text(text: str) -> Any:
+def _parse_or_text(text: str) -> JsonValue:
     stripped = text.strip()
     if not stripped:
         return ""
     try:
-        return json.loads(stripped)
+        return _to_jsonable(json.loads(stripped))
     except json.JSONDecodeError:
         return stripped
 
@@ -510,9 +510,9 @@ def _redact_args(args: Sequence[str]) -> list[str]:
     return redacted
 
 
-def _to_jsonable(value: Any) -> Any:
+def _to_jsonable(value: object) -> JsonValue:
     if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json")
+        return _to_jsonable(value.model_dump(mode="json"))
     if isinstance(value, Mapping):
         return {
             str(key): ("***" if SENSITIVE_KEY_PATTERN.search(str(key)) else _to_jsonable(item))
@@ -520,8 +520,10 @@ def _to_jsonable(value: Any) -> Any:
         }
     if isinstance(value, list | tuple):
         return [_to_jsonable(item) for item in value]
-    return value
+    if isinstance(value, str | int | float | bool) or value is None:
+        return value
+    return str(value)
 
 
-def _dump(data: Any) -> str:
+def _dump(data: JsonValue) -> str:
     return json.dumps(_to_jsonable(data), ensure_ascii=False)

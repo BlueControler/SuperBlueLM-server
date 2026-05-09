@@ -11,12 +11,12 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
-from typing import Any
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
+from .json_types import JsonObject
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL_REPO = "ggml-org/gemma-4-E2B-it-GGUF"
@@ -59,7 +59,7 @@ class LocalModelRuntime:
         self._last_error: str | None = None
         self._config: LocalModelConfig | None = None
 
-    def set_network_connected(self, connected: bool) -> dict[str, Any]:
+    def set_network_connected(self, connected: bool) -> JsonObject:
         with self._lock:
             self._network_connected = connected
             if connected:
@@ -92,7 +92,7 @@ class LocalModelRuntime:
                 )
             return self._local_model
 
-    def status(self) -> dict[str, Any]:
+    def status(self) -> JsonObject:
         with self._lock:
             process = self._process
             running = process is not None and process.poll() is None
@@ -214,11 +214,11 @@ class LocalModelRuntime:
             api_key=SecretStr(os.getenv("LLAMA_CPP_API_KEY", "sk-local")),
             base_url=config.base_url,
             model=config.model_name,
-            max_tokens=max_tokens,  # type: ignore[arg-type]
+            max_tokens=max_tokens,  # type: ignore[call-arg]
         )
 
 
-def build_cloud_model():
+def build_cloud_model() -> ChatOpenAI | str:
     load_dotenv()
     openai_key = os.getenv("OPENAI_API_KEY")
     openai_model = os.getenv("OPENAI_MODEL", "gpt-5-mini")
@@ -229,7 +229,7 @@ def build_cloud_model():
             api_key=SecretStr(openai_key),
             base_url=openai_base_url,
             model=openai_model,
-            max_tokens=openai_max_tokens,  # type: ignore[arg-type]
+            max_tokens=openai_max_tokens,  # type: ignore[call-arg]
         )
 
     return "openai:gpt-5.4"
@@ -267,7 +267,7 @@ def _server_healthy(url: str, timeout: float) -> bool:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
             return 200 <= response.status < 500
-    except (OSError, urllib.error.URLError):
+    except OSError, urllib.error.URLError:
         return False
 
 

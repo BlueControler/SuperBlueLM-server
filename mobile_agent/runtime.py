@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from .phone_gateway import DeviceGateway
-from .system_gateway import SystemToolGateway
+from .gateways.phone import DeviceGateway
+from .gateways.system import SystemToolGateway
 
 phone_gateway = DeviceGateway()
 system_gateway = SystemToolGateway()

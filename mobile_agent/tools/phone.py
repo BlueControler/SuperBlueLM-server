@@ -2,31 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import TypedDict
 
-from langchain_core.tools import tool
+from langchain_core.tools import BaseTool, tool
 
-from .phone_gateway import DeviceGateway
-
-
-def _dump_result(result: dict[str, Any]) -> str:
-    return json.dumps(result, ensure_ascii=False)
+from ..gateways.phone import DeviceGateway
+from ..json_types import JsonObject, JsonValue
 
 
-def _summarize_result(result: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "ok": True,
-        "currentPackage": result.get("currentPackage"),
-        "activity": result.get("activity"),
-        "has_screenshot": bool(result.get("screenshot")),
-        "has_ui": bool(result.get("ui")),
-    }
+class PhoneToolSummary(TypedDict):
+    ok: bool
+    currentPackage: JsonValue
+    activity: JsonValue
+    has_screenshot: bool
+    has_ui: bool
 
 
-def create_phone_tools(gateway: DeviceGateway) -> list[Any]:
-    async def send(message: str, data: Any) -> dict[str, Any]:
-        session = gateway.get_session()
-        return await session.send_command(message, data)
+def create_phone_tools(gateway: DeviceGateway) -> list[BaseTool]:
+    async def send(message: str, data: JsonValue) -> JsonObject:
+        return await gateway.get_session().send_command(message, data)
 
     @tool("observe", description="Get the latest screenshot and UI tree from the phone.")
     async def observe() -> str:
@@ -45,20 +39,12 @@ def create_phone_tools(gateway: DeviceGateway) -> list[Any]:
         return _dump_result(_summarize_result(await send("type", {"text": text})))
 
     @tool("swipe", description="Swipe from one coordinate to another.")
-    async def swipe(
-        start_x: int,
-        start_y: int,
-        end_x: int,
-        end_y: int,
-    ) -> str:
-        return _dump_result(
-            _summarize_result(
-                await send(
-                    "swipe",
-                    {"startX": start_x, "startY": start_y, "endX": end_x, "endY": end_y},
-                )
-            )
+    async def swipe(start_x: int, start_y: int, end_x: int, end_y: int) -> str:
+        result = await send(
+            "swipe",
+            {"startX": start_x, "startY": start_y, "endX": end_x, "endY": end_y},
         )
+        return _dump_result(_summarize_result(result))
 
     @tool("long_press", description="Long press a screen coordinate.")
     async def long_press(x: int, y: int) -> str:
@@ -126,3 +112,17 @@ def create_phone_tools(gateway: DeviceGateway) -> list[Any]:
         interact,
         take_over,
     ]
+
+
+def _summarize_result(result: JsonObject) -> PhoneToolSummary:
+    return {
+        "ok": True,
+        "currentPackage": result.get("currentPackage"),
+        "activity": result.get("activity"),
+        "has_screenshot": bool(result.get("screenshot")),
+        "has_ui": bool(result.get("ui")),
+    }
+
+
+def _dump_result(result: PhoneToolSummary) -> str:
+    return json.dumps(result, ensure_ascii=False)

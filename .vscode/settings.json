@@ -2,5 +2,8 @@
     "json.schemaDownload.trustedDomains": {
         "https://langgra.ph/": true,
         "https://raw.githubusercontent.com": true
-    }
+    },
+    "cSpell.words": [
+        "keyevent"
+    ]
 }

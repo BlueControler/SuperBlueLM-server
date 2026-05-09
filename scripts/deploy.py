@@ -49,21 +49,21 @@ def build_deploy_plan(
         steps.append(
             DeployStep(
                 "setup-local-model",
-                (sys.executable, "-m", "entrypoints.setup", "llama:all"),
+                (sys.executable, "-m", "scripts.setup", "llama:all"),
             )
         )
     if profile == "full":
         steps.append(
             DeployStep(
                 "setup-external-tools",
-                (sys.executable, "-m", "entrypoints.setup", "external:all"),
+                (sys.executable, "-m", "scripts.setup", "external:all"),
             )
         )
 
     steps.append(
         DeployStep(
             "check-unified-setup",
-            (sys.executable, "-m", "entrypoints.setup", "check"),
+            (sys.executable, "-m", "scripts.setup", "check"),
             required=profile != "core",
         )
     )
@@ -172,8 +172,7 @@ def _check_python_version() -> int:
         print(f"python: {sys.version.split()[0]}")
         return 0
     print(
-        "error: Python >= 3.14 is required by pyproject.toml; "
-        f"current is {sys.version.split()[0]}."
+        f"error: Python >= 3.14 is required by pyproject.toml; current is {sys.version.split()[0]}."
     )
     return 1
 
@@ -210,7 +209,7 @@ def _health_check(url: str, *, timeout_seconds: float = 90) -> int:
                 if 200 <= response.status < 500:
                     print(f"healthy: {url}")
                     return 0
-        except (OSError, urllib.error.URLError):
+        except OSError, urllib.error.URLError:
             time.sleep(1)
     print(f"error: server did not become healthy: {url}")
     return 1
