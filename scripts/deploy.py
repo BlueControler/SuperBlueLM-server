@@ -33,7 +33,7 @@ def build_deploy_plan(
     install_deps: bool = True,
     check_python: bool = True,
 ) -> list[DeployStep]:
-    if profile not in {"core", "local", "full"}:
+    if profile not in {"core", "local", "external", "full"}:
         raise ValueError(f"unsupported deploy profile: {profile}")
 
     steps: list[DeployStep] = []
@@ -52,21 +52,33 @@ def build_deploy_plan(
                 (sys.executable, "-m", "scripts.setup", "llama:all"),
             )
         )
-    if profile == "full":
+        steps.append(
+            DeployStep(
+                "check-local-model-setup",
+                (sys.executable, "-m", "scripts.setup", "llama:check"),
+            )
+        )
+    if profile in {"external", "full"}:
         steps.append(
             DeployStep(
                 "setup-external-tools",
                 (sys.executable, "-m", "scripts.setup", "external:all"),
             )
         )
-
-    steps.append(
-        DeployStep(
-            "check-unified-setup",
-            (sys.executable, "-m", "scripts.setup", "check"),
-            required=profile != "core",
+        steps.append(
+            DeployStep(
+                "check-external-tools-setup",
+                (sys.executable, "-m", "scripts.setup", "external:check"),
+            )
         )
-    )
+    if profile == "core":
+        steps.append(
+            DeployStep(
+                "check-core-setup",
+                (sys.executable, "-m", "scripts.setup", "check"),
+                required=False,
+            )
+        )
 
     if start:
         steps.append(
@@ -209,7 +221,7 @@ def _health_check(url: str, *, timeout_seconds: float = 90) -> int:
                 if 200 <= response.status < 500:
                     print(f"healthy: {url}")
                     return 0
-        except OSError, urllib.error.URLError:
+        except (OSError, urllib.error.URLError):
             time.sleep(1)
     print(f"error: server did not become healthy: {url}")
     return 1
@@ -234,11 +246,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="One-command deployment helper.")
     parser.add_argument(
         "--profile",
-        choices=["core", "local", "full"],
+        choices=["core", "local", "external", "full"],
         default="full",
         help=(
-            "core installs Python dependencies and checks setup; local also installs "
-            "llama.cpp/model; full also installs and initializes external tools."
+            "core installs Python dependencies only; local adds llama.cpp/model; "
+            "external installs/checks business tools; full runs local then external."
         ),
     )
     parser.add_argument(

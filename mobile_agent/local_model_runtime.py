@@ -120,13 +120,13 @@ class LocalModelRuntime:
         if not server_binary.exists():
             raise LocalModelRuntimeError(
                 f"llama.cpp server binary not found: {server_binary}. "
-                "Run `python -m entrypoints.setup llama:all` first, or set "
+                "Run `python -m scripts.setup llama:all` first, or set "
                 "LLAMA_CPP_SERVER_BINARY."
             )
         if not model_path.exists():
             raise LocalModelRuntimeError(
                 f"local model file not found: {model_path}. "
-                "Run `python -m entrypoints.setup llama:all` first, or set "
+                "Run `python -m scripts.setup llama:all` first, or set "
                 "LLAMA_CPP_MODEL_PATH."
             )
 
@@ -267,7 +267,7 @@ def _server_healthy(url: str, timeout: float) -> bool:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
             return 200 <= response.status < 500
-    except OSError, urllib.error.URLError:
+    except (OSError, urllib.error.URLError):
         return False
 
 

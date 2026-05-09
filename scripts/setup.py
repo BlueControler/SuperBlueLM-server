@@ -59,13 +59,15 @@ def _run(command: list[str]) -> int:
 
 
 def check_external_tools() -> int:
-    commands = ["node", "npm", "npx", "lark-cli", "wecom-cli"]
+    commands = ["node", "npm", "lark-cli", "wecom-cli"]
     failed = False
     for command in commands:
         resolved = shutil.which(command)
         print(f"{command}: {resolved or 'not found'}")
         failed = failed or resolved is None
-    print(f"AMAP_MAPS_API_KEY: {'set' if os.getenv('AMAP_MAPS_API_KEY') else 'missing'}")
+    amap_key = os.getenv("AMAP_MAPS_API_KEY")
+    print(f"AMAP_MAPS_API_KEY: {'set' if amap_key else 'missing'}")
+    failed = failed or not amap_key
     return 1 if failed else 0
 
 
@@ -144,34 +146,55 @@ def _asset_for_target(release: dict[str, Any], target: str) -> dict[str, Any]:
     assets = release.get("assets", [])
     if not isinstance(assets, list):
         raise SetupError("llama.cpp release response did not contain assets.")
+    _validate_asset_target(target)
 
-    def names_containing(*parts: str) -> list[dict[str, Any]]:
-        matched = []
-        for asset in assets:
-            name = asset.get("name")
-            if isinstance(name, str) and all(part in name for part in parts):
-                matched.append(asset)
-        return matched
+    scored_assets: list[tuple[int, str, dict[str, Any]]] = []
+    for asset in assets:
+        name = asset.get("name")
+        if not isinstance(name, str):
+            continue
+        score = _asset_score_for_target(name, target)
+        if score is not None:
+            scored_assets.append((score, name, asset))
 
-    if target == "windows-x64":
-        candidates = names_containing("bin-win-x64")
-    elif target == "linux-x64":
-        candidates = names_containing("bin-ubuntu-x64")
-    elif target == "android-arm64":
-        candidates = names_containing("bin-android-arm64")
-    else:
-        raise SetupError(f"unsupported target: {target}")
-
-    preferred = [
-        asset
-        for asset in candidates
-        if not _asset_name_has_accelerator(str(asset.get("name", "")))
-    ]
-    selected = (preferred or candidates)[0] if (preferred or candidates) else None
-    if selected is None:
-        available = ", ".join(str(asset.get("name")) for asset in assets[:20])
+    if not scored_assets:
+        available = ", ".join(str(asset.get("name")) for asset in assets[:50])
         raise SetupError(f"no llama.cpp binary asset matched {target}. Available: {available}")
-    return selected
+
+    return sorted(scored_assets, key=lambda item: (item[0], item[1]))[0][2]
+
+
+def _asset_score_for_target(name: str, target: str) -> int | None:
+    lower = name.lower()
+    if target == "windows-x64":
+        if not (
+            lower.startswith("llama-")
+            and lower.endswith(".zip")
+            and "bin-win" in lower
+            and "x64" in lower
+        ):
+            return None
+        if "cpu" in lower:
+            return 0
+        if "cuda-12.4" in lower:
+            return 10
+        if "cuda" in lower or "cudart" in lower:
+            return 20
+        return 30
+    if target == "linux-x64":
+        if not (lower.endswith((".tar.gz", ".tgz")) and "bin-ubuntu" in lower and "x64" in lower):
+            return None
+        return 20 if _asset_name_has_accelerator(lower) else 0
+    if target == "android-arm64":
+        if lower.endswith((".tar.gz", ".tgz")) and "bin-android-arm64" in lower:
+            return 0
+        return None
+    _validate_asset_target(target)
+
+
+def _validate_asset_target(target: str) -> None:
+    if target not in {"windows-x64", "linux-x64", "android-arm64"}:
+        raise SetupError(f"unsupported target: {target}")
 
 
 def _asset_name_has_accelerator(name: str) -> bool:

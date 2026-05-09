@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
 set -eu
 
-python -m entrypoints.deploy "$@"
+PYTHON_BIN=${PYTHON:-python3}
+exec "$PYTHON_BIN" -m scripts.deploy "$@"

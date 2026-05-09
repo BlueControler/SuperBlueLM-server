@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import datetime
+import os
 from typing import Any, TypeAlias, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.messages import SystemMessage
@@ -19,6 +22,60 @@ from .state import (
 
 ModelHandler: TypeAlias = Callable[[ModelRequest[Any]], ModelResponse[Any]]
 AsyncModelHandler: TypeAlias = Callable[[ModelRequest[Any]], Awaitable[ModelResponse[Any]]]
+NowProvider: TypeAlias = Callable[[], datetime]
+CURRENT_TIME_MESSAGE_MARKER = "mobile_agent_current_time"
+
+
+def _agent_timezone() -> ZoneInfo:
+    timezone_name = os.getenv("AGENT_TIMEZONE", "Asia/Shanghai")
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("Asia/Shanghai")
+
+
+def _default_now() -> datetime:
+    return datetime.now(_agent_timezone())
+
+
+def build_current_time_message(now: datetime) -> SystemMessage:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("build_current_time_message requires a timezone-aware datetime")
+    timezone_name = getattr(now.tzinfo, "key", now.tzname()) or "unknown"
+    unix_millis = int(now.timestamp() * 1000)
+    return SystemMessage(
+        content=(
+            "当前时间: "
+            f"{now.isoformat()}\n"
+            f"UnixMillis: {unix_millis}\n"
+            f"Timezone: {timezone_name}\n"
+            "请使用此时间解析相对时间表达，例如今天、明天、昨天、稍后、本周。"
+        ),
+        additional_kwargs={CURRENT_TIME_MESSAGE_MARKER: True},
+    )
+
+
+def _is_routed_system_prompt(message: Any) -> bool:
+    return (
+        isinstance(message, SystemMessage)
+        and message.content in {SYSTEM_PROMPT, LOCAL_MODEL_SYSTEM_PROMPT}
+    )
+
+
+def _is_current_time_message(message: Any) -> bool:
+    return (
+        isinstance(message, SystemMessage)
+        and message.additional_kwargs.get(CURRENT_TIME_MESSAGE_MARKER) is True
+    )
+
+
+def _without_leading_routed_messages(messages: list[Any]) -> list[Any]:
+    remaining = list(messages)
+    while remaining and (
+        _is_routed_system_prompt(remaining[0]) or _is_current_time_message(remaining[0])
+    ):
+        remaining = remaining[1:]
+    return remaining
 
 
 class SyncPhoneStateMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
@@ -113,6 +170,9 @@ class RouteModelMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
 class RoutedSystemPromptMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
     state_schema = MobileAgentState
 
+    def __init__(self, now_provider: NowProvider = _default_now) -> None:
+        self.now_provider = now_provider
+
     def wrap_model_call(
         self,
         request: ModelRequest[Any],
@@ -140,6 +200,7 @@ class RoutedSystemPromptMiddleware(AgentMiddleware[MobileAgentState, None, Any])
         return request.override(
             messages=[
                 SystemMessage(content=prompt),
-                *request.messages,
+                build_current_time_message(self.now_provider()),
+                *_without_leading_routed_messages(request.messages),
             ],
         )

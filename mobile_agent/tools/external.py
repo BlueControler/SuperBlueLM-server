@@ -4,11 +4,11 @@ import asyncio
 import json
 import os
 import re
-import shlex
 import shutil
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
+from urllib.parse import urlencode
 
 from langchain_core.tools import BaseTool, tool
 
@@ -106,6 +106,15 @@ class AmapClient(Protocol):
     async def call_tool(self, tool_name: str, arguments: Mapping[str, JsonValue]) -> JsonValue: ...
 
 
+class AmapHttpCaller(Protocol):
+    async def __call__(
+        self,
+        url: str,
+        tool_name: str,
+        arguments: dict[str, JsonValue],
+    ) -> JsonValue: ...
+
+
 @dataclass(frozen=True)
 class CliSpec:
     name: str
@@ -176,36 +185,26 @@ class SafeCommandRunner:
         }
 
 
-class AmapMcpClient:
+class AmapHttpMcpClient:
+    def __init__(self, http_caller: AmapHttpCaller | None = None) -> None:
+        self._http_caller = http_caller or _call_streamable_http_mcp
+
     async def call_tool(self, tool_name: str, arguments: Mapping[str, JsonValue]) -> JsonValue:
         api_key = os.getenv("AMAP_MAPS_API_KEY")
         if not api_key:
             return {
                 "error": "missing_env",
                 "env": "AMAP_MAPS_API_KEY",
-                "message": "AMAP_MAPS_API_KEY is required for AMap MCP tools.",
+                "message": "AMAP_MAPS_API_KEY is required for AMap HTTP MCP tools.",
             }
 
         try:
-            from mcp import ClientSession, StdioServerParameters
-            from mcp.client.stdio import stdio_client
-        except ImportError as exc:
+            return await self._http_caller(_amap_http_url(api_key), tool_name, dict(arguments))
+        except Exception as exc:
             return {
-                "error": "missing_dependency",
-                "dependency": "mcp",
-                "message": str(exc),
+                "error": "amap_mcp_call_failed",
+                "message": _redact_text(str(exc)).replace(api_key, "***"),
             }
-
-        server_params = StdioServerParameters(
-            command=os.getenv("AMAP_MCP_COMMAND", "npx"),
-            args=_amap_mcp_args(),
-            env=_amap_mcp_env(api_key),
-        )
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(tool_name, dict(arguments))
-                return _to_jsonable(result)
 
 
 def create_external_tools(
@@ -213,7 +212,7 @@ def create_external_tools(
     amap_client: AmapClient | None = None,
 ) -> list[BaseTool]:
     runner = command_runner or SafeCommandRunner()
-    amap = amap_client or AmapMcpClient()
+    amap = amap_client or AmapHttpMcpClient()
 
     @tool(
         "feishu_cli_readonly",
@@ -274,7 +273,7 @@ def create_external_tools(
 
     @tool(
         "external_tools_status",
-        description="Check local availability of Node, npm, npx, Feishu CLI, WeCom CLI, and AMap key.",
+        description="Check local availability of Node, npm, Feishu CLI, WeCom CLI, and AMap HTTP MCP key.",
     )
     async def external_tools_status() -> str:
         return _dump(external_tools_status_payload())
@@ -379,15 +378,15 @@ async def query_weather(amap_client: AmapClient, city: str) -> JsonValue:
 def external_tools_status_payload() -> JsonObject:
     lark_bin = os.getenv("LARK_CLI_BIN", "lark-cli")
     wecom_bin = os.getenv("WECOM_CLI_BIN", "wecom-cli")
-    amap_command = os.getenv("AMAP_MCP_COMMAND", "npx")
+    api_key = os.getenv("AMAP_MAPS_API_KEY")
     return {
         "node": _command_status("node"),
         "npm": _command_status("npm"),
-        "npx": _command_status("npx"),
         "feishu_cli": _command_status(lark_bin),
         "wecom_cli": _command_status(wecom_bin),
-        "amap_mcp_command": _command_status(amap_command),
-        "amap_maps_api_key": bool(os.getenv("AMAP_MAPS_API_KEY")),
+        "amap_mcp_transport": "http",
+        "amap_http_url": _redact_text(_amap_http_url(api_key or "***")),
+        "amap_maps_api_key": bool(api_key),
     }
 
 
@@ -428,39 +427,32 @@ def _tool_timeout() -> float:
         return DEFAULT_TIMEOUT_SECONDS
 
 
-def _amap_mcp_args() -> list[str]:
-    raw = os.getenv("AMAP_MCP_ARGS")
-    if not raw:
-        return ["-y", "@amap/amap-maps-mcp-server"]
+def _amap_http_url(api_key: str) -> str:
+    base_url = os.getenv("AMAP_MCP_HTTP_URL", "https://mcp.amap.com/mcp")
+    separator = "" if base_url.endswith(("?", "&")) else "&" if "?" in base_url else "?"
+    return f"{base_url}{separator}{urlencode({'key': api_key})}"
+
+
+async def _call_streamable_http_mcp(
+    url: str,
+    tool_name: str,
+    arguments: dict[str, JsonValue],
+) -> JsonValue:
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return shlex.split(raw)
-    if isinstance(parsed, list) and all(isinstance(item, str) for item in parsed):
-        return parsed
-    return ["-y", "@amap/amap-maps-mcp-server"]
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+    except ImportError as exc:
+        return {
+            "error": "missing_dependency",
+            "dependency": "mcp",
+            "message": str(exc),
+        }
 
-
-def _amap_mcp_env(api_key: str) -> dict[str, str]:
-    env = {"AMAP_MAPS_API_KEY": api_key}
-    for key in (
-        "PATH",
-        "Path",
-        "PATHEXT",
-        "SystemRoot",
-        "SYSTEMROOT",
-        "COMSPEC",
-        "TEMP",
-        "TMP",
-        "HOME",
-        "USERPROFILE",
-        "APPDATA",
-        "LOCALAPPDATA",
-    ):
-        value = os.getenv(key)
-        if value:
-            env[key] = value
-    return env
+    async with streamablehttp_client(url) as (read_stream, write_stream, _get_session_id):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            result = await session.call_tool(tool_name, arguments)
+            return _to_jsonable(result)
 
 
 def _decode_limited(value: bytes) -> str:

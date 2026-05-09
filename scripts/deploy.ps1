@@ -1,3 +1,4 @@
 $ErrorActionPreference = "Stop"
 
-python -m entrypoints.deploy @args
+python -m scripts.deploy @args
+exit $LASTEXITCODE
