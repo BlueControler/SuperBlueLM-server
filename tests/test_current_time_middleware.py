@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfoNotFoundError
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+import mobile_agent.agent.middleware as agent_middleware
 from mobile_agent.agent.middleware import (
     RoutedSystemPromptMiddleware,
     build_current_time_message,
 )
 from mobile_agent.prompt_assets import LOCAL_MODEL_SYSTEM_PROMPT, SYSTEM_PROMPT
+
+SHANGHAI_TZ = timezone(timedelta(hours=8), "Asia/Shanghai")
 
 
 @dataclass(frozen=True)
@@ -33,7 +36,7 @@ def test_routed_system_prompt_includes_current_time_after_prompt(monkeypatch: An
         "mobile_agent.agent.middleware.model_runtime.status",
         lambda: {"mode": "cloud"},
     )
-    fixed = datetime(2026, 5, 9, 10, 30, 5, tzinfo=ZoneInfo("Asia/Shanghai"))
+    fixed = datetime(2026, 5, 9, 10, 30, 5, tzinfo=SHANGHAI_TZ)
     middleware = RoutedSystemPromptMiddleware(now_provider=lambda: fixed)
     user_message = HumanMessage(content="\u4eca\u5929\u6709\u4ec0\u4e48\u5b89\u6392?")
     request = FakeRequest(
@@ -72,7 +75,7 @@ def test_routed_system_prompt_uses_local_prompt_in_local_mode(monkeypatch: Any) 
         "mobile_agent.agent.middleware.model_runtime.status",
         lambda: {"mode": "local"},
     )
-    fixed = datetime(2026, 5, 9, 10, 30, 5, tzinfo=ZoneInfo("Asia/Shanghai"))
+    fixed = datetime(2026, 5, 9, 10, 30, 5, tzinfo=SHANGHAI_TZ)
     middleware = RoutedSystemPromptMiddleware(now_provider=lambda: fixed)
     user_message = HumanMessage(content="hello")
     request = FakeRequest(
@@ -100,8 +103,8 @@ def test_routed_system_prompt_replaces_existing_routed_pair(monkeypatch: Any) ->
         "mobile_agent.agent.middleware.model_runtime.status",
         lambda: {"mode": "cloud"},
     )
-    old_time = datetime(2026, 5, 9, 8, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
-    new_time = datetime(2026, 5, 9, 10, 30, 5, tzinfo=ZoneInfo("Asia/Shanghai"))
+    old_time = datetime(2026, 5, 9, 8, 0, 0, tzinfo=SHANGHAI_TZ)
+    new_time = datetime(2026, 5, 9, 10, 30, 5, tzinfo=SHANGHAI_TZ)
     human_message = HumanMessage(content="keep me")
     middleware = RoutedSystemPromptMiddleware(now_provider=lambda: new_time)
     request = FakeRequest(
@@ -136,3 +139,22 @@ def test_build_current_time_message_rejects_naive_datetime() -> None:
         assert "timezone-aware datetime" in str(exc)
     else:
         raise AssertionError("Expected ValueError for naive datetime")
+
+
+def test_agent_timezone_uses_fixed_shanghai_fallback_when_zoneinfo_data_missing(
+    monkeypatch: Any,
+) -> None:
+    def missing_zoneinfo(key: str) -> timezone:
+        raise ZoneInfoNotFoundError(f"No time zone found with key {key}")
+
+    monkeypatch.setattr(agent_middleware, "ZoneInfo", missing_zoneinfo)
+
+    fallback_timezone = agent_middleware._agent_timezone()
+    now = agent_middleware._default_now()
+    fixed = datetime(2026, 5, 9, 10, 30, 5, tzinfo=fallback_timezone)
+    message = build_current_time_message(fixed)
+
+    assert now.tzinfo is fallback_timezone
+    assert fixed.isoformat() == "2026-05-09T10:30:05+08:00"
+    assert fixed.tzname() == "Asia/Shanghai"
+    assert "Timezone: Asia/Shanghai" in message.content

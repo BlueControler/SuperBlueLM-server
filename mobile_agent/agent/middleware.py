@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import datetime, timedelta, timezone, tzinfo
 import os
 from typing import Any, TypeAlias, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -24,14 +24,21 @@ ModelHandler: TypeAlias = Callable[[ModelRequest[Any]], ModelResponse[Any]]
 AsyncModelHandler: TypeAlias = Callable[[ModelRequest[Any]], Awaitable[ModelResponse[Any]]]
 NowProvider: TypeAlias = Callable[[], datetime]
 CURRENT_TIME_MESSAGE_MARKER = "mobile_agent_current_time"
+DEFAULT_TIMEZONE = "Asia/Shanghai"
+FALLBACK_TIMEZONE = timezone(timedelta(hours=8), DEFAULT_TIMEZONE)
 
 
-def _agent_timezone() -> ZoneInfo:
-    timezone_name = os.getenv("AGENT_TIMEZONE", "Asia/Shanghai")
+def _agent_timezone() -> tzinfo:
+    timezone_name = os.getenv("AGENT_TIMEZONE", DEFAULT_TIMEZONE)
     try:
         return ZoneInfo(timezone_name)
     except ZoneInfoNotFoundError:
-        return ZoneInfo("Asia/Shanghai")
+        if timezone_name != DEFAULT_TIMEZONE:
+            try:
+                return ZoneInfo(DEFAULT_TIMEZONE)
+            except ZoneInfoNotFoundError:
+                pass
+        return FALLBACK_TIMEZONE
 
 
 def _default_now() -> datetime:
