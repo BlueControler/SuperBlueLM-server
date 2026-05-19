@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from ..gateways.system import SystemGatewayError, SystemToolGateway
 from ..json_types import JsonObject, JsonValue, to_json_value
+from ..progress import emit_task_progress
 
 
 class CalendarEventArgs(BaseModel):
@@ -121,11 +122,34 @@ class GetLocationArgs(BaseModel):
 
 
 def create_system_tools(gateway: SystemToolGateway) -> list[BaseTool]:
-    async def send(message: str, data: JsonValue) -> str:
+    async def send(tool_name: str, message: str, data: JsonValue) -> str:
+        emit_task_progress(
+            label=tool_name,
+            status="running",
+            phase="system_tool",
+            message=f"Running system tool: {tool_name}",
+            tool_name=tool_name,
+        )
         try:
-            return _dump(await gateway.get_default_client().send_request(message, data))
+            result = await gateway.get_default_client().send_request(message, data)
         except SystemGatewayError as exc:
+            emit_task_progress(
+                label=tool_name,
+                status="failed",
+                phase="system_tool",
+                message=f"System tool failed: {tool_name}",
+                tool_name=tool_name,
+                error=str(exc),
+            )
             return _dump({"error": str(exc)})
+        emit_task_progress(
+            label=tool_name,
+            status="completed",
+            phase="system_tool",
+            message=f"Completed system tool: {tool_name}",
+            tool_name=tool_name,
+        )
+        return _dump(result)
 
     @tool(
         "list_apps",
@@ -136,7 +160,7 @@ def create_system_tools(gateway: SystemToolGateway) -> list[BaseTool]:
         ),
     )
     async def list_apps(app_type: str = "all") -> str:
-        return await send("listApps", {"type": app_type})
+        return await send("list_apps", "listApps", {"type": app_type})
 
     @tool(
         "create_event",
@@ -144,7 +168,7 @@ def create_system_tools(gateway: SystemToolGateway) -> list[BaseTool]:
         description="Create a calendar event through the /system tool client. The event follows CalendarContract fields.",
     )
     async def create_event(event: CalendarEventArgs) -> str:
-        return await send("createEvent", {"event": _json_object(event)})
+        return await send("create_event", "createEvent", {"event": _json_object(event)})
 
     @tool(
         "list_events",
@@ -152,7 +176,7 @@ def create_system_tools(gateway: SystemToolGateway) -> list[BaseTool]:
         description="List calendar events whose start or end time falls within [start, end], timestamps in milliseconds.",
     )
     async def list_events(start: int, end: int) -> str:
-        return await send("listEvents", {"start": start, "end": end})
+        return await send("list_events", "listEvents", {"start": start, "end": end})
 
     @tool(
         "update_event",
@@ -160,7 +184,7 @@ def create_system_tools(gateway: SystemToolGateway) -> list[BaseTool]:
         description="Update an existing calendar event. To delete an event, set status to cancelled.",
     )
     async def update_event(event: CalendarEventArgs) -> str:
-        return await send("updateEvent", {"event": _json_object(event)})
+        return await send("update_event", "updateEvent", {"event": _json_object(event)})
 
     @tool(
         "list_reminders",
@@ -168,7 +192,7 @@ def create_system_tools(gateway: SystemToolGateway) -> list[BaseTool]:
         description="List all reminders attached to a calendar event.",
     )
     async def list_reminders(event_id: int) -> str:
-        return await send("listReminders", {"eventId": event_id})
+        return await send("list_reminders", "listReminders", {"eventId": event_id})
 
     @tool(
         "update_reminders",
@@ -179,6 +203,7 @@ def create_system_tools(gateway: SystemToolGateway) -> list[BaseTool]:
         event_id: int, reminders: list[CalendarReminderArgs]
     ) -> str:
         return await send(
+            "update_reminders",
             "updateReminders",
             {
                 "eventId": event_id,
@@ -192,7 +217,7 @@ def create_system_tools(gateway: SystemToolGateway) -> list[BaseTool]:
         description="Get current device location through the /system tool client.",
     )
     async def get_location() -> str:
-        return await send("getLocation", None)
+        return await send("get_location", "getLocation", None)
 
     return [
         list_apps,

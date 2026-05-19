@@ -5,7 +5,7 @@ import json
 import os
 import re
 import shutil
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urlencode
@@ -13,6 +13,7 @@ from urllib.parse import urlencode
 from langchain_core.tools import BaseTool, tool
 
 from ..json_types import JsonObject, JsonValue
+from ..progress import emit_task_progress
 
 MAX_OUTPUT_BYTES = 256 * 1024
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -214,6 +215,38 @@ def create_external_tools(
     runner = command_runner or SafeCommandRunner()
     amap = amap_client or AmapHttpMcpClient()
 
+    async def run_external_tool(
+        label: str,
+        action: Callable[[], Awaitable[JsonValue]],
+    ) -> str:
+        emit_task_progress(
+            label=label,
+            status="running",
+            phase="external_tool",
+            message=f"Running external tool: {label}",
+            tool_name=label,
+        )
+        try:
+            result = await action()
+        except Exception as exc:
+            emit_task_progress(
+                label=label,
+                status="failed",
+                phase="external_tool",
+                message=f"External tool failed: {label}",
+                tool_name=label,
+                error=str(exc),
+            )
+            raise
+        emit_task_progress(
+            label=label,
+            status="completed",
+            phase="external_tool",
+            message=f"Completed external tool: {label}",
+            tool_name=label,
+        )
+        return _dump(result)
+
     @tool(
         "feishu_cli_readonly",
         description=(
@@ -222,7 +255,10 @@ def create_external_tools(
         ),
     )
     async def feishu_cli_readonly(argv: list[str]) -> str:
-        return _dump(await _run_readonly_cli(FEISHU_CLI, argv, runner))
+        return await run_external_tool(
+            "feishu_cli_readonly",
+            lambda: _run_readonly_cli(FEISHU_CLI, argv, runner),
+        )
 
     @tool(
         "wecom_cli_readonly",
@@ -232,7 +268,10 @@ def create_external_tools(
         ),
     )
     async def wecom_cli_readonly(argv: list[str]) -> str:
-        return _dump(await _run_readonly_cli(WECOM_CLI, argv, runner))
+        return await run_external_tool(
+            "wecom_cli_readonly",
+            lambda: _run_readonly_cli(WECOM_CLI, argv, runner),
+        )
 
     @tool(
         "feishu_cli",
@@ -242,7 +281,10 @@ def create_external_tools(
         ),
     )
     async def feishu_cli(argv: list[str]) -> str:
-        return _dump(await _run_cli(FEISHU_CLI, argv, runner))
+        return await run_external_tool(
+            "feishu_cli",
+            lambda: _run_cli(FEISHU_CLI, argv, runner),
+        )
 
     @tool(
         "wecom_cli",
@@ -252,7 +294,10 @@ def create_external_tools(
         ),
     )
     async def wecom_cli(argv: list[str]) -> str:
-        return _dump(await _run_cli(WECOM_CLI, argv, runner))
+        return await run_external_tool(
+            "wecom_cli",
+            lambda: _run_cli(WECOM_CLI, argv, runner),
+        )
 
     @tool(
         "amap_mcp_tool",
@@ -262,21 +307,30 @@ def create_external_tools(
         ),
     )
     async def amap_mcp_tool(tool_name: str, arguments: JsonObject) -> str:
-        return _dump(await call_amap_mcp_tool(amap, tool_name, arguments))
+        return await run_external_tool(
+            "amap_mcp_tool",
+            lambda: call_amap_mcp_tool(amap, tool_name, arguments),
+        )
 
     @tool(
         "weather_query",
         description="Query weather through AMap MCP maps_weather. city can be a city name or adcode.",
     )
     async def weather_query(city: str) -> str:
-        return _dump(await query_weather(amap, city))
+        return await run_external_tool(
+            "weather_query",
+            lambda: query_weather(amap, city),
+        )
 
     @tool(
         "external_tools_status",
         description="Check local availability of Node, npm, Feishu CLI, WeCom CLI, and AMap HTTP MCP key.",
     )
     async def external_tools_status() -> str:
-        return _dump(external_tools_status_payload())
+        async def status_payload() -> JsonObject:
+            return external_tools_status_payload()
+
+        return await run_external_tool("external_tools_status", status_payload)
 
     return [
         feishu_cli_readonly,
