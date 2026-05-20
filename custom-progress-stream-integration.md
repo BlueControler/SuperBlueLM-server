@@ -25,7 +25,7 @@ The request must include `custom` in `stream_mode`:
 The Android frontend already sends this stream mode from:
 
 ```text
-D:\aigc\AIGC_Figma_Frontend\app\src\main\java\com\example\blueheartv\chat\AgentServerClient.kt
+AIGC_Figma_Frontend\app\src\main\java\com\example\blueheartv\chat\AgentServerClient.kt
 ```
 
 ## Custom Progress Payload
@@ -73,7 +73,7 @@ Optional fields:
 Backend helper:
 
 ```text
-D:\aigc\SuperBlueLM-server\mobile_agent\progress.py
+SuperBlueLM-server\mobile_agent\progress.py
 ```
 
 Current wrapped tool groups:
@@ -89,21 +89,21 @@ The helper uses LangGraph `get_stream_writer()`. If a tool runs outside a stream
 Frontend model/event files:
 
 ```text
-D:\aigc\AIGC_Figma_Frontend\app\src\main\java\com\example\blueheartv\chat\ChatStreamEvent.kt
-D:\aigc\AIGC_Figma_Frontend\app\src\main\java\com\example\blueheartv\model\Message.kt
+AIGC_Figma_Frontend\app\src\main\java\com\example\blueheartv\chat\ChatStreamEvent.kt
+AIGC_Figma_Frontend\app\src\main\java\com\example\blueheartv\model\Message.kt
 ```
 
 Frontend parser:
 
 ```text
-D:\aigc\AIGC_Figma_Frontend\app\src\main\java\com\example\blueheartv\chat\AgentServerClient.kt
+AIGC_Figma_Frontend\app\src\main\java\com\example\blueheartv\chat\AgentServerClient.kt
 ```
 
 Frontend state/UI:
 
 ```text
-D:\aigc\AIGC_Figma_Frontend\app\src\main\java\com\example\blueheartv\viewmodel\ChatViewModel.kt
-D:\aigc\AIGC_Figma_Frontend\app\src\main\java\com\example\blueheartv\ui\components\ChatBubble.kt
+AIGC_Figma_Frontend\app\src\main\java\com\example\blueheartv\viewmodel\ChatViewModel.kt
+AIGC_Figma_Frontend\app\src\main\java\com\example\blueheartv\ui\components\ChatBubble.kt
 ```
 
 Frontend behavior:
