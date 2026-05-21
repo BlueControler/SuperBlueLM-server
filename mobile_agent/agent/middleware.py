@@ -7,18 +7,20 @@ from typing import Any, TypeAlias, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.runtime import Runtime
 
 from ..gateways.phone import DeviceGateway
 from ..local_model_runtime import model_runtime
 from ..prompt_assets import LOCAL_MODEL_SYSTEM_PROMPT, SYSTEM_PROMPT
+from ..progress import emit_task_complexity
 from .state import (
     MobileAgentState,
     PhoneSnapshot,
     build_phone_snapshot,
     build_phone_state_message,
 )
+from .task_complexity import classify_task_complexity
 
 ModelHandler: TypeAlias = Callable[[ModelRequest[Any]], ModelResponse[Any]]
 AsyncModelHandler: TypeAlias = Callable[[ModelRequest[Any]], Awaitable[ModelResponse[Any]]]
@@ -83,6 +85,57 @@ def _without_leading_routed_messages(messages: list[Any]) -> list[Any]:
     ):
         remaining = remaining[1:]
     return remaining
+
+
+def _latest_human_text(messages: list[BaseMessage]) -> str:
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            return _message_content_to_text(message.content)
+    return ""
+
+
+def _message_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
+class TaskComplexityMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
+    state_schema = MobileAgentState
+
+    def before_model(
+        self,
+        state: MobileAgentState,
+        runtime: Runtime[None],
+    ) -> dict[str, bool] | None:
+        if state.get("task_complexity_emitted") is True:
+            return None
+
+        text = _latest_human_text(cast(list[BaseMessage], state.get("messages", [])))
+        result = classify_task_complexity(text)
+        emit_task_complexity(
+            complexity=result.complexity,
+            track_steps=result.track_steps,
+            reason=result.reason,
+        )
+        return {"task_complexity_emitted": True}
+
+    async def abefore_model(
+        self,
+        state: MobileAgentState,
+        runtime: Runtime[None],
+    ) -> dict[str, bool] | None:
+        return self.before_model(state, runtime)
 
 
 class SyncPhoneStateMiddleware(AgentMiddleware[MobileAgentState, None, Any]):

@@ -8,8 +8,10 @@ from langgraph.config import get_stream_writer
 from .json_types import JsonObject, JsonValue, to_json_value
 
 ProgressStatus = Literal["started", "running", "completed", "failed"]
+TaskComplexity = Literal["simple", "complex"]
 
 TASK_PROGRESS_TYPE = "task_progress"
+TASK_COMPLEXITY_TYPE = "task_complexity"
 
 
 def emit_task_progress(
@@ -40,6 +42,28 @@ def emit_task_progress(
         list(completed_steps) if completed_steps is not None else None,
     )
     _put_if_present(payload, "error", error)
+
+    try:
+        writer = get_stream_writer()
+    except Exception:
+        return
+    writer(payload)
+
+
+def emit_task_complexity(
+    *,
+    complexity: TaskComplexity,
+    track_steps: bool,
+    reason: str,
+    message: str | None = None,
+) -> None:
+    payload: JsonObject = {
+        "type": TASK_COMPLEXITY_TYPE,
+        "complexity": complexity,
+        "trackSteps": track_steps,
+        "reason": reason,
+    }
+    _put_if_present(payload, "message", message)
 
     try:
         writer = get_stream_writer()

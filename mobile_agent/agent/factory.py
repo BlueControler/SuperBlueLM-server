@@ -15,6 +15,7 @@ from .middleware import (
     RouteModelMiddleware,
     RoutedSystemPromptMiddleware,
     SyncPhoneStateMiddleware,
+    TaskComplexityMiddleware,
 )
 
 
@@ -22,6 +23,7 @@ def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway)
     middleware = cast(
         list[AgentMiddleware[AgentState[Any], None, Any]],
         [
+            TaskComplexityMiddleware(),
             RouteModelMiddleware(),
             RoutedSystemPromptMiddleware(),
             SyncPhoneStateMiddleware(phone_gateway),

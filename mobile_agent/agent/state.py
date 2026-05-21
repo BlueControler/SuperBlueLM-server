@@ -22,6 +22,7 @@ class PhoneSnapshot(TypedDict):
 
 class MobileAgentState(AgentState[object], total=False):
     phone_snapshot: NotRequired[Annotated[PhoneSnapshot | None, PrivateStateAttr]]
+    task_complexity_emitted: NotRequired[Annotated[bool, PrivateStateAttr]]
 
 
 def build_phone_snapshot(session: ConnectedDeviceSession) -> PhoneSnapshot:

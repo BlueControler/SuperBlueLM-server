@@ -30,7 +30,46 @@ AIGC_Figma_Frontend\app\src\main\java\com\example\blueheartv\chat\AgentServerCli
 
 ## Custom Progress Payload
 
-Backend emits a LangGraph `custom` chunk shaped as:
+Backend emits two kinds of LangGraph `custom` chunks:
+
+- `task_complexity`: task-level complexity classification, sent once near the beginning of a run.
+- `task_progress`: step/tool-level progress updates, sent during tool execution.
+
+## Task Complexity Payload
+
+Backend emits this chunk once per run, near the beginning of task handling:
+
+```json
+{
+  "type": "task_complexity",
+  "complexity": "complex",
+  "trackSteps": true,
+  "reason": "tool_or_external_action_required"
+}
+```
+
+Required fields:
+
+- `type`: must be `task_complexity`.
+- `complexity`: `simple` or `complex`.
+- `trackSteps`: `false` for pure text-only answers, `true` for tasks that need tools, APIs, phone actions, system reads, or external queries.
+- `reason`: currently `text_only_answer` or `tool_or_external_action_required`.
+
+Classification rule:
+
+- `simple`: pure text answer only. No phone action, system read, external query, API lookup, or tool use is expected.
+- `complex`: any task that may require phone tools, system tools, external tools, API queries, real-time data lookup, or multi-step execution.
+
+Examples:
+
+- `解释一下 LangGraph 是什么` -> `simple`, `trackSteps=false`.
+- `查询深圳今天的天气` -> `complex`, `trackSteps=true`.
+- `读取当前手机已安装应用列表` -> `complex`, `trackSteps=true`.
+- `打开浏览器，搜索蓝心小V` -> `complex`, `trackSteps=true`.
+
+## Task Progress Payload
+
+Backend emits progress chunks shaped as:
 
 ```json
 {
@@ -124,6 +163,7 @@ Preconditions:
 - Phone-control client is already connected to the backend `/adb` WebSocket.
 - System service is already connected to the backend `/system` WebSocket when the scenario requires system tools.
 - Frontend stream requests already include `custom` in `stream_mode`.
+- Each run should receive at most one `task_complexity` chunk before or near the first model/tool activity.
 
 The scenarios below do not verify deployment, port availability, WebSocket connection setup, or health-check endpoints. They verify agent behavior after the system is connected.
 
@@ -154,7 +194,8 @@ Required tools:
 
 Expected task complexity state:
 
-- Initial state: task is simple or medium complexity because it requires visual observation plus one phone action.
+- Initial state: `task_complexity` should be `complex` because phone tools are required.
+- `trackSteps` should be `true`.
 - During execution: current step should advance from observation to tap.
 - Final state: task should be marked complete after the phone reports the tap result.
 
@@ -206,7 +247,8 @@ Optional tools:
 
 Expected task complexity state:
 
-- Initial state: task is simple because it requires one system read.
+- Initial state: `task_complexity` should be `complex` because a system tool is required.
+- `trackSteps` should be `true`.
 - During execution: current step should represent the `list_apps` read.
 - Final state: task should be marked complete after the system tool result is summarized.
 
@@ -255,7 +297,8 @@ Optional tools:
 
 Expected task complexity state:
 
-- Initial state: task is simple because it requires one external read and one summary.
+- Initial state: `task_complexity` should be `complex` because an external tool/API query is required.
+- `trackSteps` should be `true`.
 - During execution: current step should represent the weather lookup.
 - Final state: task should be marked complete after the weather result is summarized.
 
@@ -313,7 +356,8 @@ Required tools:
 
 Expected task complexity state:
 
-- Initial state: task should be classified as complex because it requires several dependent phone actions.
+- Initial state: `task_complexity` should be `complex` because it requires several dependent phone actions.
+- `trackSteps` should be `true`.
 - During execution: the stream should expose the current action and completed steps.
 - Final state: task should be marked complete only after the final page state is confirmed.
 
@@ -364,7 +408,8 @@ Required tools:
 
 Expected task complexity state:
 
-- Initial state: task is simple because it requires one phone observation.
+- Initial state: `task_complexity` should be `complex` because a phone tool is required.
+- `trackSteps` should be `true`.
 - During execution: `observe` should enter running state.
 - Failure state: `observe` should transition to failed state if the phone tool cannot complete.
 
