@@ -44,7 +44,7 @@ Backend emits this chunk once per run, near the beginning of task handling:
   "type": "task_complexity",
   "complexity": "complex",
   "trackSteps": true,
-  "reason": "tool_or_external_action_required"
+  "reason": "multi_step_plan_required"
 }
 ```
 
@@ -52,19 +52,22 @@ Required fields:
 
 - `type`: must be `task_complexity`.
 - `complexity`: `simple` or `complex`.
-- `trackSteps`: `false` for pure text-only answers, `true` for tasks that need tools, APIs, phone actions, system reads, or external queries.
-- `reason`: currently `text_only_answer` or `tool_or_external_action_required`.
+- `trackSteps`: `false` for pure text-only answers or tasks expected to need 0/1 tool call, `true` for tasks that need planning into multiple dependent steps.
+- `reason`: currently `text_only_answer`, `zero_or_one_tool_call`, or `multi_step_plan_required`.
 
 Classification rule:
 
-- `simple`: pure text answer only. No phone action, system read, external query, API lookup, or tool use is expected.
-- `complex`: any task that may require phone tools, system tools, external tools, API queries, real-time data lookup, or multi-step execution.
+- `simple`: pure text answer, or a task expected to complete with 0/1 tool call. Examples include one weather lookup, one system read, or one phone observation.
+- `complex`: a task that must be planned into multiple dependent steps or is expected to use more than one tool/action/tool domain.
 
 Examples:
 
 - `解释一下 LangGraph 是什么` -> `simple`, `trackSteps=false`.
-- `查询深圳今天的天气` -> `complex`, `trackSteps=true`.
-- `读取当前手机已安装应用列表` -> `complex`, `trackSteps=true`.
+- `查询深圳今天的天气` -> `simple`, `trackSteps=false`.
+- `读取当前手机已安装应用列表` -> `simple`, `trackSteps=false`.
+- `观察当前手机页面` -> `simple`, `trackSteps=false`.
+- `查询深圳天气，并读取当前手机已安装应用列表` -> `complex`, `trackSteps=true`.
+- `观察当前手机页面，并点击屏幕上的搜索框` -> `complex`, `trackSteps=true`.
 - `打开浏览器，搜索蓝心小V` -> `complex`, `trackSteps=true`.
 
 ## Task Progress Payload
@@ -194,7 +197,7 @@ Required tools:
 
 Expected task complexity state:
 
-- Initial state: `task_complexity` should be `complex` because phone tools are required.
+- Initial state: `task_complexity` should be `complex` because the task requires at least two dependent actions: observe the screen and tap the target.
 - `trackSteps` should be `true`.
 - During execution: current step should advance from observation to tap.
 - Final state: task should be marked complete after the phone reports the tap result.
@@ -247,16 +250,16 @@ Optional tools:
 
 Expected task complexity state:
 
-- Initial state: `task_complexity` should be `complex` because a system tool is required.
-- `trackSteps` should be `true`.
-- During execution: current step should represent the `list_apps` read.
+- Initial state: `task_complexity` should be `simple` because the task is expected to need one system read tool.
+- `trackSteps` should be `false`.
+- During execution: `list_apps` progress may still be streamed, but step tracking is not required.
 - Final state: task should be marked complete after the system tool result is summarized.
 
 Expected progress stream:
 
 - `task_progress` chunk for `list_apps` with `phase=system_tool` and `status=running`.
 - `task_progress` chunk for `list_apps` with `phase=system_tool` and `status=completed`.
-- If step counters are available, the frontend should be able to show `1/1`.
+- Step counters are optional and not required for this simple one-tool scenario.
 
 Expected result:
 
@@ -267,7 +270,7 @@ Completion indicators:
 
 - The agent calls `list_apps`.
 - The progress stream contains `phase=system_tool`.
-- The completed steps / total steps match the expected one-step flow when counters are present.
+- The initial `task_complexity` chunk uses `complexity=simple` and `trackSteps=false`.
 - The assistant response is based on the `list_apps` result.
 
 ### Scenario 3: External Tool Read
@@ -297,16 +300,16 @@ Optional tools:
 
 Expected task complexity state:
 
-- Initial state: `task_complexity` should be `complex` because an external tool/API query is required.
-- `trackSteps` should be `true`.
-- During execution: current step should represent the weather lookup.
+- Initial state: `task_complexity` should be `simple` because the task is expected to need one external lookup tool.
+- `trackSteps` should be `false`.
+- During execution: weather tool progress may still be streamed, but step tracking is not required.
 - Final state: task should be marked complete after the weather result is summarized.
 
 Expected progress stream:
 
 - `task_progress` chunk for `weather_query` or `amap_mcp_tool` with `phase=external_tool` and `status=running`.
 - `task_progress` chunk for the same tool with `phase=external_tool` and `status=completed` or `status=failed`.
-- If step counters are available, the frontend should be able to show `1/1`.
+- Step counters are optional and not required for this simple one-tool scenario.
 
 Expected result:
 
@@ -318,6 +321,7 @@ Completion indicators:
 
 - The agent calls `weather_query` or a whitelisted `amap_mcp_tool`.
 - The progress stream contains `phase=external_tool`.
+- The initial `task_complexity` chunk uses `complexity=simple` and `trackSteps=false`.
 - The progress row reaches completed or failed state.
 - When the API key is present, the assistant response includes weather data from the tool result.
 - When the API key is missing, the response exposes a clear missing-key requirement.
@@ -408,9 +412,9 @@ Required tools:
 
 Expected task complexity state:
 
-- Initial state: `task_complexity` should be `complex` because a phone tool is required.
-- `trackSteps` should be `true`.
-- During execution: `observe` should enter running state.
+- Initial state: `task_complexity` should be `simple` because the task is expected to need one phone observation tool.
+- `trackSteps` should be `false`.
+- During execution: `observe` should enter running state, but step tracking is not required.
 - Failure state: `observe` should transition to failed state if the phone tool cannot complete.
 
 Expected progress stream:
@@ -427,6 +431,7 @@ Expected result:
 Completion indicators:
 
 - The agent attempts `observe`.
+- The initial `task_complexity` chunk uses `complexity=simple` and `trackSteps=false`.
 - At least one custom progress payload contains `status=failed`.
 - The failed progress payload includes `toolName=observe` or `label=observe`.
 - The failed progress row remains visible on the frontend.

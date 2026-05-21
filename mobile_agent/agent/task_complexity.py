@@ -7,23 +7,28 @@ from typing import Literal
 TaskComplexity = Literal["simple", "complex"]
 
 TEXT_ONLY_REASON = "text_only_answer"
-TOOL_REQUIRED_REASON = "tool_or_external_action_required"
+ZERO_OR_ONE_TOOL_REASON = "zero_or_one_tool_call"
+MULTI_STEP_REASON = "multi_step_plan_required"
 
-PHONE_TOOL_INTENTS = (
+MULTI_STEP_ACTION_INTENTS = (
+    "观察",
     "打开",
     "点击",
     "输入",
     "滑动",
     "返回",
-    "搜索框",
-    "手机页面",
-    "屏幕",
-    "应用",
-    "app",
-    "浏览器",
+    "搜索",
+    "进入",
+    "提交",
+    "停在",
+    "切换",
+    "等待",
+    "启动",
 )
 
-SYSTEM_TOOL_INTENTS = (
+SINGLE_TOOL_HINTS = (
+    "手机页面",
+    "屏幕",
     "应用列表",
     "已安装应用",
     "当前位置",
@@ -31,9 +36,6 @@ SYSTEM_TOOL_INTENTS = (
     "提醒",
     "联系人",
     "系统",
-)
-
-EXTERNAL_TOOL_INTENTS = (
     "天气",
     "路线",
     "地图",
@@ -42,9 +44,22 @@ EXTERNAL_TOOL_INTENTS = (
     "飞书",
     "企业微信",
     "高德",
-    "搜索",
     "查询",
     "查一下",
+    "读取",
+    "获取",
+)
+
+TOOL_INTENT_CATEGORIES = (
+    ("应用列表", "已安装应用"),
+    ("当前位置", "定位"),
+    ("日程",),
+    ("提醒",),
+    ("联系人",),
+    ("天气",),
+    ("路线", "地图", "距离", "导航"),
+    ("飞书",),
+    ("企业微信",),
 )
 
 
@@ -58,23 +73,43 @@ class TaskComplexityResult:
 def classify_task_complexity(text: str) -> TaskComplexityResult:
     normalized = text.strip().lower()
     if not normalized:
-        return _simple()
+        return _text_only()
 
-    if _contains_any(normalized, PHONE_TOOL_INTENTS):
+    matched_actions = _matched_values(normalized, MULTI_STEP_ACTION_INTENTS)
+    tool_category_count = _count_matching_groups(normalized, TOOL_INTENT_CATEGORIES)
+
+    if len(matched_actions) >= 2:
         return _complex()
-    if _contains_any(normalized, SYSTEM_TOOL_INTENTS):
+    if tool_category_count >= 2:
         return _complex()
-    if _contains_any(normalized, EXTERNAL_TOOL_INTENTS):
+    if tool_category_count >= 1 and _has_phone_action(matched_actions):
         return _complex()
 
-    return _simple()
+    if matched_actions or tool_category_count >= 1:
+        return _zero_or_one_tool()
+    if _contains_any(normalized, SINGLE_TOOL_HINTS):
+        return _zero_or_one_tool()
+
+    return _text_only()
 
 
 def _contains_any(text: str, values: tuple[str, ...]) -> bool:
     return any(value.lower() in text for value in values)
 
 
-def _simple() -> TaskComplexityResult:
+def _matched_values(text: str, values: tuple[str, ...]) -> list[str]:
+    return [value for value in values if value.lower() in text]
+
+
+def _count_matching_groups(text: str, groups: tuple[tuple[str, ...], ...]) -> int:
+    return sum(1 for group in groups if _contains_any(text, group))
+
+
+def _has_phone_action(matched_actions: list[str]) -> bool:
+    return any(action not in {"观察", "搜索"} for action in matched_actions)
+
+
+def _text_only() -> TaskComplexityResult:
     return TaskComplexityResult(
         complexity="simple",
         track_steps=False,
@@ -82,9 +117,17 @@ def _simple() -> TaskComplexityResult:
     )
 
 
+def _zero_or_one_tool() -> TaskComplexityResult:
+    return TaskComplexityResult(
+        complexity="simple",
+        track_steps=False,
+        reason=ZERO_OR_ONE_TOOL_REASON,
+    )
+
+
 def _complex() -> TaskComplexityResult:
     return TaskComplexityResult(
         complexity="complex",
         track_steps=True,
-        reason=TOOL_REQUIRED_REASON,
+        reason=MULTI_STEP_REASON,
     )
