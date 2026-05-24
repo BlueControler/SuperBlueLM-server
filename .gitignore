@@ -162,4 +162,7 @@ cython_debug/
 # .idea/
 .langgraph_api/
 
+#docs
+docs/
+
 .local/
