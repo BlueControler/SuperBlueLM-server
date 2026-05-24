@@ -1,6 +1,9 @@
+import tarfile
+import zipfile
+
 import pytest
 
-from scripts.setup import SetupError, _asset_for_target
+from setup import SetupError, _asset_for_target, _extract
 
 
 def _asset(name):
@@ -74,3 +77,25 @@ def test_android_arm64_matches_android_asset():
 def test_asset_for_target_rejects_unsupported_target_before_scanning_assets():
     with pytest.raises(SetupError, match="unsupported target: bad-target"):
         _asset_for_target({"assets": []}, "bad-target")
+
+
+def test_extract_rejects_zip_member_outside_destination(tmp_path):
+    archive = tmp_path / "bad.zip"
+    destination = tmp_path / "out"
+    with zipfile.ZipFile(archive, "w") as zip_file:
+        zip_file.writestr("../escape.txt", "nope")
+
+    with pytest.raises(SetupError, match="archive member escapes destination"):
+        _extract(archive, destination)
+
+
+def test_extract_rejects_tar_member_outside_destination(tmp_path):
+    archive = tmp_path / "bad.tar.gz"
+    destination = tmp_path / "out"
+    payload = tmp_path / "payload.txt"
+    payload.write_text("nope", encoding="utf-8")
+    with tarfile.open(archive, "w:gz") as tar_file:
+        tar_file.add(payload, arcname="../escape.txt")
+
+    with pytest.raises(SetupError, match="archive member escapes destination"):
+        _extract(archive, destination)

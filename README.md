@@ -15,167 +15,78 @@
 
 ## 核心流程
 
-1. 使用 `langgraph dev` 启动 LangGraph API Server。
-2. 手机操作客户端连接 `ws://host:port/adb`，首条消息发送 `connect`。
-3. 系统工具客户端连接 `ws://host:port/system`，提供应用列表、日程、提醒、定位等 API。
-4. LangGraph API 调用 `agent` graph，Agent 通过工具向两个 WebSocket client 下发请求。
-5. 手机端或系统工具端返回结果，服务端更新状态并继续下一步。
+1. 手机操作客户端连接 `/adb`，首条消息发送 `connect`。
+2. 系统工具客户端连接 `/system`，提供应用列表、日程、提醒、定位等 API。
+3. Agent 通过工具向两个 WebSocket client 下发请求。
+4. 手机端或系统工具端返回结果，服务端更新状态并继续下一步。
 
-## 开发环境要求
+## 部署
 
-- Python `>= 3.14`
-- 建议在虚拟环境中开发
-
-## 安装依赖（开发模式）
-
-### 方式一：使用 uv
+从仓库根目录执行一条命令即可完成 llama.cpp 和外部业务工具部署：
 
 ```bash
-uv sync
+python -m setup deploy
 ```
 
-如果你希望包含开发依赖（ruff、mypy、pytest、langgraph-cli 等），使用：
+这条命令默认执行 `full` profile，流程只有两步：
 
-```bash
-uv sync --group dev
-```
-
-### 方式二：使用 pip
-
-```bash
-python -m venv .venv
-```
-
-Windows PowerShell:
-
-```bash
-.\.venv\Scripts\Activate.ps1
-```
-
-安装项目（可编辑模式）以及开发依赖：
-
-```bash
-pip install -e .
-pip install mypy ruff pytest "langgraph-cli[inmem]" anyio
-```
-
-## 一键部署
-
-从仓库根目录执行一条命令即可完成完整部署：
-
-```bash
-python -m scripts.deploy
-```
-
-这条命令默认执行 `full` profile 并启动 LangGraph 服务，流程包括：
-
-1. 检查 Python 版本是否满足 `>=3.14`。
-2. 如果 `.env` 不存在，从 `.env.example` 创建。
-3. 检查启动端口是否可用。
-4. 安装 Python 依赖。
-5. 安装 llama.cpp 并下载默认本地模型。
-6. 检查本地模型 setup 状态。
-7. 安装并初始化飞书、企业微信和高德 MCP 等外部业务工具。
-8. 检查外部工具 setup 状态。
-9. 启动 LangGraph 服务。
-10. 请求 `/network/status` 做部署后健康检查。
-
-Windows PowerShell 也可以使用：
-
-```powershell
-.\scripts\deploy.ps1
-```
-
-Linux/macOS 也可以使用：
-
-```bash
-sh scripts/deploy.sh
-```
+1. 安装 llama.cpp 并创建本地模型目录。
+2. 安装飞书、企业微信 CLI，并检查高德 MCP 等外部业务工具。
 
 可选 profile 仍然保留，方便只部署一部分：
 
-- `core`: 只安装 Python 依赖；setup 检查缺失只会给出 warning。
-- `local`: 在 `core` 基础上安装 llama.cpp 并下载默认本地模型。
-- `external`: 安装并检查飞书、企业微信和高德 MCP 等外部业务工具。
-- `full`: `local` + `external`，先完成本地模型，再安装并检查外部业务工具；该模式会触发 CLI 登录或初始化流程。
+- `local`: 安装 llama.cpp 并创建本地模型目录（需要手动放入模型文件）。
+- `external`: 安装飞书、企业微信 CLI（不做登录授权）。
+- `full`: `local` + `external`，先完成本地模型，再安装外部工具。
 
-飞书/企微 CLI 的授权是“首次部署需要人工处理，后续复用登录态”的模式：第一次执行 `full` 时，如果 CLI 要求扫码、浏览器登录或填写配置，需要按提示完成；完成后登录态通常保存在本机 CLI 配置目录里。之后在同一台机器、同一用户下再次执行一键部署，会优先复用已有登录态，一般不会重复登录。只有登录态过期、被清理、换机器或换系统用户时，才需要重新授权。
-
-例如只部署本地模型并启动：
+例如只部署本地模型：
 
 ```bash
-python -m scripts.deploy --profile local --start --port 2024
+python -m setup deploy --profile local
 ```
 
-如果只想打印完整部署步骤，不执行下载、登录或启动：
+如果只想打印完整部署步骤，不执行安装：
 
 ```bash
-python -m scripts.deploy --dry-run
+python -m setup deploy --dry-run
 ```
 
-如果本机已装好依赖，可跳过依赖安装；如果只是临时诊断，也可以跳过 Python 版本保护：
+然后到Hugging Face或镜像站下载 GGUF 模型文件，放到 `.local/models/` 目录下即可。
+
+### 离线本地模型
+
+安装 llama.cpp 预编译包并创建 models 目录（不再自动下载模型）：
 
 ```bash
-python -m scripts.deploy --profile core --no-start --no-install-deps --allow-unsupported-python
-```
-
-## 正式运行：LangGraph API
-
-项目的正式入口是 `langgraph dev`。它会读取 `langgraph.json`，同时启动：
-
-- LangGraph API / Studio 调试服务
-- `agent` graph
-- 自定义 HTTP app 中的 `/adb` 和 `/system` WebSocket 路由
-- `/adb/status` 和 `/system/status` 状态检查接口
-
-```bash
-langgraph dev --port 2024
-```
-
-启动后：
-
-- LangGraph API: `http://127.0.0.1:2024`
-- Studio UI: 终端输出的 `https://smith.langchain.com/studio/?baseUrl=...`
-- 手机操作客户端连接：`ws://127.0.0.1:2024/adb`
-- 系统工具客户端连接：`ws://127.0.0.1:2024/system`
-- 手机连接状态：`http://127.0.0.1:2024/adb/status`
-- 系统工具连接状态：`http://127.0.0.1:2024/system/status`
-- 网络/模型路由状态：`http://127.0.0.1:2024/network/status`
-
-LangSmith tracing 使用 `.env` 中的 `LANGSMITH_TRACING=true`、`LANGSMITH_PROJECT` 和 `LANGSMITH_API_KEY`。
-
-## 离线本地模型
-
-安装 llama.cpp 预编译包并下载默认 Gemma 4 GGUF 模型：
-
-```bash
-python -m scripts.setup llama:all
+python -m setup llama:all
 ```
 
 脚本会自动识别 Windows x64、Linux x64、Android arm64，也可以显式指定：
 
 ```bash
-python -m scripts.setup llama:all --target linux-x64
+python -m setup llama:all --target linux-x64
 ```
 
-如果 Hugging Face 需要授权，先设置 `HF_TOKEN` 或 `HUGGINGFACE_TOKEN`。默认文件会放到仓库内 `.local/`，也可以用环境变量覆盖：
+默认目录在仓库内 `.local/`。模型文件请手动放到 `.local/models/`，例如保持默认文件名就放在 `.local/models/gemma-4-E2B-it-Q8_0.gguf`；或自行指定路径并设置 `LLAMA_CPP_MODEL_PATH` 指向你的 GGUF 文件。
+
+也可以用环境变量覆盖：
 
 - `LLAMA_CPP_SERVER_BINARY`: `llama-server` 可执行文件路径
 - `LLAMA_CPP_MODEL_PATH`: GGUF 模型文件路径
 - `LLAMA_CPP_HOST` / `LLAMA_CPP_PORT`: 本地 llama.cpp server 地址，默认 `127.0.0.1:8080`
 - `LLAMA_CPP_MODEL_NAME`: OpenAI-compatible model 名称，默认 `gemma-4-E2B-it`
 
-统一 setup 入口是 `python -m scripts.setup`。
+统一 setup 入口是 `python -m setup`。
 
 本地模型模式会额外注入一份更保守的系统提示词，只允许简单任务、零次或一次工具调用；多步骤、高风险或不确定任务会停止并要求用户确认或交还给更强模型。
 
-## 外部业务工具
+### 外部业务工具
 
 飞书、企业微信和高德 MCP 工具统一通过 setup 入口安装或检查：
 
 ```bash
-python -m scripts.setup external:check
-python -m scripts.setup external:all
+python -m setup external:check
+python -m setup external:all
 ```
 
 高德 MCP 使用官方 Streamable HTTP 地址 `https://mcp.amap.com/mcp?key=...`。需要设置 `AMAP_MAPS_API_KEY`；如需切换网关或代理，可用 `AMAP_MCP_HTTP_URL` 覆盖基础 URL。
@@ -188,15 +99,12 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:2024/network/status -Conten
 
 当 `connected=false` 时，服务会启动本地 `llama-server` 并让 agent graph 切到本地模型；当 `connected=true` 时，会切回云端并停止本地进程。
 
-如果看到 Windows 的 `WinError 10048`，表示端口已经被另一个进程占用。可以换端口：
+## 运行
 
 ```bash
-langgraph dev --port 2025
+langgraph dev
 ```
 
-或查看占用进程：
+## Nginx 端口转发
 
-```powershell
-Get-NetTCPConnection -LocalPort 2024 | Select-Object LocalAddress,LocalPort,State,OwningProcess
-```
-
+如需把 `langgraph dev` 的默认端口 `127.0.0.1:2024` 暴露到其他地址/端口，可在本机 Nginx 配置中加入一个反向代理服务。关键点是保留 WebSocket 和 SSE 的相关设置。配置见 `nginx.conf`。

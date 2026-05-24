@@ -1,0 +1,4 @@
+- [x] `setup.py`改为了仅安装`llama.cpp`、`lark-cli`和`wecom-cli`，不再进行登录授权等操作。这部分改为由Agent通过工具执行命令的方式触发。
+- [ ] 为`mobile_agent`提供一个执行命令的`tool`，它仅支持执行`lark-cli`或`wecom-cli`开头的命令（Windows上可能是`lark-cli.cmd`或`wecom-cli.cmd`），并将输出结果返回给Agent。
+- [ ] 参考[飞书CLI｜让AI直接操作你的飞书，一键安装开源工具 - 飞书官网](https://www.feishu.cn/feishu-cli)，修改“通过AI Agent安装”部分的`skill`并接入我们的Agent，使其适配我们的`tool`。
+- [ ] 为企业微信CLI做同样的适配。

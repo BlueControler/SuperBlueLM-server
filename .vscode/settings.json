@@ -1,4 +1,12 @@
 {
+    "files.exclude": {
+        "**/__pycache__": true,
+        "**/*.pyc": true
+    },
+    "search.exclude": {
+        "**/__pycache__": true,
+        "**/*.pyc": true
+    },
     "json.schemaDownload.trustedDomains": {
         "https://langgra.ph/": true,
         "https://raw.githubusercontent.com": true

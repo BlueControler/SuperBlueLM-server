@@ -10,31 +10,25 @@ from mobile_agent.tools.external import (
     call_amap_mcp_tool,
     external_tools_status_payload,
 )
-from scripts import setup
+import setup as setup
 
 
 class FakeHttpCaller:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
 
-    async def __call__(
-        self, url: str, tool_name: str, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def __call__(self, url: str, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self.calls.append((url, tool_name, arguments))
         return {"ok": True, "tool": tool_name, "arguments": arguments}
 
 
 class RaisingHttpCaller:
-    async def __call__(
-        self, url: str, tool_name: str, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def __call__(self, url: str, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("boom https://mcp.amap.com/mcp?key=test+key")
 
 
 class RaisingRawKeyHttpCaller:
-    async def __call__(
-        self, url: str, tool_name: str, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def __call__(self, url: str, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("provider rejected API key test key")
 
 
@@ -44,9 +38,7 @@ def test_amap_http_client_uses_official_streamable_http_url(monkeypatch: Any) ->
     fake = FakeHttpCaller()
 
     result = asyncio.run(
-        AmapHttpMcpClient(http_caller=fake).call_tool(
-            "maps_weather", {"city": "北京"}
-        )
+        AmapHttpMcpClient(http_caller=fake).call_tool("maps_weather", {"city": "北京"})
     )
 
     assert result == {"ok": True, "tool": "maps_weather", "arguments": {"city": "北京"}}
@@ -103,9 +95,7 @@ def test_amap_http_client_returns_redacted_json_error_when_call_fails(
     monkeypatch.delenv("AMAP_MCP_HTTP_URL", raising=False)
 
     result = asyncio.run(
-        AmapHttpMcpClient(http_caller=RaisingHttpCaller()).call_tool(
-            "maps_weather", {}
-        )
+        AmapHttpMcpClient(http_caller=RaisingHttpCaller()).call_tool("maps_weather", {})
     )
 
     assert isinstance(result, dict)
@@ -121,9 +111,7 @@ def test_amap_http_client_redacts_raw_api_key_when_call_fails(
     monkeypatch.setenv("AMAP_MAPS_API_KEY", "test key")
 
     result = asyncio.run(
-        AmapHttpMcpClient(http_caller=RaisingRawKeyHttpCaller()).call_tool(
-            "maps_weather", {}
-        )
+        AmapHttpMcpClient(http_caller=RaisingRawKeyHttpCaller()).call_tool("maps_weather", {})
     )
 
     assert isinstance(result, dict)
@@ -136,9 +124,7 @@ def test_disallowed_amap_tool_is_rejected_before_http(monkeypatch: Any) -> None:
     fake = FakeHttpCaller()
 
     result = asyncio.run(
-        call_amap_mcp_tool(
-            AmapHttpMcpClient(http_caller=fake), "maps_secret_write", {}
-        )
+        call_amap_mcp_tool(AmapHttpMcpClient(http_caller=fake), "maps_secret_write", {})
     )
 
     assert isinstance(result, dict)
@@ -173,7 +159,9 @@ def test_setup_external_check_does_not_require_npx_for_amap_http(
         return f"/fake/{command}"
 
     monkeypatch.setattr(setup.shutil, "which", fake_which)
-    monkeypatch.setattr(setup.os, "getenv", lambda key: "set" if key == "AMAP_MAPS_API_KEY" else None)
+    monkeypatch.setattr(
+        setup.os, "getenv", lambda key: "set" if key == "AMAP_MAPS_API_KEY" else None
+    )
 
     status = setup.check_external_tools()
 
@@ -183,9 +171,7 @@ def test_setup_external_check_does_not_require_npx_for_amap_http(
     assert "npx:" not in output
 
 
-def test_setup_external_check_fails_when_amap_key_missing(
-    monkeypatch: Any, capsys: Any
-) -> None:
+def test_setup_external_check_fails_when_amap_key_missing(monkeypatch: Any, capsys: Any) -> None:
     checked: list[str] = []
 
     def fake_which(command: str) -> str | None:

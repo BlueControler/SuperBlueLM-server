@@ -7,9 +7,9 @@ import platform
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
-import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -17,34 +17,28 @@ from typing import Any, Sequence
 
 from mobile_agent.local_model_runtime import (
     DEFAULT_MODEL_FILE,
-    DEFAULT_MODEL_REPO,
     PROJECT_ROOT,
 )
 
 
-NPM_REGISTRY = "https://registry.npmmirror.com"
 GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 DEFAULT_INSTALL_ROOT = PROJECT_ROOT / ".local"
-EXTERNAL_AUTH_NOTICE = (
-    "外部工具首次初始化可能需要在飞书/企微 CLI 中人工登录或授权；"
-    "授权完成后 CLI 通常会在本机保存登录态，后续再次执行一键部署会复用已有登录态，"
-    "一般不需要重复手动登录。"
-)
 
 SETUP_ACTIONS = {
     "check",
     "all",
     "external:check",
     "external:install-feishu",
-    "external:auth-feishu",
     "external:install-wecom",
-    "external:init-wecom",
-    "external:verify",
     "external:all",
     "llama:check",
     "llama:download-llama",
-    "llama:download-model",
     "llama:all",
+}
+DEPLOY_ACTIONS = {
+    "local": [("setup-local-model", "llama:all")],
+    "external": [("setup-external-tools", "external:all")],
+    "full": [("setup-local-model", "llama:all"), ("setup-external-tools", "external:all")],
 }
 
 
@@ -58,8 +52,23 @@ def _run(command: list[str]) -> int:
     return int(completed.returncode)
 
 
+def _executable(name: str) -> str:
+    if platform.system().lower() == "windows":
+        return f"{name}.cmd"
+    return name
+
+
+def _cli_installed(name: str) -> bool:
+    return shutil.which(_executable(name)) is not None
+
+
 def check_external_tools() -> int:
-    commands = ["node", "npm", "lark-cli", "wecom-cli"]
+    commands = [
+        "node",
+        _executable("npm"),
+        _executable("lark-cli"),
+        _executable("wecom-cli"),
+    ]
     failed = False
     for command in commands:
         resolved = shutil.which(command)
@@ -72,34 +81,21 @@ def check_external_tools() -> int:
 
 
 def install_feishu() -> int:
-    return _run(["npm", "install", "-g", "@larksuite/cli", f"--registry={NPM_REGISTRY}"])
-
-
-def auth_feishu() -> int:
-    status = _run(["lark-cli", "config", "init", "--new"])
-    if status != 0:
-        return status
-    return _run(["lark-cli", "auth", "login", "--recommend"])
+    if _cli_installed("lark-cli"):
+        print("cli already installed: lark-cli")
+        return 0
+    return _run([_executable("npm"), "install", "-g", "@larksuite/cli"])
 
 
 def install_wecom() -> int:
-    return _run(["npm", "install", "-g", "@wecom/cli", f"--registry={NPM_REGISTRY}"])
-
-
-def init_wecom() -> int:
-    return _run(["wecom-cli", "init"])
-
-
-def verify_external_tools() -> int:
-    status = _run(["lark-cli", "auth", "status"])
-    if status != 0:
-        return status
-    return _run(["wecom-cli", "contact", "get_userlist", "{}"])
+    if _cli_installed("wecom-cli"):
+        print("cli already installed: wecom-cli")
+        return 0
+    return _run([_executable("npm"), "install", "-g", "@wecom/cli"])
 
 
 def install_external_tools_all() -> int:
-    print(EXTERNAL_AUTH_NOTICE)
-    for step in (install_feishu, auth_feishu, install_wecom, init_wecom, verify_external_tools):
+    for step in (install_feishu, install_wecom):
         status = step()
         if status != 0:
             return status
@@ -213,28 +209,67 @@ def _asset_name_has_accelerator(name: str) -> bool:
 
 
 def _extract(archive: Path, destination: Path) -> None:
-    if destination.exists():
-        shutil.rmtree(destination)
-    destination.mkdir(parents=True, exist_ok=True)
+    destination.parent.mkdir(parents=True, exist_ok=True)
 
     name = archive.name.lower()
-    if name.endswith(".zip"):
-        with zipfile.ZipFile(archive) as zip_file:
-            zip_file.extractall(destination)
-    elif name.endswith((".tar.gz", ".tgz")):
-        with tarfile.open(archive) as tar_file:
-            tar_file.extractall(destination)
-    else:
-        raise SetupError(f"unsupported archive format: {archive}")
+    with tempfile.TemporaryDirectory(
+        prefix=f".{destination.name}-", dir=destination.parent
+    ) as temp_dir:
+        staging = Path(temp_dir) / "content"
+        staging.mkdir()
+        if name.endswith(".zip"):
+            with zipfile.ZipFile(archive) as zip_file:
+                _safe_extract_zip(zip_file, staging)
+        elif name.endswith((".tar.gz", ".tgz")):
+            with tarfile.open(archive) as tar_file:
+                _safe_extract_tar(tar_file, staging)
+        else:
+            raise SetupError(f"unsupported archive format: {archive}")
+
+        if destination.exists():
+            shutil.rmtree(destination)
+        shutil.move(str(staging), destination)
+
+
+def _safe_extract_zip(zip_file: zipfile.ZipFile, destination: Path) -> None:
+    destination_root = destination.resolve()
+    for member in zip_file.infolist():
+        target = (destination / member.filename).resolve()
+        if not _is_relative_to(target, destination_root):
+            raise SetupError(f"archive member escapes destination: {member.filename}")
+    zip_file.extractall(destination)
+
+
+def _safe_extract_tar(tar_file: tarfile.TarFile, destination: Path) -> None:
+    destination_root = destination.resolve()
+    for member in tar_file.getmembers():
+        target = (destination / member.name).resolve()
+        if not _is_relative_to(target, destination_root):
+            raise SetupError(f"archive member escapes destination: {member.name}")
+    tar_file.extractall(destination, filter="data")
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 def install_llama_cpp(target: str, install_root: Path) -> Path:
+    (install_root / "models").mkdir(parents=True, exist_ok=True)
+    destination = install_root / "llama.cpp" / target
+    existing = _find_existing_llama_server(destination, target)
+    if existing is not None:
+        print(f"llama.cpp already installed: {existing}")
+        return existing
+
     release = _fetch_latest_release()
     tag_name = release.get("tag_name") or "latest"
     asset = _asset_for_target(release, target)
     asset_name = str(asset["name"])
     download_url = str(asset["browser_download_url"])
-    destination = install_root / "llama.cpp" / target
 
     with tempfile.TemporaryDirectory() as temp_dir:
         archive = Path(temp_dir) / asset_name
@@ -245,6 +280,18 @@ def install_llama_cpp(target: str, install_root: Path) -> Path:
     _make_executable(server)
     print(f"installed llama.cpp {tag_name}: {server}")
     return server
+
+
+def _find_existing_llama_server(root: Path, target: str) -> Path | None:
+    if not root.exists():
+        return None
+    try:
+        server = _find_llama_server(root, target)
+    except SetupError:
+        return None
+    if server.exists() and server.stat().st_size > 0:
+        return server
+    return None
 
 
 def _find_llama_server(root: Path, target: str) -> Path:
@@ -263,33 +310,14 @@ def _make_executable(path: Path) -> None:
     path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def download_model(repo: str, filename: str, install_root: Path) -> Path:
-    destination = install_root / "models" / filename
-    if destination.exists() and destination.stat().st_size > 0:
-        print(f"model already exists: {destination}")
-        return destination
-
-    url = f"https://huggingface.co/{repo}/resolve/main/{filename}?download=true"
-    try:
-        _download(url, destination)
-    except urllib.error.HTTPError as exc:
-        if exc.code in {401, 403}:
-            raise SetupError(
-                "Hugging Face refused the model download. Accept the model license "
-                "and set HF_TOKEN or HUGGINGFACE_TOKEN before rerunning."
-            ) from exc
-        raise
-
-    print(f"downloaded model: {destination}")
-    return destination
-
-
 def check_llama_cpp(install_root: Path) -> int:
     server_matches = sorted((install_root / "llama.cpp").rglob("llama-server*"))
     model_path = install_root / "models" / DEFAULT_MODEL_FILE
     print(f"llama-server: {server_matches[0] if server_matches else 'not found'}")
     print(f"model: {model_path if model_path.exists() else 'not found'}")
-    print(f"HF token: {'set' if os.getenv('HF_TOKEN') or os.getenv('HUGGINGFACE_TOKEN') else 'missing'}")
+    print(
+        f"HF token: {'set' if os.getenv('HF_TOKEN') or os.getenv('HUGGINGFACE_TOKEN') else 'missing'}"
+    )
     return 0 if server_matches and model_path.exists() else 1
 
 
@@ -305,20 +333,11 @@ def detect_target() -> str:
     raise SetupError(f"cannot auto-detect supported target from {system}/{machine}")
 
 
-def normalize_legacy_action(kind: str, action: str) -> str:
-    normalized = f"{kind}:{action}"
-    if normalized not in SETUP_ACTIONS:
-        raise SetupError(f"unsupported setup action: {normalized}")
-    return normalized
-
-
 def run_action(
     action: str,
     *,
     target: str = "auto",
     install_root: Path = DEFAULT_INSTALL_ROOT,
-    model_repo: str = DEFAULT_MODEL_REPO,
-    model_file: str = DEFAULT_MODEL_FILE,
 ) -> int:
     if action not in SETUP_ACTIONS:
         raise SetupError(f"unsupported setup action: {action}")
@@ -335,8 +354,6 @@ def run_action(
             "llama:all",
             target=target,
             install_root=install_root,
-            model_repo=model_repo,
-            model_file=model_file,
         )
         if llama_status != 0:
             return llama_status
@@ -344,17 +361,12 @@ def run_action(
             "external:all",
             target=target,
             install_root=install_root,
-            model_repo=model_repo,
-            model_file=model_file,
         )
 
     external_actions = {
         "external:check": check_external_tools,
         "external:install-feishu": install_feishu,
-        "external:auth-feishu": auth_feishu,
         "external:install-wecom": install_wecom,
-        "external:init-wecom": init_wecom,
-        "external:verify": verify_external_tools,
         "external:all": install_external_tools_all,
     }
     if action in external_actions:
@@ -364,14 +376,20 @@ def run_action(
         return check_llama_cpp(install_root)
     if action in {"llama:download-llama", "llama:all"}:
         install_llama_cpp(resolved_target, install_root)
-    if action in {"llama:download-model", "llama:all"}:
-        download_model(model_repo, model_file, install_root)
     return 0
+
+
+def deploy_actions(profile: str) -> list[tuple[str, str]]:
+    actions = DEPLOY_ACTIONS.get(profile)
+    if actions is None:
+        raise SetupError(f"unsupported deploy profile: {profile}")
+    return actions.copy()
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Unified setup for local llama.cpp and external business tools."
+        description="Unified setup for local llama.cpp and external business tools.",
+        epilog="Use `python -m scripts.setup deploy --help` for deployment profiles.",
     )
     parser.add_argument("action", choices=sorted(SETUP_ACTIONS), help="Setup action to run.")
     parser.add_argument(
@@ -386,38 +404,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_INSTALL_ROOT,
         help="Directory used for llama.cpp and model files.",
     )
-    parser.add_argument("--model-repo", default=DEFAULT_MODEL_REPO, help="Hugging Face repo.")
-    parser.add_argument("--model-file", default=DEFAULT_MODEL_FILE, help="GGUF file name.")
     return parser.parse_args(argv)
 
 
-def parse_external_tools_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Install and initialize external business tools.")
+def parse_deploy_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="One-command deployment helper.")
     parser.add_argument(
-        "action",
-        choices=[
-            "check",
-            "install-feishu",
-            "auth-feishu",
-            "install-wecom",
-            "init-wecom",
-            "verify",
-            "all",
-        ],
-        help="Setup action to run.",
+        "--profile",
+        choices=sorted(DEPLOY_ACTIONS),
+        default="full",
+        help=(
+            "local sets up llama.cpp/model; external sets up business tools; "
+            "full runs local then external."
+        ),
     )
-    return parser.parse_args(argv)
-
-
-def parse_llama_cpp_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Install llama.cpp and download the default Gemma 4 GGUF model."
-    )
-    parser.add_argument(
-        "action",
-        choices=["check", "download-llama", "download-model", "all"],
-        help="Setup action to run.",
-    )
+    parser.add_argument("--dry-run", action="store_true", help="Print deployment steps only.")
     parser.add_argument(
         "--target",
         choices=["auto", "windows-x64", "linux-x64", "android-arm64"],
@@ -430,20 +431,21 @@ def parse_llama_cpp_args(argv: Sequence[str] | None = None) -> argparse.Namespac
         default=DEFAULT_INSTALL_ROOT,
         help="Directory used for llama.cpp and model files.",
     )
-    parser.add_argument("--model-repo", default=DEFAULT_MODEL_REPO, help="Hugging Face repo.")
-    parser.add_argument("--model-file", default=DEFAULT_MODEL_FILE, help="GGUF file name.")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    args = parse_args(argv)
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if raw_args[:1] == ["deploy"]:
+        main_deploy(raw_args[1:])
+        return
+
+    args = parse_args(raw_args)
     try:
         status = run_action(
             args.action,
             target=args.target,
             install_root=args.install_root,
-            model_repo=args.model_repo,
-            model_file=args.model_file,
         )
     except SetupError as exc:
         print(f"error: {exc}")
@@ -451,32 +453,26 @@ def main(argv: Sequence[str] | None = None) -> None:
     raise SystemExit(status)
 
 
-def main_external_tools(argv: Sequence[str] | None = None) -> None:
-    args = parse_external_tools_args(argv)
+def main_deploy(argv: Sequence[str] | None = None) -> None:
+    args = parse_deploy_args(argv)
     try:
-        action = normalize_legacy_action("external", args.action)
-        status = run_action(action)
+        for name, action in deploy_actions(args.profile):
+            print(f"\n== {name} ==")
+            print(f"> {sys.executable} -m scripts.setup {action}")
+            if args.dry_run:
+                continue
+
+            status = run_action(
+                action,
+                target=args.target,
+                install_root=args.install_root,
+            )
+            if status != 0:
+                raise SystemExit(status)
     except SetupError as exc:
         print(f"error: {exc}")
         raise SystemExit(1) from exc
-    raise SystemExit(status)
-
-
-def main_llama_cpp(argv: Sequence[str] | None = None) -> None:
-    args = parse_llama_cpp_args(argv)
-    try:
-        action = normalize_legacy_action("llama", args.action)
-        status = run_action(
-            action,
-            target=args.target,
-            install_root=args.install_root,
-            model_repo=args.model_repo,
-            model_file=args.model_file,
-        )
-    except SetupError as exc:
-        print(f"error: {exc}")
-        raise SystemExit(1) from exc
-    raise SystemExit(status)
+    raise SystemExit(0)
 
 
 if __name__ == "__main__":
