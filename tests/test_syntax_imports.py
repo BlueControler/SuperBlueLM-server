@@ -9,7 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def test_core_python_files_compile() -> None:
     files = [
-        "scripts/setup.py",
+        "setup.py",
         "mobile_agent/local_model_runtime.py",
         "mobile_agent/tools/external.py",
         "mobile_agent/tools/system.py",

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import shutil
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from typing import Protocol
 from urllib.parse import urlencode
 
 from langchain_core.tools import BaseTool, tool
+from pydantic import BaseModel, Field
 
 from ..json_types import JsonObject, JsonValue
 from ..progress import emit_task_progress
@@ -93,6 +95,8 @@ ALLOWED_AMAP_TOOLS = {
     "maps_distance",
 }
 
+ALLOWED_CLI_COMMANDS = ("lark-cli", "lark-cli.cmd", "wecom-cli", "wecom-cli.cmd")
+
 
 class CommandRunner(Protocol):
     async def run(
@@ -114,6 +118,15 @@ class AmapHttpCaller(Protocol):
         tool_name: str,
         arguments: dict[str, JsonValue],
     ) -> JsonValue: ...
+
+
+class RunCliCommandArgs(BaseModel):
+    command: str = Field(
+        description=(
+            "Full CLI command to execute. The first token must be lark-cli, "
+            "lark-cli.cmd, wecom-cli, or wecom-cli.cmd."
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -300,6 +313,21 @@ def create_external_tools(
         )
 
     @tool(
+        "run_cli_command",
+        args_schema=RunCliCommandArgs,
+        description=(
+            "Run one complete Feishu/Lark or WeCom CLI command and return stdout, "
+            "stderr, returncode, and ok. The command must start with lark-cli, "
+            "lark-cli.cmd, wecom-cli, or wecom-cli.cmd; other executables are rejected."
+        ),
+    )
+    async def run_cli_command(command: str) -> str:
+        return await run_external_tool(
+            "run_cli_command",
+            lambda: _run_allowed_cli_command(command, runner),
+        )
+
+    @tool(
         "amap_mcp_tool",
         description=(
             "Call a whitelisted AMap MCP tool. Allowed tools include geocode, "
@@ -337,10 +365,53 @@ def create_external_tools(
         wecom_cli_readonly,
         feishu_cli,
         wecom_cli,
+        run_cli_command,
         amap_mcp_tool,
         weather_query,
         external_tools_status,
     ]
+
+
+async def _run_allowed_cli_command(
+    command_line: str,
+    runner: CommandRunner,
+) -> JsonObject:
+    parsed = parse_allowed_cli_command(command_line)
+    if isinstance(parsed, dict):
+        return parsed
+
+    command, args = parsed
+    timeout = _tool_timeout()
+    return await runner.run(command=command, args=args, timeout=timeout)
+
+
+def parse_allowed_cli_command(command_line: str) -> tuple[str, list[str]] | JsonObject:
+    if not isinstance(command_line, str):
+        return {"error": "invalid_command", "message": "command must be a string."}
+
+    try:
+        parts = shlex.split(command_line, posix=True)
+    except ValueError as exc:
+        return {"error": "invalid_command", "message": str(exc)}
+
+    if not parts:
+        return {"error": "invalid_command", "message": "command cannot be empty."}
+    if any("\x00" in item or "\n" in item or "\r" in item for item in parts):
+        return {
+            "error": "invalid_command",
+            "message": "command must not contain control separators.",
+        }
+
+    command = parts[0]
+    command_name = os.path.basename(command).lower()
+    if command_name not in ALLOWED_CLI_COMMANDS:
+        return {
+            "error": "disallowed_command",
+            "command": command,
+            "allowed_commands": list(ALLOWED_CLI_COMMANDS),
+        }
+
+    return command, parts[1:]
 
 
 async def _run_readonly_cli(
