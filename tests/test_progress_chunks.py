@@ -59,6 +59,7 @@ def test_emit_task_progress_writes_custom_payload(monkeypatch: Any) -> None:
         phase="phone_tool",
         message="正在点击屏幕",
         tool_name="tap",
+        progress_key="phone-todo-2",
         current_step=2,
         total_steps=5,
     )
@@ -71,6 +72,7 @@ def test_emit_task_progress_writes_custom_payload(monkeypatch: Any) -> None:
             "phase": "phone_tool",
             "message": "正在点击屏幕",
             "toolName": "tap",
+            "progressKey": "phone-todo-2",
             "currentStep": 2,
             "totalSteps": 5,
         }

@@ -82,6 +82,7 @@ Backend emits progress chunks shaped as:
   "phase": "phone_tool",
   "message": "Running phone tool: tap",
   "toolName": "tap",
+  "progressKey": "phone-todo-2",
   "currentStep": 2,
   "totalSteps": 5,
   "completedSteps": [
@@ -106,6 +107,7 @@ Optional fields:
 
 - `message`: human-readable detail.
 - `toolName`: stable tool key. Frontend uses it to update the same row across progress chunks.
+- `progressKey`: optional stable row identity. Frontend should prefer it when present and fall back to `toolName` for older payloads.
 - `currentStep` / `totalSteps`: complex-task step counter when known.
 - `completedSteps`: completed step summaries when the backend has a higher-level plan.
 - `error`: short failure reason.
@@ -120,11 +122,28 @@ SuperBlueLM-server\mobile_agent\progress.py
 
 Current wrapped tool groups:
 
+- main-agent phone TODO delegation: `mobile_agent/agent/phone_delegation.py`
 - phone tools: `mobile_agent/tools/phone.py`
 - system tools: `mobile_agent/tools/system.py`
 - external tools: `mobile_agent/tools/external.py`
 
 The helper uses LangGraph `get_stream_writer()`. If a tool runs outside a stream context, progress emission is skipped and the tool continues normally.
+
+### Main-Agent TODO Progress
+
+Cloud-mode phone UI operations are delegated through `execute_phone_todo`.
+Delegation emits `task_progress` with `phase=agent` before and after each phone
+TODO. Atomic `phone_tool` progress is still emitted inside the child execution.
+
+The main agent can append a corrected TODO after observing a failure or an
+unexpected page:
+
+- `progressKey` identifies one TODO row, for example `phone-todo-2`.
+- `currentStep` is the TODO currently executing.
+- `totalSteps` is the number of TODO items currently known by the backend. It may
+  grow while the main agent extends or corrects its plan.
+- `completedSteps` lists completed TODO summaries.
+- A failed TODO remains visible when a corrected TODO is appended.
 
 ## Frontend Consumption Points
 
@@ -152,6 +171,7 @@ Frontend behavior:
 
 - `status=running` shows an active tool/progress row.
 - `status=completed` marks that row complete.
+- `progressKey` should be used as the row identity when present.
 - `currentStep/totalSteps` shows a compact counter such as `2/5`.
 - `status=failed` keeps the row visible with failure detail.
 

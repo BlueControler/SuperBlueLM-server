@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from langchain.agents.middleware.types import AgentState, PrivateStateAttr
 from langchain_core.messages import HumanMessage
@@ -20,9 +20,20 @@ class PhoneSnapshot(TypedDict):
     activity: str | None
 
 
+class PhoneTodoStep(TypedDict):
+    index: int
+    progressKey: str
+    name: str
+    status: Literal["completed", "failed"]
+    summary: str
+
+
 class MobileAgentState(AgentState[object], total=False):
     phone_snapshot: NotRequired[Annotated[PhoneSnapshot | None, PrivateStateAttr]]
     task_complexity_emitted: NotRequired[Annotated[bool, PrivateStateAttr]]
+    phone_todo_steps: NotRequired[
+        Annotated[tuple[PhoneTodoStep, ...], PrivateStateAttr]
+    ]
 
 
 def build_phone_snapshot(session: ConnectedDeviceSession) -> PhoneSnapshot:

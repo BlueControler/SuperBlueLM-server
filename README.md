@@ -4,7 +4,7 @@
 
 这个项目是一个 Android 手机远程操作服务端。
 
-它通过 WebSocket 与手机侧工具通信，并在服务端把手机能力包装成工具（observe、tap、swipe、type、keyevent 等），供 Deep Agent 进行任务规划和自动执行。
+它通过 WebSocket 与手机侧工具通信，并在服务端把手机能力包装成工具（observe、tap、swipe、type、keyevent 等）。云端模式下，主 agent 负责规划、验收和纠错，手机子 agent 负责把一条明确 TODO 转换成受限手机工具调用。
 
 当前代码已按单设备模型实现：
 
@@ -17,8 +17,42 @@
 
 1. 手机操作客户端连接 `/adb`，首条消息发送 `connect`。
 2. 系统工具客户端连接 `/system`，提供应用列表、日程、提醒、定位等 API。
-3. Agent 通过工具向两个 WebSocket client 下发请求。
-4. 手机端或系统工具端返回结果，服务端更新状态并继续下一步。
+3. 主 agent 直接调用系统工具和外部业务工具；手机 UI 操作通过 `execute_phone_todo` 委派给手机子 agent。
+4. 手机子 agent 仅持有手机工具，并在受限调用预算内执行当前 TODO。
+5. 手机端或系统工具端返回结果，服务端更新状态并继续下一步。
+
+## 多模型 Agent 架构
+
+网络可用时：
+
+```text
+主 agent -> execute_phone_todo -> 手机子 agent -> observe/tap/type/swipe 等手机工具
+主 agent -> 系统工具和外部业务工具
+```
+
+- 主 agent 使用云端强模型，负责维护计划、创建或修正 TODO、检查执行结果并决定是否结束。
+- 手机子 agent 使用独立可配置模型，只执行一条明确手机 TODO。
+- `allow_short_chain=false` 时，子 agent 默认只执行一个手机工具调用。
+- `allow_short_chain=true` 时，子 agent 可以执行少量确定性连续动作，但仍受调用预算限制。
+- 手机子 agent 不持有系统、飞书、企业微信、地图或天气工具。
+- 云端主 agent 看不到底层手机工具，不能绕过 `execute_phone_todo`。
+
+网络断开时：
+
+```text
+本地 llama.cpp 模型 -> 至多一次低风险手机工具调用
+```
+
+离线模式不会启动复杂的主子 agent 循环。多步骤、高风险或不确定任务仍会停止并要求用户确认或交还给更强模型。
+
+手机子 agent 环境变量：
+
+- `PHONE_SUBAGENT_MODEL`: 子 agent 模型名称；为空时复用主云端模型。
+- `PHONE_SUBAGENT_BASE_URL`: 可选 OpenAI-compatible 子模型地址。
+- `PHONE_SUBAGENT_API_KEY`: 子模型 API key；为空时回退 `OPENAI_API_KEY`。
+- `PHONE_SUBAGENT_MAX_TOKENS`: 子模型最大输出 token，默认 `2048`。
+- `PHONE_SUBAGENT_MAX_TOOL_CALLS`: 普通 TODO 最大手机工具调用数，默认 `1`。
+- `PHONE_SUBAGENT_SHORT_CHAIN_MAX_TOOL_CALLS`: 确定性短链最大手机工具调用数，默认 `4`。
 
 ## 部署
 

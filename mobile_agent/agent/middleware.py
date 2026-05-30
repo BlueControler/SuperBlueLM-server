@@ -7,8 +7,10 @@ from typing import Any, TypeAlias, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain.tools.tool_node import ToolCallRequest
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.runtime import Runtime
+from langgraph.types import Command
 
 from ..gateways.phone import DeviceGateway
 from ..local_model_runtime import model_runtime
@@ -24,10 +26,26 @@ from .task_complexity import classify_task_complexity
 
 ModelHandler: TypeAlias = Callable[[ModelRequest[Any]], ModelResponse[Any]]
 AsyncModelHandler: TypeAlias = Callable[[ModelRequest[Any]], Awaitable[ModelResponse[Any]]]
+ToolResult: TypeAlias = ToolMessage | Command[Any]
+ToolHandler: TypeAlias = Callable[[ToolCallRequest], ToolResult]
+AsyncToolHandler: TypeAlias = Callable[[ToolCallRequest], Awaitable[ToolResult]]
 NowProvider: TypeAlias = Callable[[], datetime]
 CURRENT_TIME_MESSAGE_MARKER = "mobile_agent_current_time"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 FALLBACK_TIMEZONE = timezone(timedelta(hours=8), DEFAULT_TIMEZONE)
+PHONE_DELEGATION_TOOL = "execute_phone_todo"
+ALWAYS_BLOCKED_MAIN_TOOLS = frozenset(
+    {
+        "task",
+        "execute",
+        "ls",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob",
+        "grep",
+    }
+)
 
 
 def _agent_timezone() -> tzinfo:
@@ -201,6 +219,78 @@ class SyncPhoneStateMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         if session.device_info is None:
             return None
         return build_phone_snapshot(session)
+
+
+class ModeToolAccessMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
+    state_schema = MobileAgentState
+
+    def __init__(self, phone_tool_names: set[str]) -> None:
+        self.phone_tool_names = frozenset(phone_tool_names)
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: ModelHandler,
+    ) -> ModelResponse[Any]:
+        return handler(self._with_visible_tools(request))
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: AsyncModelHandler,
+    ) -> ModelResponse[Any]:
+        return await handler(self._with_visible_tools(request))
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: ToolHandler,
+    ) -> ToolResult:
+        if self._is_blocked(request.tool_call["name"]):
+            return self._blocked_message(request)
+        return handler(request)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: AsyncToolHandler,
+    ) -> ToolResult:
+        if self._is_blocked(request.tool_call["name"]):
+            return self._blocked_message(request)
+        return await handler(request)
+
+    def _with_visible_tools(self, request: ModelRequest[Any]) -> ModelRequest[Any]:
+        return request.override(
+            tools=[
+                tool
+                for tool in request.tools
+                if self._is_visible(tool)
+            ]
+        )
+
+    def _is_visible(self, tool: Any) -> bool:
+        if isinstance(tool, dict):
+            tool_name = tool.get("name")
+        else:
+            tool_name = tool.name
+        return not isinstance(tool_name, str) or not self._is_blocked(tool_name)
+
+    def _is_blocked(self, tool_name: str) -> bool:
+        if tool_name in ALWAYS_BLOCKED_MAIN_TOOLS:
+            return True
+        if model_runtime.status().get("mode") == "local":
+            return tool_name == PHONE_DELEGATION_TOOL
+        return tool_name in self.phone_tool_names
+
+    def _blocked_message(self, request: ToolCallRequest) -> ToolMessage:
+        tool_name = request.tool_call["name"]
+        mode = model_runtime.status().get("mode", "unknown")
+        return ToolMessage(
+            content=f"Tool {tool_name!r} is unavailable in {mode} mode.",
+            tool_call_id=request.tool_call["id"],
+            name=tool_name,
+            status="error",
+        )
 
 
 class RouteModelMiddleware(AgentMiddleware[MobileAgentState, None, Any]):

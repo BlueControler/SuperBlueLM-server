@@ -21,6 +21,7 @@ def emit_task_progress(
     phase: str,
     message: str | None = None,
     tool_name: str | None = None,
+    progress_key: str | None = None,
     current_step: int | None = None,
     total_steps: int | None = None,
     completed_steps: Sequence[JsonObject] | None = None,
@@ -34,6 +35,7 @@ def emit_task_progress(
     }
     _put_if_present(payload, "message", message)
     _put_if_present(payload, "toolName", tool_name)
+    _put_if_present(payload, "progressKey", progress_key)
     _put_if_present(payload, "currentStep", current_step)
     _put_if_present(payload, "totalSteps", total_steps)
     _put_if_present(
