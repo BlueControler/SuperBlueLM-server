@@ -40,10 +40,10 @@
 网络断开时：
 
 ```text
-本地 llama.cpp 模型 -> 至多一次低风险手机工具调用
+本地 llama.cpp 模型 -> 每个用户请求至多一次低风险手机工具调用
 ```
 
-离线模式不会启动复杂的主子 agent 循环。多步骤、高风险或不确定任务仍会停止并要求用户确认或交还给更强模型。
+离线模式不会启动复杂的主子 agent 循环。服务端只暴露 `observe`、`tap`、`back`、`home`、`wait`、`interact` 和 `take_over`，并拒绝同一请求中的第二次或并行手机动作。多步骤、高风险或不确定任务仍会停止并要求用户确认或交还给更强模型。
 
 手机子 agent 环境变量：
 
@@ -53,6 +53,8 @@
 - `PHONE_SUBAGENT_MAX_TOKENS`: 子模型最大输出 token，默认 `2048`。
 - `PHONE_SUBAGENT_MAX_TOOL_CALLS`: 普通 TODO 最大手机工具调用数，默认 `1`。
 - `PHONE_SUBAGENT_SHORT_CHAIN_MAX_TOOL_CALLS`: 确定性短链最大手机工具调用数，默认 `4`。
+
+`PHONE_SUBAGENT_BASE_URL` 只能指向可信服务。子 agent 为执行页面操作会接收最新截图和 UI 树；服务端会在调用子模型前拒绝包含密码、token、cookie、session 或授权头等敏感值的 TODO，并返回 `needs_user_action` 交由用户接管。
 
 ## 部署
 
@@ -112,7 +114,7 @@ python -m setup llama:all --target linux-x64
 
 统一 setup 入口是 `python -m setup`。
 
-本地模型模式会额外注入一份更保守的系统提示词，只允许简单任务、零次或一次工具调用；多步骤、高风险或不确定任务会停止并要求用户确认或交还给更强模型。
+本地模型模式会额外注入一份更保守的系统提示词，只允许简单任务、每个用户请求零次或一次低风险手机工具调用；多步骤、高风险或不确定任务会停止并要求用户确认或交还给更强模型。
 
 ### 外部业务工具
 

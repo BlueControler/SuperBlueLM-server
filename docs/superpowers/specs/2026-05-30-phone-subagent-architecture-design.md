@@ -99,6 +99,9 @@ The phone subagent must stop when:
 
 - The TODO is complete.
 - A target is ambiguous.
+- The TODO contains an explicit credential, token, cookie, session, or
+  authorization value. The server rejects it before invoking the configurable
+  phone-subagent model.
 - User action is required for login, password, CAPTCHA, payment, biometric, or
   authorization steps.
 - Its tool-call budget is exhausted.
@@ -168,6 +171,10 @@ Configuration:
 When the phone-subagent model is not configured, the builder returns the main
 cloud model. Offline mode continues using the existing llama.cpp runtime and does
 not start the cloud-mode delegation loop.
+
+The configured phone-subagent endpoint is a trusted execution boundary because
+the child model receives current screenshot and UI-tree context. Explicit
+sensitive values in delegated TODO text are blocked before model invocation.
 
 ## Prompt Responsibilities
 
@@ -252,9 +259,13 @@ When `/network/status` is updated with `connected=false`, the existing local
 llama.cpp runtime is used. Offline mode does not enter the main-agent and phone-
 subagent delegation loop.
 
-The existing conservative local prompt remains authoritative:
+The existing conservative local prompt remains authoritative, and the backend
+enforces the direct-phone boundary:
 
-- Zero or one low-risk tool call per model round.
+- Zero or one low-risk phone-tool call per user request.
+- Only `observe`, `tap`, `back`, `home`, `wait`, `interact`, and `take_over`
+  remain available to the local model.
+- A second or parallel phone-tool call is rejected server-side.
 - No multi-step automation.
 - No continuous clicking, typing, or cross-app workflows.
 - Stop and explain when a complex task requires a stronger model or user action.

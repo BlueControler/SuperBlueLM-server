@@ -32,14 +32,27 @@ PhoneTodoStatus = Literal[
 ]
 
 BASE64_IMAGE_PATTERN = re.compile(
-    r"data:image/[^;]+;base64,[A-Za-z0-9+/=\r\n]+",
+    r"data:image/[^,\s]+;base64,[A-Za-z0-9+/=\r\n]+",
     re.IGNORECASE,
 )
 UI_TAG_PATTERN = re.compile(r"<[^>]+>")
 SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
-    r"""(?i)(["']?(?:token|secret|key|password)["']?\s*[:=]\s*)["']?[^,\s"']+"""
+    r"""(?ix)
+    (["']?(?:
+        token|secret|key|password|passwd|authorization|credential|
+        cookie|session(?:_id)?|access_token|api_key
+    )["']?\s*[:=]\s*)
+    (?:
+        ["'][^"']*["']|
+        [^,\s;]+
+    )
+    """
 )
 BEARER_PATTERN = re.compile(r"(?i)(bearer\s+)[a-z0-9._~+/=-]+")
+AUTHORIZATION_HEADER_PATTERN = re.compile(
+    r"(?i)(authorization\s*:\s*)(?:basic|bearer)\s+[^,\s;]+"
+)
+COOKIE_HEADER_PATTERN = re.compile(r"(?i)(cookie\s*:\s*)[^\r\n]+")
 
 
 class PhoneStateSummary(BaseModel):
@@ -160,6 +173,10 @@ class PhoneSubagentRunner:
         *,
         allow_short_chain: bool,
     ) -> PhoneTodoExecution:
+        if phone_text_contains_sensitive_data(todo):
+            logger.warning("Phone TODO contains sensitive data and requires user takeover.")
+            return self._needs_user_action(todo, "phone_todo_contains_sensitive_data")
+
         budget = _tool_budget(allow_short_chain)
         tools = create_phone_tools(self.phone_gateway)
         phone_tool_names = {tool.name for tool in tools}
@@ -204,15 +221,15 @@ class PhoneSubagentRunner:
             return self._failed(todo, "phone_subagent_invalid_response")
         return PhoneTodoExecution(
             status=decision.status,
-            todo=todo,
-            summary=_redact_text(decision.summary),
+            todo=redact_phone_text(todo),
+            summary=redact_phone_text(decision.summary),
             phoneState=self._phone_state_summary(),
             toolCallCount=_count_phone_tool_calls(
                 state.get("messages", ()),
                 phone_tool_names,
             ),
             needsMainAgentPlan=decision.needs_main_agent_plan,
-            error=_redact_text(decision.error) if decision.error else None,
+            error=redact_phone_text(decision.error) if decision.error else None,
         )
 
     def _phone_state_summary(self) -> PhoneStateSummary:
@@ -242,7 +259,7 @@ class PhoneSubagentRunner:
     ) -> PhoneTodoExecution:
         return PhoneTodoExecution(
             status="budget_exhausted",
-            todo=todo,
+            todo=redact_phone_text(todo),
             summary=f"Phone TODO stopped after reaching the {limit}-tool budget.",
             phoneState=self._phone_state_summary(),
             toolCallCount=executed_count,
@@ -253,8 +270,20 @@ class PhoneSubagentRunner:
     def _failed(self, todo: str, error: str) -> PhoneTodoExecution:
         return PhoneTodoExecution(
             status="failed",
-            todo=todo,
+            todo=redact_phone_text(todo),
             summary="Phone subagent execution failed.",
+            phoneState=self._phone_state_summary(),
+            toolCallCount=0,
+            needsMainAgentPlan=True,
+            error=error,
+        )
+
+
+    def _needs_user_action(self, todo: str, error: str) -> PhoneTodoExecution:
+        return PhoneTodoExecution(
+            status="needs_user_action",
+            todo=redact_phone_text(todo),
+            summary="Phone TODO requires user takeover because it contains sensitive data.",
             phoneState=self._phone_state_summary(),
             toolCallCount=0,
             needsMainAgentPlan=True,
@@ -286,11 +315,20 @@ def _count_phone_tool_calls(
     )
 
 
-def _redact_text(value: str) -> str:
+def redact_phone_text(value: str) -> str:
     without_images = BASE64_IMAGE_PATTERN.sub("data:image/***;base64,***", value)
     without_ui_tags = UI_TAG_PATTERN.sub("<ui-redacted>", without_images)
-    without_bearer = BEARER_PATTERN.sub(r"\1***", without_ui_tags)
+    without_authorization = AUTHORIZATION_HEADER_PATTERN.sub(
+        r"\1***",
+        without_ui_tags,
+    )
+    without_cookies = COOKIE_HEADER_PATTERN.sub(r"\1***", without_authorization)
+    without_bearer = BEARER_PATTERN.sub(r"\1***", without_cookies)
     return SENSITIVE_ASSIGNMENT_PATTERN.sub(r"\1***", without_bearer)
+
+
+def phone_text_contains_sensitive_data(value: str) -> bool:
+    return redact_phone_text(value) != value
 
 
 __all__ = [
@@ -298,4 +336,6 @@ __all__ = [
     "PhoneSubagentRunner",
     "PhoneTodoExecution",
     "PhoneTodoStatus",
+    "phone_text_contains_sensitive_data",
+    "redact_phone_text",
 ]

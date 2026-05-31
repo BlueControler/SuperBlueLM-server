@@ -8,7 +8,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
 from langchain.tools.tool_node import ToolCallRequest
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langgraph.runtime import Runtime
 from langgraph.types import Command
 
@@ -44,6 +50,17 @@ ALWAYS_BLOCKED_MAIN_TOOLS = frozenset(
         "edit_file",
         "glob",
         "grep",
+    }
+)
+LOCAL_ALLOWED_PHONE_TOOLS = frozenset(
+    {
+        "observe",
+        "tap",
+        "back",
+        "home",
+        "wait",
+        "interact",
+        "take_over",
     }
 )
 
@@ -246,7 +263,9 @@ class ModeToolAccessMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         request: ToolCallRequest,
         handler: ToolHandler,
     ) -> ToolResult:
-        if self._is_blocked(request.tool_call["name"]):
+        if self._is_blocked(request.tool_call["name"]) or self._exceeds_local_phone_limit(
+            request
+        ):
             return self._blocked_message(request)
         return handler(request)
 
@@ -255,7 +274,9 @@ class ModeToolAccessMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         request: ToolCallRequest,
         handler: AsyncToolHandler,
     ) -> ToolResult:
-        if self._is_blocked(request.tool_call["name"]):
+        if self._is_blocked(request.tool_call["name"]) or self._exceeds_local_phone_limit(
+            request
+        ):
             return self._blocked_message(request)
         return await handler(request)
 
@@ -279,8 +300,37 @@ class ModeToolAccessMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         if tool_name in ALWAYS_BLOCKED_MAIN_TOOLS:
             return True
         if model_runtime.status().get("mode") == "local":
-            return tool_name == PHONE_DELEGATION_TOOL
+            return tool_name == PHONE_DELEGATION_TOOL or (
+                tool_name in self.phone_tool_names
+                and tool_name not in LOCAL_ALLOWED_PHONE_TOOLS
+            )
         return tool_name in self.phone_tool_names
+
+    def _exceeds_local_phone_limit(self, request: ToolCallRequest) -> bool:
+        tool_name = request.tool_call["name"]
+        if (
+            model_runtime.status().get("mode") != "local"
+            or tool_name not in self.phone_tool_names
+        ):
+            return False
+
+        messages = request.state.get("messages", ())
+        if any(
+            isinstance(message, ToolMessage) and message.name in self.phone_tool_names
+            for message in messages
+        ):
+            return True
+
+        for message in reversed(messages):
+            if isinstance(message, AIMessage):
+                return (
+                    sum(
+                        call["name"] in self.phone_tool_names
+                        for call in message.tool_calls
+                    )
+                    > 1
+                )
+        return False
 
     def _blocked_message(self, request: ToolCallRequest) -> ToolMessage:
         tool_name = request.tool_call["name"]

@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from ..json_types import JsonObject
 from ..progress import emit_task_progress
-from .phone_subagent import PhoneTodoExecution
+from .phone_subagent import PhoneTodoExecution, redact_phone_text
 from .state import MobileAgentState, PhoneTodoStep
 
 
@@ -67,11 +67,12 @@ async def execute_tracked_phone_todo(
 ) -> tuple[PhoneTodoExecution, tuple[PhoneTodoStep, ...]]:
     index = len(steps) + 1
     progress_key = f"phone-todo-{index}"
+    redacted_todo = redact_phone_text(todo)
     emit_task_progress(
-        label=todo,
+        label=redacted_todo,
         status="running",
         phase="agent",
-        message=f"Executing phone TODO: {todo}",
+        message=f"Executing phone TODO: {redacted_todo}",
         tool_name="execute_phone_todo",
         progress_key=progress_key,
         current_step=index,
@@ -80,6 +81,8 @@ async def execute_tracked_phone_todo(
     )
 
     result = await runner.execute(todo, allow_short_chain=allow_short_chain)
+    redacted_summary = redact_phone_text(result.summary)
+    redacted_error = redact_phone_text(result.error) if result.error else None
     progress_status: Literal["completed", "failed"] = (
         "completed" if result.status == "completed" else "failed"
     )
@@ -88,22 +91,22 @@ async def execute_tracked_phone_todo(
         PhoneTodoStep(
             index=index,
             progressKey=progress_key,
-            name=todo,
+            name=redacted_todo,
             status=progress_status,
-            summary=result.summary,
+            summary=redacted_summary,
         ),
     )
     emit_task_progress(
-        label=todo,
+        label=redacted_todo,
         status=progress_status,
         phase="agent",
-        message=result.summary,
+        message=redacted_summary,
         tool_name="execute_phone_todo",
         progress_key=progress_key,
         current_step=index,
         total_steps=len(next_steps),
         completed_steps=_completed_step_payloads(next_steps),
-        error=result.error,
+        error=redacted_error,
     )
     return result, next_steps
 
