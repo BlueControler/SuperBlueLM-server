@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Literal, Protocol, cast
+from typing import Annotated, Any, Literal, Protocol, cast
 
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain.tools import ToolRuntime
@@ -9,6 +9,7 @@ from langchain_core.tools import BaseTool, tool
 from langgraph.runtime import Runtime
 from langgraph.types import Command
 from pydantic import BaseModel, Field
+from pydantic.json_schema import SkipJsonSchema
 
 from ..json_types import JsonObject
 from ..progress import emit_task_progress
@@ -35,6 +36,7 @@ class ExecutePhoneTodoArgs(BaseModel):
         default=False,
         description="Allow a bounded deterministic short chain of phone actions.",
     )
+    runtime: Annotated[Any, SkipJsonSchema()] = None
 
 
 class ResetPhoneTodoMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
@@ -121,6 +123,7 @@ def create_phone_delegation_tool(runner: PhoneTodoRunner) -> BaseTool:
         ),
     )
     async def execute_phone_todo(
+        *,
         todo: str,
         runtime: ToolRuntime,
         allow_short_chain: bool = False,

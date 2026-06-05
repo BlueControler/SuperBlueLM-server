@@ -88,7 +88,9 @@ async def update_network_status(request: Request) -> JSONResponse:
 app = Starlette(
     routes=[
         WebSocketRoute("/adb", adb_websocket),
+        WebSocketRoute("/adb/{device_id}", adb_websocket),
         WebSocketRoute("/system", system_websocket),
+        WebSocketRoute("/system/{device_id}", system_websocket),
         Route("/adb/status", adb_status, methods=["GET"]),
         Route("/system/status", system_status, methods=["GET"]),
         Route("/network/status", network_status, methods=["GET"]),

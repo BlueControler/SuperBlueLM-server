@@ -12,6 +12,9 @@
   "http": {
     "app": "mobile_agent.http_app:app"
   },
+  "auth": {
+    "path": "mobile_agent.auth:auth"
+  },
   "env": ".env",
   "image_distro": "wolfi"
 }

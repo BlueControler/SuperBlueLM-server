@@ -232,9 +232,16 @@ class DeviceGateway:
         await self.handler(StarletteWebSocketConnection(websocket))
 
     def _validate_path(self, path: str) -> None:
-        if normalized_path(path) == self.path_prefix:
+        normalized = normalized_path(path)
+        if normalized == self.path_prefix:
             return
-        raise DeviceGatewayError(f"Invalid device path {path!r}. Expected {self.path_prefix!r}.")
+        prefix = f"{self.path_prefix}/"
+        if normalized.startswith(prefix) and "/" not in normalized[len(prefix) :]:
+            return
+        raise DeviceGatewayError(
+            f"Invalid device path {path!r}. Expected {self.path_prefix!r} "
+            f"or {self.path_prefix}/{{device_id}}."
+        )
 
 
 def _optional_str(value: JsonValue) -> str | None:

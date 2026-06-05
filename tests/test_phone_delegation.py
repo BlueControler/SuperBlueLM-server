@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from langchain.tools import ToolRuntime
+
 from mobile_agent import progress
 from mobile_agent.agent.phone_delegation import (
     ResetPhoneTodoMiddleware,
@@ -205,6 +207,48 @@ def test_phone_delegation_tool_schema_exposes_validated_main_agent_inputs() -> N
     assert schema["properties"].keys() == {"todo", "allow_short_chain"}
     assert schema["properties"]["todo"]["minLength"] == 1
     assert schema["properties"]["todo"]["maxLength"] == 1000
+
+
+def test_phone_delegation_tool_preserves_injected_runtime(
+    monkeypatch: Any,
+) -> None:
+    emitted: list[dict[str, Any]] = []
+    runner = _Runner(_execution("Open the app"))
+    tool = create_phone_delegation_tool(runner)
+    runtime = ToolRuntime(
+        state={
+            "phone_todo_steps": (
+                {
+                    "index": 1,
+                    "progressKey": "phone-todo-1",
+                    "name": "old",
+                    "status": "completed",
+                    "summary": "done",
+                },
+            )
+        },
+        context=None,
+        config={},
+        stream_writer=lambda _: None,
+        tool_call_id="call_1",
+        store=None,
+    )
+    monkeypatch.setattr(progress, "get_stream_writer", lambda: emitted.append)
+
+    result = asyncio.run(
+        tool.ainvoke(
+            {
+                "name": "execute_phone_todo",
+                "args": {"todo": "Open the app", "runtime": runtime},
+                "id": "call_1",
+                "type": "tool_call",
+            }
+        )
+    )
+
+    assert result.update["phone_todo_steps"][-1]["index"] == 2
+    assert result.update["messages"][0].tool_call_id == "call_1"
+    assert runner.calls == [("Open the app", False)]
 
 
 def test_reset_phone_todo_middleware_returns_fresh_immutable_state() -> None:

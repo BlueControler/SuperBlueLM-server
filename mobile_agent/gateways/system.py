@@ -79,9 +79,7 @@ class SystemToolGateway:
 
     async def handler(self, websocket: JsonLineWebSocket) -> None:
         request = websocket.request
-        path = normalized_path(request.path) if request is not None else ""
-        if path != self.path:
-            raise SystemGatewayError(f"Invalid system tool path {path!r}. Expected {self.path!r}.")
+        path = self._normalized_client_path(request.path if request is not None else "")
 
         client = ConnectedSystemClient(websocket, path=path)
         await client.start()
@@ -102,3 +100,15 @@ class SystemToolGateway:
     async def starlette_handler(self, websocket: WebSocket) -> None:
         await websocket.accept()
         await self.handler(StarletteWebSocketConnection(websocket))
+
+    def _normalized_client_path(self, path: str) -> str:
+        normalized = normalized_path(path)
+        if normalized == self.path:
+            return normalized
+        prefix = f"{self.path.rstrip('/')}/"
+        if normalized.startswith(prefix) and "/" not in normalized[len(prefix) :]:
+            return normalized
+        raise SystemGatewayError(
+            f"Invalid system tool path {path!r}. Expected {self.path!r} "
+            f"or {self.path.rstrip('/')}/{{device_id}}."
+        )
