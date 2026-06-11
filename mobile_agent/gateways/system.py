@@ -67,25 +67,39 @@ class ConnectedSystemClient(JsonLineRpcSession):
 
 
 class SystemToolGateway:
+    DEFAULT_DEVICE_ID = "__default__"
+
     def __init__(self, path: str = "/system") -> None:
         self.path = path
-        self._client: ConnectedSystemClient | None = None
+        self._clients: dict[str, ConnectedSystemClient] = {}
+        self._default_device_id: str | None = None
         self._lock = asyncio.Lock()
 
-    def get_default_client(self) -> ConnectedSystemClient:
-        if self._client is None or self._client.closed.is_set():
-            raise SystemGatewayError("No connected system tool client is available.")
-        return self._client
+    def get_default_client(self, device_id: str | None = None) -> ConnectedSystemClient:
+        if device_id is not None:
+            client = self._clients.get(device_id)
+            if client is not None and not client.closed.is_set():
+                return client
+            raise SystemGatewayError(
+                f"No connected system tool client is available for {device_id!r}."
+            )
+
+        client = self._default_client()
+        if client is not None and not client.closed.is_set():
+            return client
+        raise SystemGatewayError("No connected system tool client is available.")
 
     async def handler(self, websocket: JsonLineWebSocket) -> None:
         request = websocket.request
         path = self._normalized_client_path(request.path if request is not None else "")
+        device_id = self._device_id_from_path(path)
 
         client = ConnectedSystemClient(websocket, path=path)
         await client.start()
         async with self._lock:
-            old_client = self._client
-            self._client = client
+            old_client = self._clients.get(device_id)
+            self._clients[device_id] = client
+            self._default_device_id = device_id
         if old_client is not None and not old_client.closed.is_set():
             await old_client.websocket.close(code=1000, reason="replaced by a new system client")
 
@@ -93,8 +107,12 @@ class SystemToolGateway:
             await client.closed.wait()
         finally:
             async with self._lock:
-                if self._client is client:
-                    self._client = None
+                if self._clients.get(device_id) is client:
+                    self._clients.pop(device_id, None)
+                    if self._default_device_id == device_id:
+                        self._default_device_id = next(
+                            reversed(self._clients), None
+                        )
             await client.stop()
 
     async def starlette_handler(self, websocket: WebSocket) -> None:
@@ -112,3 +130,21 @@ class SystemToolGateway:
             f"Invalid system tool path {path!r}. Expected {self.path!r} "
             f"or {self.path.rstrip('/')}/{{device_id}}."
         )
+
+    def _device_id_from_path(self, path: str) -> str:
+        normalized = self._normalized_client_path(path)
+        if normalized == self.path:
+            return self.DEFAULT_DEVICE_ID
+        return normalized.removeprefix(f"{self.path.rstrip('/')}/")
+
+    def _default_client(self) -> ConnectedSystemClient | None:
+        if self._default_device_id is not None:
+            client = self._clients.get(self._default_device_id)
+            if client is not None and not client.closed.is_set():
+                return client
+
+        for device_id, client in reversed(self._clients.items()):
+            if not client.closed.is_set():
+                self._default_device_id = device_id
+                return client
+        return None

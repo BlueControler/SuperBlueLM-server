@@ -193,13 +193,22 @@ class ConnectedDeviceSession(JsonLineRpcSession):
 
 
 class DeviceGateway:
+    DEFAULT_DEVICE_ID = "__default__"
+
     def __init__(self, path_prefix: str = "/adb") -> None:
         self.path_prefix = path_prefix.rstrip("/")
-        self._session: ConnectedDeviceSession | None = None
+        self._sessions: dict[str, ConnectedDeviceSession] = {}
+        self._default_device_id: str | None = None
         self._lock = asyncio.Lock()
 
-    def get_session(self) -> ConnectedDeviceSession:
-        session = self._session
+    def get_session(self, device_id: str | None = None) -> ConnectedDeviceSession:
+        if device_id is not None:
+            session = self._sessions.get(device_id)
+            if session is not None and not session.closed.is_set():
+                return session
+            raise DeviceGatewayError(f"No connected device is available for {device_id!r}.")
+
+        session = self._default_session()
         if session is not None and not session.closed.is_set():
             return session
         raise DeviceGatewayError("No connected device is available.")
@@ -208,23 +217,33 @@ class DeviceGateway:
         request = websocket.request
         if request is None:
             raise DeviceGatewayError("Missing websocket request metadata.")
-        self._validate_path(request.path)
+        device_id = self._device_id_from_path(request.path)
         session = ConnectedDeviceSession(websocket)
-
-        async with self._lock:
-            if self._session is not None and not self._session.closed.is_set():
-                raise DeviceGatewayError("Only one device connection is supported.")
 
         await session.start()
         await session.wait_ready()
         async with self._lock:
-            self._session = session
+            old_session = self._sessions.get(device_id)
+            self._sessions[device_id] = session
+            self._default_device_id = device_id
+        if old_session is not None and not old_session.closed.is_set():
+            await old_session.websocket.close(
+                code=1000,
+                reason="replaced by a new device connection",
+            )
+        async with self._lock:
+            self._sessions[device_id] = session
+            self._default_device_id = device_id
         try:
             await session.closed.wait()
         finally:
             async with self._lock:
-                if self._session is session:
-                    self._session = None
+                if self._sessions.get(device_id) is session:
+                    self._sessions.pop(device_id, None)
+                    if self._default_device_id == device_id:
+                        self._default_device_id = next(
+                            reversed(self._sessions), None
+                        )
             await session.stop()
 
     async def starlette_handler(self, websocket: WebSocket) -> None:
@@ -232,16 +251,33 @@ class DeviceGateway:
         await self.handler(StarletteWebSocketConnection(websocket))
 
     def _validate_path(self, path: str) -> None:
+        self._device_id_from_path(path)
+
+    def _device_id_from_path(self, path: str) -> str:
         normalized = normalized_path(path)
         if normalized == self.path_prefix:
-            return
+            return self.DEFAULT_DEVICE_ID
         prefix = f"{self.path_prefix}/"
         if normalized.startswith(prefix) and "/" not in normalized[len(prefix) :]:
-            return
+            device_id = normalized[len(prefix) :]
+            if device_id:
+                return device_id
         raise DeviceGatewayError(
             f"Invalid device path {path!r}. Expected {self.path_prefix!r} "
             f"or {self.path_prefix}/{{device_id}}."
         )
+
+    def _default_session(self) -> ConnectedDeviceSession | None:
+        if self._default_device_id is not None:
+            session = self._sessions.get(self._default_device_id)
+            if session is not None and not session.closed.is_set():
+                return session
+
+        for device_id, session in reversed(self._sessions.items()):
+            if not session.closed.is_set():
+                self._default_device_id = device_id
+                return session
+        return None
 
 
 def _optional_str(value: JsonValue) -> str | None:
