@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from typing import Any
 
 from mobile_agent import progress
@@ -14,6 +15,7 @@ from mobile_agent.tools.system import create_system_tools
 class _FakeSession:
     def __init__(self) -> None:
         self.calls: list[tuple[str, Any]] = []
+        self.device_info = SimpleNamespace(width=1080, height=2400)
 
     async def send_command(self, message: str, data: Any) -> dict[str, Any]:
         self.calls.append((message, data))
@@ -129,6 +131,45 @@ def test_phone_tool_routes_to_explicit_device_id() -> None:
     asyncio.run(tools["tap"].ainvoke({"x": 10, "y": 20, "device_id": "device-uuid-1"}))
 
     assert gateway.device_ids == ["device-uuid-1"]
+
+
+def test_scroll_uses_device_relative_safe_area_coordinates() -> None:
+    gateway = _FakePhoneGateway()
+    tools = {tool.name: tool for tool in create_phone_tools(gateway)}
+
+    asyncio.run(tools["scroll"].ainvoke({"direction": "up", "distance": "medium"}))
+
+    assert gateway.session.calls == [
+        (
+            "swipe",
+            {
+                "startX": 540,
+                "startY": 1800,
+                "endX": 540,
+                "endY": 600,
+            },
+        )
+    ]
+
+
+def test_scroll_adapts_to_different_device_dimensions() -> None:
+    gateway = _FakePhoneGateway()
+    gateway.session.device_info = SimpleNamespace(width=1440, height=3200)
+    tools = {tool.name: tool for tool in create_phone_tools(gateway)}
+
+    asyncio.run(tools["scroll"].ainvoke({"direction": "down", "distance": "short"}))
+
+    assert gateway.session.calls == [
+        (
+            "swipe",
+            {
+                "startX": 720,
+                "startY": 1120,
+                "endX": 720,
+                "endY": 2080,
+            },
+        )
+    ]
 
 
 def test_bound_phone_tool_rejects_device_id_override() -> None:

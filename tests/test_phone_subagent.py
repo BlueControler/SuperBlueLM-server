@@ -11,6 +11,7 @@ from mobile_agent.agent.phone_subagent import (
     PhoneSubagentRunner,
     PhoneToolBudgetExceededError,
     PhoneToolBudgetMiddleware,
+    PhoneToolRepeatedActionError,
     PhoneToolSequenceError,
     redact_phone_text,
 )
@@ -333,7 +334,8 @@ def test_phone_tool_budget_allows_first_sequential_call_and_blocks_second() -> N
         runtime=None,
     )
 
-    assert update == {"phone_tool_call_count": 1}
+    assert update["phone_tool_call_count"] == 1
+    assert update["phone_identical_action_count"] == 1
     with pytest.raises(PhoneToolBudgetExceededError):
         middleware.after_model(
             {
@@ -369,6 +371,53 @@ def test_phone_tool_budget_rejects_parallel_phone_actions() -> None:
             },
             runtime=None,
         )
+
+
+def test_phone_tool_budget_rejects_fourth_identical_action() -> None:
+    middleware = PhoneToolBudgetMiddleware({"swipe"}, limit=12, identical_action_limit=3)
+    action = {
+        "name": "swipe",
+        "args": {"start_x": 283, "start_y": 1215, "end_x": 283, "end_y": 200},
+        "id": "call-1",
+    }
+    state: dict[str, Any] = {"messages": [AIMessage(content="", tool_calls=[action])]}
+
+    first = middleware.after_model(state, runtime=None)
+    second = middleware.after_model({**state, **first}, runtime=None)
+    third = middleware.after_model({**state, **second}, runtime=None)
+
+    assert first["phone_identical_action_count"] == 1
+    assert second["phone_identical_action_count"] == 2
+    assert third["phone_identical_action_count"] == 3
+    with pytest.raises(PhoneToolRepeatedActionError):
+        middleware.after_model({**state, **third}, runtime=None)
+
+
+def test_phone_tool_budget_resets_identical_count_when_action_changes() -> None:
+    middleware = PhoneToolBudgetMiddleware({"swipe", "observe"}, limit=12)
+    swipe = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "swipe",
+                "args": {"start_x": 283, "start_y": 1215, "end_x": 283, "end_y": 200},
+                "id": "call-1",
+            }
+        ],
+    )
+    observe = AIMessage(
+        content="",
+        tool_calls=[{"name": "observe", "args": {}, "id": "call-2"}],
+    )
+
+    first = middleware.after_model({"messages": [swipe]}, runtime=None)
+    changed = middleware.after_model(
+        {"messages": [observe], **first},
+        runtime=None,
+    )
+
+    assert changed["phone_identical_action_count"] == 1
+    assert changed["phone_last_action_signature"] != first["phone_last_action_signature"]
 
 
 def test_phone_tool_budget_ignores_structured_output_tool_call() -> None:

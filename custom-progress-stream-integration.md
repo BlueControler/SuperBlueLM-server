@@ -26,6 +26,19 @@ The request must include `custom` in `stream_mode`:
 `on_disconnect` must be `cancel`. Agent Server defaults to `continue`, which
 allows the old run to keep executing after the frontend stream disconnects.
 
+## Message Rendering Rules
+
+`messages-tuple` contains both assistant messages and internal tool messages.
+Chat bubbles must render assistant/AI messages only and must not display raw
+`ToolMessage.content`. For example, `execute_phone_todo` returns internal JSON
+containing `status`, `phoneState`, `toolCallCount`, and `error`; this payload is
+for main-agent planning and is not a user-facing final response.
+
+Tool execution state should be rendered from `custom.task_progress`. If a run
+ends after a device disconnect without a final assistant message, map
+`device_not_connected` to a friendly reconnect message instead of displaying
+the raw tool JSON.
+
 The Android frontend already sends this stream mode from:
 
 ```text

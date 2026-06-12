@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -87,6 +88,8 @@ class PhoneTodoExecution(BaseModel):
 
 class PhoneToolBudgetState(AgentState[PhoneSubagentDecision], total=False):
     phone_tool_call_count: NotRequired[Annotated[int, PrivateStateAttr]]
+    phone_last_action_signature: NotRequired[Annotated[str, PrivateStateAttr]]
+    phone_identical_action_count: NotRequired[Annotated[int, PrivateStateAttr]]
 
 
 class PhoneToolBudgetExceededError(RuntimeError):
@@ -100,20 +103,30 @@ class PhoneToolSequenceError(RuntimeError):
     pass
 
 
+class PhoneToolRepeatedActionError(RuntimeError):
+    pass
+
+
 class PhoneToolBudgetMiddleware(
     AgentMiddleware[PhoneToolBudgetState, None, PhoneSubagentDecision]
 ):
     state_schema = PhoneToolBudgetState
 
-    def __init__(self, phone_tool_names: set[str], limit: int) -> None:
+    def __init__(
+        self,
+        phone_tool_names: set[str],
+        limit: int,
+        identical_action_limit: int = 3,
+    ) -> None:
         self.phone_tool_names = frozenset(phone_tool_names)
         self.limit = max(limit, 1)
+        self.identical_action_limit = max(identical_action_limit, 1)
 
     def after_model(
         self,
         state: PhoneToolBudgetState,
         runtime: Runtime[None],
-    ) -> dict[str, int] | None:
+    ) -> dict[str, int | str] | None:
         phone_calls = self._latest_phone_calls(state)
         if not phone_calls:
             return None
@@ -128,13 +141,28 @@ class PhoneToolBudgetMiddleware(
                 executed_count=executed_count,
                 limit=self.limit,
             )
-        return {"phone_tool_call_count": executed_count + 1}
+
+        signature = _phone_tool_call_signature(phone_calls[0])
+        identical_count = (
+            state.get("phone_identical_action_count", 0) + 1
+            if state.get("phone_last_action_signature") == signature
+            else 1
+        )
+        if identical_count > self.identical_action_limit:
+            raise PhoneToolRepeatedActionError(
+                f"Phone tool repeated more than {self.identical_action_limit} times."
+            )
+        return {
+            "phone_tool_call_count": executed_count + 1,
+            "phone_last_action_signature": signature,
+            "phone_identical_action_count": identical_count,
+        }
 
     async def aafter_model(
         self,
         state: PhoneToolBudgetState,
         runtime: Runtime[None],
-    ) -> dict[str, int] | None:
+    ) -> dict[str, int | str] | None:
         return self.after_model(state, runtime)
 
     def _latest_phone_calls(self, state: PhoneToolBudgetState) -> list[ToolCall]:
@@ -200,7 +228,11 @@ class PhoneSubagentRunner:
             system_prompt=PHONE_SUBAGENT_SYSTEM_PROMPT,
             middleware=[
                 SyncPhoneStateMiddleware(self.phone_gateway, device_id=device_id),
-                PhoneToolBudgetMiddleware(phone_tool_names, budget),
+                PhoneToolBudgetMiddleware(
+                    phone_tool_names,
+                    budget,
+                    identical_action_limit=_identical_action_limit(),
+                ),
             ],
             response_format=ToolStrategy(PhoneSubagentDecision),
         )
@@ -229,6 +261,9 @@ class PhoneSubagentRunner:
         except PhoneToolSequenceError:
             logger.warning("Phone subagent attempted parallel UI tool calls.")
             return self._failed(todo, "phone_parallel_tool_calls_rejected", device_id)
+        except PhoneToolRepeatedActionError:
+            logger.warning("Phone subagent stopped after repeating the same phone action.")
+            return self._failed(todo, "phone_repeated_tool_calls_rejected", device_id)
         except Exception:
             logger.exception("Phone subagent execution failed.")
             return self._failed(todo, "phone_subagent_execution_failed", device_id)
@@ -336,6 +371,22 @@ def _tool_budget(allow_short_chain: bool) -> int:
         return max(int(os.getenv(env_name, default)), 1)
     except ValueError:
         return int(default)
+
+
+def _identical_action_limit() -> int:
+    try:
+        return max(int(os.getenv("PHONE_SUBAGENT_MAX_IDENTICAL_ACTIONS", "3")), 1)
+    except ValueError:
+        return 3
+
+
+def _phone_tool_call_signature(call: ToolCall) -> str:
+    return json.dumps(
+        {"name": call["name"], "args": call["args"]},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _count_phone_tool_calls(

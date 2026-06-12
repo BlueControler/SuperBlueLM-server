@@ -20,6 +20,7 @@ from .rpc import (
 
 VERBOSE_HEARTBEAT = os.getenv("VERBOSE_HEARTBEAT", "").lower() in {"1", "true", "yes"}
 DEFAULT_SESSION_RECONNECT_WAIT_SECONDS = 3.0
+DEFAULT_PHONE_COMMAND_TIMEOUT_SECONDS = 45.0
 DEVICE_NOT_CONNECTED_CODE = "device_not_connected"
 DEVICE_NOT_CONNECTED_MESSAGE = "手机连接已断开，请重新连接后重试"
 
@@ -92,13 +93,17 @@ class ConnectedDeviceSession(JsonLineRpcSession):
         self,
         message: str,
         data: JsonValue,
-        timeout: float = 20.0,
+        timeout: float | None = None,
     ) -> JsonObject:
         if not self.ready.is_set():
             raise DeviceGatewayError("Device has not completed connect.")
 
         logger.info(f"-> message={message} data={_sanitize_log_payload(data)}")
-        response = await self.send_rpc_request(message, data, timeout=timeout)
+        response = await self.send_rpc_request(
+            message,
+            data,
+            timeout=_phone_command_timeout_seconds() if timeout is None else timeout,
+        )
         response_data = to_json_value(response.data)
         logger.info(
             f"<- requestId={response.request_id} message={response.message} "
@@ -267,21 +272,30 @@ class DeviceGateway:
 
         await session.start()
         await session.wait_ready()
+        logger.info(
+            f"Registering device session device_id={device_id!r} "
+            f"remote={websocket.remote_address!r}."
+        )
         async with self._session_changed:
             old_session = self._sessions.get(device_id)
-            self._sessions[device_id] = session
-            self._session_changed.notify_all()
-        if old_session is not None and not old_session.closed.is_set():
-            await old_session.websocket.close(
-                code=1000,
-                reason="replaced by a new device connection",
-            )
-        async with self._session_changed:
+            if old_session is not None and not old_session.closed.is_set():
+                logger.warning(
+                    f"Rejecting duplicate device session for device_id={device_id!r}; "
+                    f"active_remote={old_session.websocket.remote_address!r}, "
+                    f"duplicate_remote={websocket.remote_address!r}."
+                )
+                await websocket.close(
+                    code=1008,
+                    reason="device connection already active",
+                )
+                await session.stop()
+                return
             self._sessions[device_id] = session
             self._session_changed.notify_all()
         try:
             await session.closed.wait()
         finally:
+            logger.info(f"Device session closed for device_id={device_id!r}.")
             async with self._session_changed:
                 if self._sessions.get(device_id) is session:
                     self._sessions.pop(device_id, None)
@@ -332,6 +346,17 @@ def _session_reconnect_wait_seconds() -> float:
         return max(float(raw), 0)
     except ValueError:
         return DEFAULT_SESSION_RECONNECT_WAIT_SECONDS
+
+
+def _phone_command_timeout_seconds() -> float:
+    raw = os.getenv(
+        "PHONE_COMMAND_TIMEOUT_SECONDS",
+        str(DEFAULT_PHONE_COMMAND_TIMEOUT_SECONDS),
+    )
+    try:
+        return max(float(raw), 1)
+    except ValueError:
+        return DEFAULT_PHONE_COMMAND_TIMEOUT_SECONDS
 
 
 def _sanitize_log_payload(payload: JsonValue) -> JsonValue:

@@ -9,7 +9,12 @@ from starlette.requests import Request
 
 from mobile_agent import auth as auth_module
 from mobile_agent import http_app
-from mobile_agent.gateways.phone import DeviceGateway, DeviceGatewayError
+from mobile_agent.gateways.phone import (
+    ConnectedDeviceSession,
+    DeviceGateway,
+    DeviceGatewayError,
+)
+from mobile_agent.gateways.rpc import JsonLineEnvelope
 from mobile_agent.gateways.system import SystemGatewayError, SystemToolGateway
 from mobile_agent.http_app import app
 from mobile_agent.gateways.phone import ConnectData
@@ -62,6 +67,12 @@ class _FakeSystemWebSocket(_FakeWebSocket):
     async def __anext__(self) -> str:
         await self._closed.wait()
         raise StopAsyncIteration
+
+
+class _BrokenPipeWebSocket(_FakeWebSocket):
+    async def send(self, message: str) -> None:
+        del message
+        raise BrokenPipeError("broken pipe")
 
 
 def test_auth_identity_uses_x_api_key_without_storing_raw_secret() -> None:
@@ -121,6 +132,42 @@ def test_device_gateway_accepts_plain_and_device_scoped_adb_paths() -> None:
         pass
     else:
         raise AssertionError("nested device paths must be rejected")
+
+
+def test_device_session_ignores_late_response_without_disconnect() -> None:
+    socket = _FakeWebSocket("/adb/device-1")
+    session = ConnectedDeviceSession(socket)
+    session.ready.set()
+
+    session._handle_client_response(
+        JsonLineEnvelope(
+            type="response",
+            message="actionResult",
+            requestId=99,
+            data={},
+        )
+    )
+
+    assert session.closed.is_set() is False
+    assert socket.close_calls == []
+
+
+def test_device_session_marks_closed_when_send_hits_broken_pipe() -> None:
+    async def run() -> None:
+        socket = _BrokenPipeWebSocket("/adb/device-1")
+        session = ConnectedDeviceSession(socket)
+        session.ready.set()
+
+        try:
+            await session.send_command("swipe", {})
+        except DeviceGatewayError as exc:
+            assert "send failed" in str(exc).lower()
+        else:
+            raise AssertionError("broken pipe must fail the command")
+
+        assert session.closed.is_set()
+
+    asyncio.run(run())
 
 
 def test_connect_data_accepts_optional_screenshot_mime_type() -> None:
@@ -293,7 +340,7 @@ async def _wait_for_replaced_session(
     raise AssertionError(f"session {device_id!r} was not replaced")
 
 
-def test_device_gateway_replaces_same_device_connection_without_asgi_error() -> None:
+def test_device_gateway_rejects_duplicate_connection_without_replacing_active_session() -> None:
     async def run() -> None:
         gateway = DeviceGateway()
         first_socket = _FakeWebSocket("/adb/device-1")
@@ -302,19 +349,37 @@ def test_device_gateway_replaces_same_device_connection_without_asgi_error() -> 
 
         second_socket = _FakeWebSocket("/adb/device-1")
         second_task = asyncio.create_task(gateway.handler(second_socket))
-        second_session = await _wait_for_replaced_session(
-            gateway,
-            "device-1",
-            first_session,
-        )
+        await asyncio.sleep(0.01)
 
-        assert second_session is not first_session
-        assert first_socket.close_calls == [
-            (1000, "replaced by a new device connection")
+        assert gateway.get_session("device-1") is first_session
+        assert first_socket.close_calls == []
+        assert second_socket.close_calls == [
+            (1008, "device connection already active")
         ]
 
-        await second_socket.close()
+        await first_socket.close()
         await asyncio.gather(first_task, second_task)
+
+    asyncio.run(run())
+
+
+def test_device_gateway_accepts_reconnect_after_active_session_closes() -> None:
+    async def run() -> None:
+        gateway = DeviceGateway()
+        first_socket = _FakeWebSocket("/adb/device-1")
+        first_task = asyncio.create_task(gateway.handler(first_socket))
+        first_session = await _wait_for_session(gateway, "device-1")
+
+        await first_socket.close()
+        await first_task
+
+        second_socket = _FakeWebSocket("/adb/device-1")
+        second_task = asyncio.create_task(gateway.handler(second_socket))
+        second_session = await _wait_for_session(gateway, "device-1")
+
+        assert second_session is not first_session
+        await second_socket.close()
+        await second_task
 
     asyncio.run(run())
 

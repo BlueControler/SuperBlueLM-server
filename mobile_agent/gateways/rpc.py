@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
+from loguru import logger
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
 
@@ -123,8 +124,13 @@ class JsonLineRpcSession:
                 requestId=request_id,
             )
 
-        await self._send_envelope(envelope)
         try:
+            try:
+                await self._send_envelope(envelope)
+            except (OSError, ConnectionClosed, RuntimeError) as exc:
+                self.closed.set()
+                logger.warning(f"JSONL WebSocket send failed: {exc!r}")
+                raise self._disconnect_error("WebSocket client send failed.") from exc
             return await asyncio.wait_for(pending_response, timeout=timeout)
         finally:
             self._pending_responses.pop(request_id, None)
@@ -160,9 +166,12 @@ class JsonLineRpcSession:
                     else:
                         self._handle_client_response(envelope)
         except JsonLineProtocolViolation as exc:
+            logger.warning(f"Closing JSONL WebSocket after protocol violation: {exc}")
             await self.websocket.close(code=1008, reason=str(exc))
-        except ConnectionClosed:
-            pass
+        except ConnectionClosed as exc:
+            logger.info(f"JSONL WebSocket connection closed: {exc}")
+        except Exception as exc:
+            logger.warning(f"JSONL WebSocket reader stopped unexpectedly: {exc!r}")
         finally:
             self.closed.set()
             for future in list(self._pending_responses.values()):
@@ -183,10 +192,11 @@ class JsonLineRpcSession:
 
         pending_response = self._pending_responses.get(envelope.request_id)
         if pending_response is None or pending_response.done():
-            raise JsonLineProtocolViolation(
+            logger.warning(
                 f"Received unexpected response {envelope.message!r} "
-                f"with requestId={envelope.request_id}."
+                f"with requestId={envelope.request_id}; ignoring stale response."
             )
+            return
         pending_response.set_result(envelope)
 
 

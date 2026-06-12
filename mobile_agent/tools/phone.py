@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Literal
 
 from langchain_core.tools import BaseTool, tool
 
@@ -109,6 +110,59 @@ def create_phone_tools(
         )
         return _dump_result(_summarize_result(result))
 
+    @tool(
+        "scroll",
+        description=(
+            "Scroll the current page using stable safe-area coordinates. "
+            "Prefer this over swipe for normal page scrolling."
+        ),
+    )
+    async def scroll(
+        direction: Literal["up", "down"],
+        distance: Literal["short", "medium", "long"] = "medium",
+        device_id: str | None = None,
+    ) -> str:
+        try:
+            selected_device_id = _select_device_id(device_id, default_device_id)
+            session = await gateway.wait_for_session(selected_device_id)
+            if expected_session is not None and session is not expected_session:
+                raise DeviceNotConnectedError()
+        except DeviceNotConnectedError:
+            return _dump_result(_device_not_connected_result())
+        except DeviceGatewayError as exc:
+            if _is_device_not_connected_error(exc):
+                return _dump_result(_device_not_connected_result())
+            return _dump_result(
+                {"error": "phone_tool_failed", "message": str(exc), "recoverable": False}
+            )
+        info = getattr(session, "device_info", None)
+        if info is None:
+            return _dump_result(
+                {
+                    "error": "phone_tool_failed",
+                    "message": "Device screen dimensions are unavailable.",
+                    "recoverable": False,
+                }
+            )
+        start_x, start_y, end_x, end_y = _scroll_coordinates(
+            info.width,
+            info.height,
+            direction,
+            distance,
+        )
+        result = await send(
+            "scroll",
+            "swipe",
+            {
+                "startX": start_x,
+                "startY": start_y,
+                "endX": end_x,
+                "endY": end_y,
+            },
+            device_id,
+        )
+        return _dump_result(_summarize_result(result))
+
     @tool("long_press", description="Long press a screen coordinate.")
     async def long_press(x: int, y: int, device_id: str | None = None) -> str:
         return _dump_result(
@@ -186,6 +240,7 @@ def create_phone_tools(
         tap,
         type_text,
         swipe,
+        scroll,
         long_press,
         double_tap,
         back,
@@ -226,6 +281,26 @@ def _device_not_connected_result() -> JsonObject:
         "message": DEVICE_NOT_CONNECTED_MESSAGE,
         "recoverable": True,
     }
+
+
+def _scroll_coordinates(
+    width: int,
+    height: int,
+    direction: Literal["up", "down"],
+    distance: Literal["short", "medium", "long"],
+) -> tuple[int, int, int, int]:
+    center_x = width // 2
+    spans = {
+        "short": (0.65, 0.35),
+        "medium": (0.75, 0.25),
+        "long": (0.82, 0.18),
+    }
+    lower, upper = spans[distance]
+    start_y = int(height * lower)
+    end_y = int(height * upper)
+    if direction == "down":
+        start_y, end_y = end_y, start_y
+    return center_x, start_y, center_x, end_y
 
 
 def _is_device_not_connected_error(error: DeviceGatewayError) -> bool:
