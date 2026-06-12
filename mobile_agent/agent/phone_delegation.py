@@ -23,6 +23,7 @@ class PhoneTodoRunner(Protocol):
         todo: str,
         *,
         allow_short_chain: bool,
+        device_id: str | None = None,
     ) -> PhoneTodoExecution: ...
 
 
@@ -66,6 +67,7 @@ async def execute_tracked_phone_todo(
     todo: str,
     *,
     allow_short_chain: bool,
+    device_id: str | None = None,
 ) -> tuple[PhoneTodoExecution, tuple[PhoneTodoStep, ...]]:
     index = len(steps) + 1
     progress_key = f"phone-todo-{index}"
@@ -82,7 +84,14 @@ async def execute_tracked_phone_todo(
         completed_steps=_completed_step_payloads(steps),
     )
 
-    result = await runner.execute(todo, allow_short_chain=allow_short_chain)
+    if device_id is None:
+        result = await runner.execute(todo, allow_short_chain=allow_short_chain)
+    else:
+        result = await runner.execute(
+            todo,
+            allow_short_chain=allow_short_chain,
+            device_id=device_id,
+        )
     redacted_summary = redact_phone_text(result.summary)
     redacted_error = redact_phone_text(result.error) if result.error else None
     progress_status: Literal["completed", "failed"] = (
@@ -137,6 +146,7 @@ def create_phone_delegation_tool(runner: PhoneTodoRunner) -> BaseTool:
             runner,
             todo,
             allow_short_chain=allow_short_chain,
+            device_id=_state_device_id(runtime.state),
         )
         return Command(
             update={
@@ -152,6 +162,13 @@ def create_phone_delegation_tool(runner: PhoneTodoRunner) -> BaseTool:
         )
 
     return execute_phone_todo
+
+
+def _state_device_id(state: object) -> str | None:
+    if not isinstance(state, dict):
+        return None
+    value = state.get("device_id") or state.get("deviceId")
+    return value if isinstance(value, str) and value else None
 
 
 def _completed_step_payloads(steps: tuple[PhoneTodoStep, ...]) -> list[JsonObject]:

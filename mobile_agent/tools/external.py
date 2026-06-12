@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urlencode
 
+import httpx
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, Field
 
@@ -19,6 +20,21 @@ from ..progress import emit_task_progress
 
 MAX_OUTPUT_BYTES = 256 * 1024
 DEFAULT_TIMEOUT_SECONDS = 30.0
+AMAP_DISTRICT_URL = "https://restapi.amap.com/v3/config/district"
+AMAP_GEOCODE_URL = "https://restapi.amap.com/v3/geocode/geo"
+AMAP_PLACE_TEXT_URL = "https://restapi.amap.com/v3/place/text"
+AMAP_WEATHER_URL = "https://restapi.amap.com/v3/weather/weatherInfo"
+
+AMAP_MUNICIPALITY_ADCODES = {
+    "北京": "110000",
+    "北京市": "110000",
+    "天津": "120000",
+    "天津市": "120000",
+    "上海": "310000",
+    "上海市": "310000",
+    "重庆": "500000",
+    "重庆市": "500000",
+}
 
 SENSITIVE_KEY_PATTERN = re.compile(
     r"(token|secret|key|password|passwd|authorization|credential)",
@@ -158,7 +174,7 @@ class SafeCommandRunner:
         args: Sequence[str],
         timeout: float,
     ) -> JsonObject:
-        executable = _resolve_command(command)
+        executable = await asyncio.to_thread(_resolve_command, command)
         if executable is None:
             return {
                 "error": "command_not_found",
@@ -344,7 +360,7 @@ def create_external_tools(
         "weather_query",
         description="Query weather through AMap MCP maps_weather. city can be a city name or adcode.",
     )
-    async def weather_query(city: str) -> str:
+    async def weather_query(city: str | None = None) -> str:
         return await run_external_tool(
             "weather_query",
             lambda: query_weather(amap, city),
@@ -356,7 +372,7 @@ def create_external_tools(
     )
     async def external_tools_status() -> str:
         async def status_payload() -> JsonObject:
-            return external_tools_status_payload()
+            return await asyncio.to_thread(external_tools_status_payload)
 
         return await run_external_tool("external_tools_status", status_payload)
 
@@ -496,8 +512,223 @@ async def call_amap_mcp_tool(
     return await amap_client.call_tool(tool_name, arguments)
 
 
-async def query_weather(amap_client: AmapClient, city: str) -> JsonValue:
-    return await call_amap_mcp_tool(amap_client, "maps_weather", {"city": city})
+async def resolve_amap_city_adcode(city: str | None) -> str:
+    city_input = city.strip() if isinstance(city, str) else ""
+    if not city_input:
+        default_adcode = os.getenv("DEFAULT_AMAP_CITY_ADCODE", "").strip()
+        if re.fullmatch(r"\d{6}", default_adcode):
+            return default_adcode
+        city_input = os.getenv("DEFAULT_AMAP_CITY_NAME", "").strip()
+        if not city_input:
+            raise ValueError(
+                "city is required when DEFAULT_AMAP_CITY_ADCODE and "
+                "DEFAULT_AMAP_CITY_NAME are not configured."
+            )
+
+    if re.fullmatch(r"\d{6}", city_input):
+        return city_input
+
+    municipality_adcode = AMAP_MUNICIPALITY_ADCODES.get(city_input)
+    if municipality_adcode is not None:
+        return municipality_adcode
+
+    api_key = os.getenv("AMAP_MAPS_API_KEY")
+    if not api_key:
+        raise ValueError("AMAP_MAPS_API_KEY is required to resolve a city name.")
+
+    district_result = await _amap_rest_get_json(
+        AMAP_DISTRICT_URL,
+        {
+            "key": api_key,
+            "keywords": city_input,
+            "subdistrict": "0",
+            "extensions": "base",
+            "output": "JSON",
+        },
+    )
+    district_adcode = _first_adcode(district_result.get("districts"))
+    if district_adcode is not None:
+        return district_adcode
+
+    geocode_result = await _amap_rest_get_json(
+        AMAP_GEOCODE_URL,
+        {
+            "key": api_key,
+            "address": city_input,
+            "output": "JSON",
+        },
+    )
+    geocode_adcode = _first_adcode(geocode_result.get("geocodes"))
+    if geocode_adcode is not None:
+        return geocode_adcode
+
+    place_result = await _amap_rest_get_json(
+        AMAP_PLACE_TEXT_URL,
+        {
+            "key": api_key,
+            "keywords": city_input,
+            "offset": "1",
+            "page": "1",
+            "extensions": "base",
+            "output": "JSON",
+        },
+    )
+    place_adcode = _first_adcode(place_result.get("pois"))
+    if place_adcode is not None:
+        return place_adcode
+
+    district_info = str(district_result.get("info") or "no district match")
+    geocode_info = str(geocode_result.get("info") or "no geocode match")
+    place_info = str(place_result.get("info") or "no POI match")
+    raise ValueError(
+        f"Unable to resolve AMap adcode for {city_input!r}: "
+        f"district={district_info}; geocode={geocode_info}; POI={place_info}."
+    )
+
+
+async def query_weather(amap_client: AmapClient, city: str | None) -> JsonValue:
+    try:
+        adcode = await resolve_amap_city_adcode(city)
+    except Exception as exc:
+        return {
+            "error": "weather_query_failed",
+            "message": _safe_amap_error(exc),
+            "city_input": city,
+            "resolved_adcode": None,
+        }
+
+    try:
+        mcp_result = await call_amap_mcp_tool(
+            amap_client,
+            "maps_weather",
+            {"city": adcode},
+        )
+    except Exception as exc:
+        mcp_result = {"error": "amap_mcp_call_failed", "message": _safe_amap_error(exc)}
+
+    if _mcp_weather_is_valid(mcp_result):
+        return mcp_result
+
+    api_key = os.getenv("AMAP_MAPS_API_KEY")
+    if not api_key:
+        return _weather_query_error(city, adcode, mcp_result, "AMAP_MAPS_API_KEY is missing")
+
+    try:
+        rest_result = await _amap_rest_get_json(
+            AMAP_WEATHER_URL,
+            {
+                "key": api_key,
+                "city": adcode,
+                "extensions": "all",
+                "output": "JSON",
+            },
+        )
+    except Exception as exc:
+        return _weather_query_error(city, adcode, mcp_result, _safe_amap_error(exc))
+
+    if _rest_weather_is_valid(rest_result):
+        return rest_result
+
+    rest_message = str(rest_result.get("info") or rest_result.get("infocode") or rest_result)
+    return _weather_query_error(city, adcode, mcp_result, rest_message)
+
+
+async def _amap_rest_get_json(url: str, params: dict[str, str]) -> JsonObject:
+    api_key = params.get("key", "")
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=_tool_timeout()) as client:
+                response = await client.get(url, params=params)
+                response.raise_for_status()
+                payload = response.json()
+            break
+        except httpx.TransportError as exc:
+            if attempt == 0:
+                continue
+            return {"status": "0", "info": _safe_amap_error(exc, api_key)}
+        except Exception as exc:
+            return {"status": "0", "info": _safe_amap_error(exc, api_key)}
+
+    if not isinstance(payload, dict):
+        return {"status": "0", "info": "AMap REST API returned a non-object response."}
+    return _to_jsonable(payload)
+
+
+def _first_adcode(items: object) -> str | None:
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        adcode = item.get("adcode")
+        if isinstance(adcode, str) and re.fullmatch(r"\d{6}", adcode):
+            return adcode
+    return None
+
+
+def _mcp_weather_is_valid(result: JsonValue) -> bool:
+    if not isinstance(result, Mapping):
+        return False
+    if _weather_fields_are_valid(result):
+        return True
+
+    structured = result.get("structuredContent")
+    if isinstance(structured, Mapping) and _weather_fields_are_valid(structured):
+        return True
+
+    content = result.get("content")
+    if not isinstance(content, list):
+        return False
+    for item in content:
+        if not isinstance(item, Mapping):
+            continue
+        text = item.get("text")
+        if not isinstance(text, str):
+            continue
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, Mapping) and _weather_fields_are_valid(parsed):
+            return True
+    return False
+
+
+def _weather_fields_are_valid(payload: Mapping[object, object]) -> bool:
+    return bool(payload.get("city")) and bool(payload.get("forecasts"))
+
+
+def _rest_weather_is_valid(payload: JsonObject) -> bool:
+    forecasts = payload.get("forecasts")
+    if payload.get("status") != "1" or not isinstance(forecasts, list) or not forecasts:
+        return False
+    first = forecasts[0]
+    return isinstance(first, Mapping) and bool(first.get("city")) and bool(first.get("casts"))
+
+
+def _weather_query_error(
+    city: str | None,
+    adcode: str,
+    mcp_result: JsonValue,
+    rest_message: str,
+) -> JsonObject:
+    mcp_message = "MCP returned empty city or forecasts"
+    if isinstance(mcp_result, Mapping):
+        mcp_message = str(mcp_result.get("message") or mcp_result.get("error") or mcp_message)
+    return {
+        "error": "weather_query_failed",
+        "message": _safe_amap_error(f"MCP: {mcp_message}; REST: {rest_message}"),
+        "city_input": city,
+        "resolved_adcode": adcode,
+    }
+
+
+def _safe_amap_error(error: object, api_key: str | None = None) -> str:
+    message = _redact_text(str(error) or type(error).__name__)
+    key = api_key or os.getenv("AMAP_MAPS_API_KEY")
+    if key:
+        message = message.replace(key, "***").replace(urlencode({"key": key})[4:], "***")
+    return message
 
 
 def external_tools_status_payload() -> JsonObject:

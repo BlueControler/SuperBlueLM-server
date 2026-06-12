@@ -11,6 +11,13 @@ from ..json_types import JsonObject, JsonValue, to_json_value
 from ..progress import emit_task_progress
 
 
+class DeviceScopedArgs(BaseModel):
+    device_id: str | None = Field(
+        default=None,
+        description="Target device UUID. Required when multiple devices are connected.",
+    )
+
+
 class CalendarEventArgs(BaseModel):
     id: int | None = Field(
         default=None,
@@ -71,7 +78,7 @@ class CalendarReminderArgs(BaseModel):
     )
 
 
-class ListAppsArgs(BaseModel):
+class ListAppsArgs(DeviceScopedArgs):
     app_type: Literal["all", "third", "system"] = Field(
         default="all",
         description=(
@@ -81,13 +88,13 @@ class ListAppsArgs(BaseModel):
     )
 
 
-class CreateEventArgs(BaseModel):
+class CreateEventArgs(DeviceScopedArgs):
     event: CalendarEventArgs = Field(
         description="Calendar event payload following Android CalendarContract.EventsColumns."
     )
 
 
-class ListEventsArgs(BaseModel):
+class ListEventsArgs(DeviceScopedArgs):
     start: int = Field(
         description="Inclusive query start time as Unix timestamp in milliseconds."
     )
@@ -96,19 +103,19 @@ class ListEventsArgs(BaseModel):
     )
 
 
-class UpdateEventArgs(BaseModel):
+class UpdateEventArgs(DeviceScopedArgs):
     event: CalendarEventArgs = Field(
         description="Calendar event payload with _id set for the event to update."
     )
 
 
-class ListRemindersArgs(BaseModel):
+class ListRemindersArgs(DeviceScopedArgs):
     event_id: int = Field(
         description="Calendar event ID whose reminders should be listed."
     )
 
 
-class UpdateRemindersArgs(BaseModel):
+class UpdateRemindersArgs(DeviceScopedArgs):
     event_id: int = Field(
         description="Calendar event ID whose reminders should be replaced."
     )
@@ -117,12 +124,17 @@ class UpdateRemindersArgs(BaseModel):
     )
 
 
-class GetLocationArgs(BaseModel):
+class GetLocationArgs(DeviceScopedArgs):
     pass
 
 
 def create_system_tools(gateway: SystemToolGateway) -> list[BaseTool]:
-    async def send(tool_name: str, message: str, data: JsonValue) -> str:
+    async def send(
+        tool_name: str,
+        message: str,
+        data: JsonValue,
+        device_id: str | None,
+    ) -> str:
         emit_task_progress(
             label=tool_name,
             status="running",
@@ -131,7 +143,12 @@ def create_system_tools(gateway: SystemToolGateway) -> list[BaseTool]:
             tool_name=tool_name,
         )
         try:
-            result = await gateway.get_default_client().send_request(message, data)
+            client = (
+                gateway.get_default_client(device_id)
+                if device_id is not None
+                else gateway.get_default_client()
+            )
+            result = await client.send_request(message, data)
         except SystemGatewayError as exc:
             emit_task_progress(
                 label=tool_name,
@@ -159,40 +176,54 @@ def create_system_tools(gateway: SystemToolGateway) -> list[BaseTool]:
             "app_type is all, third, or system. Returns {packageName: appLabel}."
         ),
     )
-    async def list_apps(app_type: str = "all") -> str:
-        return await send("list_apps", "listApps", {"type": app_type})
+    async def list_apps(app_type: str = "all", device_id: str | None = None) -> str:
+        return await send("list_apps", "listApps", {"type": app_type}, device_id)
 
     @tool(
         "create_event",
         args_schema=CreateEventArgs,
         description="Create a calendar event through the /system tool client. The event follows CalendarContract fields.",
     )
-    async def create_event(event: CalendarEventArgs) -> str:
-        return await send("create_event", "createEvent", {"event": _json_object(event)})
+    async def create_event(
+        event: CalendarEventArgs, device_id: str | None = None
+    ) -> str:
+        return await send(
+            "create_event", "createEvent", {"event": _json_object(event)}, device_id
+        )
 
     @tool(
         "list_events",
         args_schema=ListEventsArgs,
         description="List calendar events whose start or end time falls within [start, end], timestamps in milliseconds.",
     )
-    async def list_events(start: int, end: int) -> str:
-        return await send("list_events", "listEvents", {"start": start, "end": end})
+    async def list_events(
+        start: int, end: int, device_id: str | None = None
+    ) -> str:
+        return await send(
+            "list_events", "listEvents", {"start": start, "end": end}, device_id
+        )
 
     @tool(
         "update_event",
         args_schema=UpdateEventArgs,
         description="Update an existing calendar event. To delete an event, set status to cancelled.",
     )
-    async def update_event(event: CalendarEventArgs) -> str:
-        return await send("update_event", "updateEvent", {"event": _json_object(event)})
+    async def update_event(
+        event: CalendarEventArgs, device_id: str | None = None
+    ) -> str:
+        return await send(
+            "update_event", "updateEvent", {"event": _json_object(event)}, device_id
+        )
 
     @tool(
         "list_reminders",
         args_schema=ListRemindersArgs,
         description="List all reminders attached to a calendar event.",
     )
-    async def list_reminders(event_id: int) -> str:
-        return await send("list_reminders", "listReminders", {"eventId": event_id})
+    async def list_reminders(event_id: int, device_id: str | None = None) -> str:
+        return await send(
+            "list_reminders", "listReminders", {"eventId": event_id}, device_id
+        )
 
     @tool(
         "update_reminders",
@@ -200,7 +231,9 @@ def create_system_tools(gateway: SystemToolGateway) -> list[BaseTool]:
         description="Replace all reminders on a calendar event. Passing an empty list removes all reminders.",
     )
     async def update_reminders(
-        event_id: int, reminders: list[CalendarReminderArgs]
+        event_id: int,
+        reminders: list[CalendarReminderArgs],
+        device_id: str | None = None,
     ) -> str:
         return await send(
             "update_reminders",
@@ -209,6 +242,7 @@ def create_system_tools(gateway: SystemToolGateway) -> list[BaseTool]:
                 "eventId": event_id,
                 "reminders": [_json_object(reminder) for reminder in reminders],
             },
+            device_id,
         )
 
     @tool(
@@ -216,8 +250,8 @@ def create_system_tools(gateway: SystemToolGateway) -> list[BaseTool]:
         args_schema=GetLocationArgs,
         description="Get current device location through the /system tool client.",
     )
-    async def get_location() -> str:
-        return await send("get_location", "getLocation", None)
+    async def get_location(device_id: str | None = None) -> str:
+        return await send("get_location", "getLocation", None, device_id)
 
     return [
         list_apps,

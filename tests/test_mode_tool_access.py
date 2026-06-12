@@ -74,17 +74,22 @@ def _visible_tool_names(
 def _tool_call_request(
     name: str,
     *,
+    args: dict[str, Any] | None = None,
+    state: dict[str, Any] | None = None,
     messages: list[Any] | None = None,
 ) -> ToolCallRequest:
+    request_state = {"messages": messages or []}
+    if state:
+        request_state.update(state)
     return ToolCallRequest(
         tool_call={
             "name": name,
-            "args": {},
+            "args": args or {},
             "id": f"call-{name}",
             "type": "tool_call",
         },
         tool=None,
-        state={"messages": messages or []},
+        state=request_state,
         runtime=None,
     )
 
@@ -233,3 +238,24 @@ def test_deep_agent_bypass_tools_stay_blocked_in_every_mode(monkeypatch: Any) ->
             )
             assert isinstance(result, ToolMessage)
             assert result.status == "error"
+
+
+def test_device_scoped_tool_is_bound_to_thread_device_id(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        "mobile_agent.agent.middleware.model_runtime.status",
+        lambda: {"mode": "cloud"},
+    )
+    middleware = ModeToolAccessMiddleware({"tap"}, {"tap", "list_apps"})
+    captured: list[ToolCallRequest] = []
+
+    result = middleware.wrap_tool_call(
+        _tool_call_request(
+            "list_apps",
+            args={"device_id": "other-device"},
+            state={"deviceId": "thread-device"},
+        ),
+        lambda request: captured.append(request) or "ok",
+    )
+
+    assert result == "ok"
+    assert captured[0].tool_call["args"]["device_id"] == "thread-device"

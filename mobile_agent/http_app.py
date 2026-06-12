@@ -25,8 +25,9 @@ async def system_websocket(websocket: WebSocket) -> None:
 
 
 async def adb_status(request: Request) -> JSONResponse:
+    device_id = request.path_params.get("device_id")
     try:
-        session = phone_gateway.get_session()
+        session = phone_gateway.get_session(device_id)
     except DeviceGatewayError:
         return JSONResponse({"connected": False})
 
@@ -43,8 +44,9 @@ async def adb_status(request: Request) -> JSONResponse:
 
 
 async def system_status(request: Request) -> JSONResponse:
+    device_id = request.path_params.get("device_id")
     try:
-        client = system_gateway.get_default_client()
+        client = system_gateway.get_default_client(device_id)
     except SystemGatewayError:
         return JSONResponse({"connected": False})
 
@@ -92,8 +94,12 @@ app = Starlette(
         WebSocketRoute("/system", system_websocket),
         WebSocketRoute("/system/{device_id}", system_websocket),
         Route("/adb/status", adb_status, methods=["GET"]),
+        Route("/adb/{device_id}/status", adb_status, methods=["GET"]),
         Route("/system/status", system_status, methods=["GET"]),
+        Route("/system/{device_id}/status", system_status, methods=["GET"]),
         Route("/network/status", network_status, methods=["GET"]),
+        Route("/network/{device_id}/status", network_status, methods=["GET"]),
         Route("/network/status", update_network_status, methods=["POST"]),
+        Route("/network/{device_id}/status", update_network_status, methods=["POST"]),
     ]
 )

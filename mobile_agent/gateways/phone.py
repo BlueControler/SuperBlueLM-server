@@ -33,6 +33,7 @@ class ConnectData(BaseModel):
     width: int = Field(ge=1)
     height: int = Field(ge=1)
     screenshot: str | None = None
+    screenshot_mime_type: str | None = Field(default=None, alias="screenshotMimeType")
     ui: str | None = None
     current_package: str | None = Field(default=None, alias="currentPackage")
     activity: str | None = None
@@ -44,6 +45,7 @@ class ConnectData(BaseModel):
 class ErrorData(BaseModel):
     message: str
     screenshot: str | None = None
+    screenshot_mime_type: str | None = Field(default=None, alias="screenshotMimeType")
     ui: str | None = None
     current_package: str | None = Field(default=None, alias="currentPackage")
     activity: str | None = None
@@ -56,6 +58,7 @@ class DeviceInfo:
     width: int
     height: int
     screenshot: str | None
+    screenshot_mime_type: str
     ui: str | None
     current_package: str | None
     activity: str | None
@@ -98,6 +101,7 @@ class ConnectedDeviceSession(JsonLineRpcSession):
             error = ErrorData.model_validate(response_data)
             self._update_device_info(
                 screenshot=error.screenshot,
+                screenshot_mime_type=error.screenshot_mime_type,
                 ui=error.ui,
                 current_package=error.current_package,
                 activity=error.activity,
@@ -153,6 +157,7 @@ class ConnectedDeviceSession(JsonLineRpcSession):
             width=connect_data.width,
             height=connect_data.height,
             screenshot=connect_data.screenshot,
+            screenshot_mime_type=_screenshot_mime_type(connect_data.screenshot_mime_type),
             ui=connect_data.ui,
             current_package=connect_data.current_package,
             activity=connect_data.activity,
@@ -168,6 +173,7 @@ class ConnectedDeviceSession(JsonLineRpcSession):
         self,
         *,
         screenshot: str | None,
+        screenshot_mime_type: str | None,
         ui: str | None,
         current_package: str | None,
         activity: str | None,
@@ -176,6 +182,8 @@ class ConnectedDeviceSession(JsonLineRpcSession):
             return
         if screenshot is not None:
             self.device_info.screenshot = screenshot
+        if screenshot_mime_type is not None:
+            self.device_info.screenshot_mime_type = _screenshot_mime_type(screenshot_mime_type)
         if ui is not None:
             self.device_info.ui = ui
         if current_package is not None:
@@ -186,6 +194,7 @@ class ConnectedDeviceSession(JsonLineRpcSession):
     def _update_device_info_from_payload(self, payload: JsonObject) -> None:
         self._update_device_info(
             screenshot=_optional_str(payload.get("screenshot")),
+            screenshot_mime_type=_optional_str(payload.get("screenshotMimeType")),
             ui=_optional_str(payload.get("ui")),
             current_package=_optional_str(payload.get("currentPackage")),
             activity=_optional_str(payload.get("activity")),
@@ -198,7 +207,6 @@ class DeviceGateway:
     def __init__(self, path_prefix: str = "/adb") -> None:
         self.path_prefix = path_prefix.rstrip("/")
         self._sessions: dict[str, ConnectedDeviceSession] = {}
-        self._default_device_id: str | None = None
         self._lock = asyncio.Lock()
 
     def get_session(self, device_id: str | None = None) -> ConnectedDeviceSession:
@@ -208,9 +216,13 @@ class DeviceGateway:
                 return session
             raise DeviceGatewayError(f"No connected device is available for {device_id!r}.")
 
-        session = self._default_session()
-        if session is not None and not session.closed.is_set():
-            return session
+        active_sessions = self._active_sessions()
+        if len(active_sessions) == 1:
+            return active_sessions[0]
+        if len(active_sessions) > 1:
+            raise DeviceGatewayError(
+                "Multiple devices are connected; device_id is required."
+            )
         raise DeviceGatewayError("No connected device is available.")
 
     async def handler(self, websocket: JsonLineWebSocket) -> None:
@@ -225,7 +237,6 @@ class DeviceGateway:
         async with self._lock:
             old_session = self._sessions.get(device_id)
             self._sessions[device_id] = session
-            self._default_device_id = device_id
         if old_session is not None and not old_session.closed.is_set():
             await old_session.websocket.close(
                 code=1000,
@@ -233,17 +244,12 @@ class DeviceGateway:
             )
         async with self._lock:
             self._sessions[device_id] = session
-            self._default_device_id = device_id
         try:
             await session.closed.wait()
         finally:
             async with self._lock:
                 if self._sessions.get(device_id) is session:
                     self._sessions.pop(device_id, None)
-                    if self._default_device_id == device_id:
-                        self._default_device_id = next(
-                            reversed(self._sessions), None
-                        )
             await session.stop()
 
     async def starlette_handler(self, websocket: WebSocket) -> None:
@@ -267,21 +273,18 @@ class DeviceGateway:
             f"or {self.path_prefix}/{{device_id}}."
         )
 
-    def _default_session(self) -> ConnectedDeviceSession | None:
-        if self._default_device_id is not None:
-            session = self._sessions.get(self._default_device_id)
-            if session is not None and not session.closed.is_set():
-                return session
-
-        for device_id, session in reversed(self._sessions.items()):
-            if not session.closed.is_set():
-                self._default_device_id = device_id
-                return session
-        return None
+    def _active_sessions(self) -> list[ConnectedDeviceSession]:
+        return [session for session in self._sessions.values() if not session.closed.is_set()]
 
 
 def _optional_str(value: JsonValue) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _screenshot_mime_type(value: str | None) -> str:
+    if isinstance(value, str) and value.startswith("image/"):
+        return value
+    return "image/png"
 
 
 def _sanitize_log_payload(payload: JsonValue) -> JsonValue:

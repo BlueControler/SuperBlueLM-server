@@ -19,8 +19,10 @@ class _FakeSystemClient:
 class _FakeSystemGateway:
     def __init__(self) -> None:
         self.client = _FakeSystemClient()
+        self.device_ids: list[str | None] = []
 
-    def get_default_client(self) -> _FakeSystemClient:
+    def get_default_client(self, device_id: str | None = None) -> _FakeSystemClient:
+        self.device_ids.append(device_id)
         return self.client
 
 
@@ -85,10 +87,10 @@ def test_reminder_schema_describes_protocol_fields() -> None:
     )
 
 
-def test_get_location_uses_empty_explicit_schema() -> None:
+def test_get_location_uses_device_scoped_explicit_schema() -> None:
     tool = _tool_by_name()["get_location"]
     assert tool.args_schema.__name__ == "GetLocationArgs"
-    assert tool.args_schema.model_json_schema().get("properties", {}) == {}
+    assert tool.args_schema.model_json_schema()["properties"].keys() == {"device_id"}
 
 
 def test_create_event_serializes_aliases_through_tool_schema() -> None:
@@ -144,6 +146,14 @@ def test_list_apps_uses_default_app_type_through_tool_schema() -> None:
     asyncio.run(tools["list_apps"].ainvoke({}))
 
     assert gateway.client.calls == [("listApps", {"type": "all"})]
+
+
+def test_system_tool_routes_to_configured_device_id() -> None:
+    tools, gateway = _fake_tools()
+
+    asyncio.run(tools["list_apps"].ainvoke({"app_type": "all", "device_id": "device-1"}))
+
+    assert gateway.device_ids == ["device-1"]
 
 
 def test_all_system_tool_arguments_have_descriptions() -> None:

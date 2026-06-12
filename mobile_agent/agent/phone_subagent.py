@@ -172,20 +172,25 @@ class PhoneSubagentRunner:
         todo: str,
         *,
         allow_short_chain: bool,
+        device_id: str | None = None,
     ) -> PhoneTodoExecution:
         if phone_text_contains_sensitive_data(todo):
             logger.warning("Phone TODO contains sensitive data and requires user takeover.")
-            return self._needs_user_action(todo, "phone_todo_contains_sensitive_data")
+            return self._needs_user_action(
+                todo,
+                "phone_todo_contains_sensitive_data",
+                device_id,
+            )
 
         budget = _tool_budget(allow_short_chain)
-        tools = create_phone_tools(self.phone_gateway)
+        tools = create_phone_tools(self.phone_gateway, default_device_id=device_id)
         phone_tool_names = {tool.name for tool in tools}
         agent = self.agent_factory(
             model=self.model,
             tools=tools,
             system_prompt=PHONE_SUBAGENT_SYSTEM_PROMPT,
             middleware=[
-                SyncPhoneStateMiddleware(self.phone_gateway),
+                SyncPhoneStateMiddleware(self.phone_gateway, device_id=device_id),
                 PhoneToolBudgetMiddleware(phone_tool_names, budget),
             ],
             response_format=ToolStrategy(PhoneSubagentDecision),
@@ -206,24 +211,29 @@ class PhoneSubagentRunner:
             )
         except PhoneToolBudgetExceededError as exc:
             logger.warning("Phone subagent stopped because its tool budget was exhausted.")
-            return self._budget_exhausted(todo, exc.executed_count, exc.limit)
+            return self._budget_exhausted(
+                todo,
+                exc.executed_count,
+                exc.limit,
+                device_id,
+            )
         except PhoneToolSequenceError:
             logger.warning("Phone subagent attempted parallel UI tool calls.")
-            return self._failed(todo, "phone_parallel_tool_calls_rejected")
+            return self._failed(todo, "phone_parallel_tool_calls_rejected", device_id)
         except Exception:
             logger.exception("Phone subagent execution failed.")
-            return self._failed(todo, "phone_subagent_execution_failed")
+            return self._failed(todo, "phone_subagent_execution_failed", device_id)
 
         try:
             decision = PhoneSubagentDecision.model_validate(state["structured_response"])
         except Exception:
             logger.exception("Phone subagent returned an invalid structured response.")
-            return self._failed(todo, "phone_subagent_invalid_response")
+            return self._failed(todo, "phone_subagent_invalid_response", device_id)
         return PhoneTodoExecution(
             status=decision.status,
             todo=redact_phone_text(todo),
             summary=redact_phone_text(decision.summary),
-            phoneState=self._phone_state_summary(),
+            phoneState=self._phone_state_summary(device_id),
             toolCallCount=_count_phone_tool_calls(
                 state.get("messages", ()),
                 phone_tool_names,
@@ -232,9 +242,13 @@ class PhoneSubagentRunner:
             error=redact_phone_text(decision.error) if decision.error else None,
         )
 
-    def _phone_state_summary(self) -> PhoneStateSummary:
+    def _phone_state_summary(self, device_id: str | None = None) -> PhoneStateSummary:
         try:
-            session = self.phone_gateway.get_session()
+            session = (
+                self.phone_gateway.get_session(device_id)
+                if device_id is not None
+                else self.phone_gateway.get_session()
+            )
         except Exception:
             return PhoneStateSummary(
                 currentPackage=None,
@@ -256,35 +270,46 @@ class PhoneSubagentRunner:
         todo: str,
         executed_count: int,
         limit: int,
+        device_id: str | None = None,
     ) -> PhoneTodoExecution:
         return PhoneTodoExecution(
             status="budget_exhausted",
             todo=redact_phone_text(todo),
             summary=f"Phone TODO stopped after reaching the {limit}-tool budget.",
-            phoneState=self._phone_state_summary(),
+            phoneState=self._phone_state_summary(device_id),
             toolCallCount=executed_count,
             needsMainAgentPlan=True,
             error="phone_tool_budget_exhausted",
         )
 
-    def _failed(self, todo: str, error: str) -> PhoneTodoExecution:
+    def _failed(
+        self,
+        todo: str,
+        error: str,
+        device_id: str | None = None,
+    ) -> PhoneTodoExecution:
         return PhoneTodoExecution(
             status="failed",
             todo=redact_phone_text(todo),
             summary="Phone subagent execution failed.",
-            phoneState=self._phone_state_summary(),
+            phoneState=self._phone_state_summary(device_id),
             toolCallCount=0,
             needsMainAgentPlan=True,
             error=error,
         )
 
 
-    def _needs_user_action(self, todo: str, error: str) -> PhoneTodoExecution:
+    def _needs_user_action(
+        self,
+        todo: str,
+        error: str,
+        device_id: str | None = None,
+    ) -> PhoneTodoExecution:
         return PhoneTodoExecution(
             status="needs_user_action",
             todo=redact_phone_text(todo),
             summary="Phone TODO requires user takeover because it contains sensitive data.",
-            phoneState=self._phone_state_summary(),
+            phoneState=self._phone_state_summary(device_id),
             toolCallCount=0,
             needsMainAgentPlan=True,
             error=error,

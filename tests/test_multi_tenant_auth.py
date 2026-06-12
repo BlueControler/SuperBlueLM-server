@@ -5,11 +5,14 @@ import json
 from types import SimpleNamespace
 
 from starlette.routing import Match
+from starlette.requests import Request
 
 from mobile_agent import auth as auth_module
+from mobile_agent import http_app
 from mobile_agent.gateways.phone import DeviceGateway, DeviceGatewayError
 from mobile_agent.gateways.system import SystemGatewayError, SystemToolGateway
 from mobile_agent.http_app import app
+from mobile_agent.gateways.phone import ConnectData
 
 
 class _Request:
@@ -120,6 +123,19 @@ def test_device_gateway_accepts_plain_and_device_scoped_adb_paths() -> None:
         raise AssertionError("nested device paths must be rejected")
 
 
+def test_connect_data_accepts_optional_screenshot_mime_type() -> None:
+    payload = ConnectData.model_validate(
+        {
+            "width": 1080,
+            "height": 2400,
+            "screenshot": "base64",
+            "screenshotMimeType": "image/webp",
+        }
+    )
+
+    assert payload.screenshot_mime_type == "image/webp"
+
+
 def test_system_gateway_accepts_plain_and_device_scoped_paths() -> None:
     gateway = SystemToolGateway()
 
@@ -158,7 +174,12 @@ def test_system_gateway_tracks_multiple_device_ids() -> None:
         second_client = await _wait_for_system_client(gateway, "device-2")
 
         assert first_client is not second_client
-        assert gateway.get_default_client() is second_client
+        try:
+            gateway.get_default_client()
+        except SystemGatewayError as exc:
+            assert "device_id" in str(exc)
+        else:
+            raise AssertionError("multiple clients must require an explicit device_id")
 
         await first_socket.close()
         await second_socket.close()
@@ -170,9 +191,55 @@ def test_system_gateway_tracks_multiple_device_ids() -> None:
 def test_http_app_registers_device_scoped_websocket_routes() -> None:
     adb_scope = {"type": "websocket", "path": "/adb/device-1"}
     system_scope = {"type": "websocket", "path": "/system/device-1"}
+    adb_status_scope = {"type": "http", "path": "/adb/device-1/status", "method": "GET"}
+    system_status_scope = {
+        "type": "http",
+        "path": "/system/device-1/status",
+        "method": "GET",
+    }
+    network_status_scope = {
+        "type": "http",
+        "path": "/network/device-1/status",
+        "method": "GET",
+    }
 
     assert any(route.matches(adb_scope)[0] == Match.FULL for route in app.routes)
     assert any(route.matches(system_scope)[0] == Match.FULL for route in app.routes)
+    assert any(route.matches(adb_status_scope)[0] == Match.FULL for route in app.routes)
+    assert any(route.matches(system_status_scope)[0] == Match.FULL for route in app.routes)
+    assert any(route.matches(network_status_scope)[0] == Match.FULL for route in app.routes)
+
+
+def test_adb_status_uses_device_id_from_path(monkeypatch: object) -> None:
+    requested: list[str | None] = []
+    session = SimpleNamespace(
+        device_info=SimpleNamespace(
+            width=1080,
+            height=2400,
+            current_package="com.example",
+            activity=".MainActivity",
+        )
+    )
+
+    def get_session(device_id: str | None = None) -> object:
+        requested.append(device_id)
+        return session
+
+    monkeypatch.setattr(http_app.phone_gateway, "get_session", get_session)
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/adb/device-uuid-1/status",
+            "headers": [],
+            "path_params": {"device_id": "device-uuid-1"},
+        }
+    )
+
+    response = asyncio.run(http_app.adb_status(request))
+
+    assert response.status_code == 200
+    assert requested == ["device-uuid-1"]
 
 
 async def _wait_for_session(gateway: DeviceGateway, device_id: str) -> object:
@@ -239,7 +306,37 @@ def test_device_gateway_tracks_multiple_device_ids() -> None:
         second_session = await _wait_for_session(gateway, "device-2")
 
         assert first_session is not second_session
-        assert gateway.get_session() is second_session
+        try:
+            gateway.get_session()
+        except DeviceGatewayError as exc:
+            assert "device_id" in str(exc)
+        else:
+            raise AssertionError("multiple devices must require an explicit device_id")
+
+        await first_socket.close()
+        await second_socket.close()
+        await asyncio.gather(first_task, second_task)
+
+    asyncio.run(run())
+
+
+def test_system_gateway_requires_device_id_when_multiple_clients_are_connected() -> None:
+    async def run() -> None:
+        gateway = SystemToolGateway()
+        first_socket = _FakeSystemWebSocket("/system/device-1")
+        second_socket = _FakeSystemWebSocket("/system/device-2")
+        first_task = asyncio.create_task(gateway.handler(first_socket))
+        second_task = asyncio.create_task(gateway.handler(second_socket))
+
+        await _wait_for_system_client(gateway, "device-1")
+        await _wait_for_system_client(gateway, "device-2")
+
+        try:
+            gateway.get_default_client()
+        except SystemGatewayError as exc:
+            assert "device_id" in str(exc)
+        else:
+            raise AssertionError("multiple clients must require an explicit device_id")
 
         await first_socket.close()
         await second_socket.close()

@@ -6,7 +6,7 @@ from typing import TypedDict
 
 from langchain_core.tools import BaseTool, tool
 
-from ..gateways.phone import DeviceGateway
+from ..gateways.phone import DeviceGateway, DeviceGatewayError
 from ..json_types import JsonObject, JsonValue
 from ..progress import emit_task_progress
 
@@ -19,8 +19,16 @@ class PhoneToolSummary(TypedDict):
     has_ui: bool
 
 
-def create_phone_tools(gateway: DeviceGateway) -> list[BaseTool]:
-    async def send(tool_name: str, message: str, data: JsonValue) -> JsonObject:
+def create_phone_tools(
+    gateway: DeviceGateway,
+    default_device_id: str | None = None,
+) -> list[BaseTool]:
+    async def send(
+        tool_name: str,
+        message: str,
+        data: JsonValue,
+        device_id: str | None,
+    ) -> JsonObject:
         emit_task_progress(
             label=tool_name,
             status="running",
@@ -29,7 +37,13 @@ def create_phone_tools(gateway: DeviceGateway) -> list[BaseTool]:
             tool_name=tool_name,
         )
         try:
-            result = await gateway.get_session().send_command(message, data)
+            selected_device_id = _select_device_id(device_id, default_device_id)
+            session = (
+                gateway.get_session(selected_device_id)
+                if selected_device_id is not None
+                else gateway.get_session()
+            )
+            result = await session.send_command(message, data)
         except Exception as exc:
             emit_task_progress(
                 label=tool_name,
@@ -50,54 +64,69 @@ def create_phone_tools(gateway: DeviceGateway) -> list[BaseTool]:
         return result
 
     @tool("observe", description="Get the latest screenshot and UI tree from the phone.")
-    async def observe() -> str:
-        return _dump_result(_summarize_result(await send("observe", "observe", None)))
+    async def observe(device_id: str | None = None) -> str:
+        return _dump_result(_summarize_result(await send("observe", "observe", None, device_id)))
 
     @tool("launch", description="Launch an Android app by package name.")
-    async def launch(package: str) -> str:
+    async def launch(package: str, device_id: str | None = None) -> str:
         return _dump_result(
-            _summarize_result(await send("launch", "launch", {"package": package}))
+            _summarize_result(await send("launch", "launch", {"package": package}, device_id))
         )
 
     @tool("tap", description="Tap a screen coordinate in pixels.")
-    async def tap(x: int, y: int) -> str:
-        return _dump_result(_summarize_result(await send("tap", "tap", {"x": x, "y": y})))
+    async def tap(x: int, y: int, device_id: str | None = None) -> str:
+        return _dump_result(
+            _summarize_result(await send("tap", "tap", {"x": x, "y": y}, device_id))
+        )
 
     @tool("type", description="Type text into the currently focused input box.")
-    async def type_text(text: str) -> str:
-        return _dump_result(_summarize_result(await send("type", "type", {"text": text})))
+    async def type_text(text: str, device_id: str | None = None) -> str:
+        return _dump_result(
+            _summarize_result(await send("type", "type", {"text": text}, device_id))
+        )
 
     @tool("swipe", description="Swipe from one coordinate to another.")
-    async def swipe(start_x: int, start_y: int, end_x: int, end_y: int) -> str:
+    async def swipe(
+        start_x: int,
+        start_y: int,
+        end_x: int,
+        end_y: int,
+        device_id: str | None = None,
+    ) -> str:
         result = await send(
             "swipe",
             "swipe",
             {"startX": start_x, "startY": start_y, "endX": end_x, "endY": end_y},
+            device_id,
         )
         return _dump_result(_summarize_result(result))
 
     @tool("long_press", description="Long press a screen coordinate.")
-    async def long_press(x: int, y: int) -> str:
+    async def long_press(x: int, y: int, device_id: str | None = None) -> str:
         return _dump_result(
-            _summarize_result(await send("long_press", "longPress", {"x": x, "y": y}))
+            _summarize_result(
+                await send("long_press", "longPress", {"x": x, "y": y}, device_id)
+            )
         )
 
     @tool("double_tap", description="Double tap a screen coordinate.")
-    async def double_tap(x: int, y: int) -> str:
+    async def double_tap(x: int, y: int, device_id: str | None = None) -> str:
         return _dump_result(
-            _summarize_result(await send("double_tap", "doubleTap", {"x": x, "y": y}))
+            _summarize_result(
+                await send("double_tap", "doubleTap", {"x": x, "y": y}, device_id)
+            )
         )
 
     @tool("back", description="Agent-level wrapper that sends Android keyevent 4 (BACK).")
-    async def back() -> str:
+    async def back(device_id: str | None = None) -> str:
         return _dump_result(
-            _summarize_result(await send("back", "keyevent", {"keyevent": 4}))
+            _summarize_result(await send("back", "keyevent", {"keyevent": 4}, device_id))
         )
 
     @tool("home", description="Agent-level wrapper that sends Android keyevent 3 (HOME).")
-    async def home() -> str:
+    async def home(device_id: str | None = None) -> str:
         return _dump_result(
-            _summarize_result(await send("home", "keyevent", {"keyevent": 3}))
+            _summarize_result(await send("home", "keyevent", {"keyevent": 3}, device_id))
         )
 
     @tool(
@@ -109,23 +138,25 @@ def create_phone_tools(gateway: DeviceGateway) -> list[BaseTool]:
             "for normal navigation."
         ),
     )
-    async def keyevent(keyevent: int) -> str:
+    async def keyevent(keyevent: int, device_id: str | None = None) -> str:
         return _dump_result(
-            _summarize_result(await send("keyevent", "keyevent", {"keyevent": keyevent}))
+            _summarize_result(
+                await send("keyevent", "keyevent", {"keyevent": keyevent}, device_id)
+            )
         )
 
     @tool("wait", description="Wait for a number of seconds so the page can complete loading.")
-    async def wait(duration: float) -> str:
+    async def wait(duration: float, device_id: str | None = None) -> str:
         await asyncio.sleep(max(duration, 0))
-        return _dump_result(_summarize_result(await send("wait", "observe", None)))
+        return _dump_result(_summarize_result(await send("wait", "observe", None, device_id)))
 
     @tool(
         "interact",
         description="Ask the user to choose one of several reasonable next actions.",
         return_direct=True,
     )
-    async def interact(message: str) -> str:
-        await send("interact", "interact", {"message": message})
+    async def interact(message: str, device_id: str | None = None) -> str:
+        await send("interact", "interact", {"message": message}, device_id)
         return message
 
     @tool(
@@ -133,8 +164,8 @@ def create_phone_tools(gateway: DeviceGateway) -> list[BaseTool]:
         description="Hand control back to the user when the user must operate the phone directly.",
         return_direct=True,
     )
-    async def take_over(message: str) -> str:
-        await send("take_over", "interact", {"message": message})
+    async def take_over(message: str, device_id: str | None = None) -> str:
+        await send("take_over", "interact", {"message": message}, device_id)
         return message
 
     return [
@@ -162,6 +193,17 @@ def _summarize_result(result: JsonObject) -> PhoneToolSummary:
         "has_screenshot": bool(result.get("screenshot")),
         "has_ui": bool(result.get("ui")),
     }
+
+
+def _select_device_id(
+    requested_device_id: str | None,
+    bound_device_id: str | None,
+) -> str | None:
+    if bound_device_id is None:
+        return requested_device_id
+    if requested_device_id is not None and requested_device_id != bound_device_id:
+        raise DeviceGatewayError("Phone tool cannot override the bound device_id.")
+    return bound_device_id
 
 
 def _dump_result(result: PhoneToolSummary) -> str:

@@ -72,7 +72,6 @@ class SystemToolGateway:
     def __init__(self, path: str = "/system") -> None:
         self.path = path
         self._clients: dict[str, ConnectedSystemClient] = {}
-        self._default_device_id: str | None = None
         self._lock = asyncio.Lock()
 
     def get_default_client(self, device_id: str | None = None) -> ConnectedSystemClient:
@@ -84,9 +83,13 @@ class SystemToolGateway:
                 f"No connected system tool client is available for {device_id!r}."
             )
 
-        client = self._default_client()
-        if client is not None and not client.closed.is_set():
-            return client
+        active_clients = self._active_clients()
+        if len(active_clients) == 1:
+            return active_clients[0]
+        if len(active_clients) > 1:
+            raise SystemGatewayError(
+                "Multiple system tool clients are connected; device_id is required."
+            )
         raise SystemGatewayError("No connected system tool client is available.")
 
     async def handler(self, websocket: JsonLineWebSocket) -> None:
@@ -99,7 +102,6 @@ class SystemToolGateway:
         async with self._lock:
             old_client = self._clients.get(device_id)
             self._clients[device_id] = client
-            self._default_device_id = device_id
         if old_client is not None and not old_client.closed.is_set():
             await old_client.websocket.close(code=1000, reason="replaced by a new system client")
 
@@ -109,10 +111,6 @@ class SystemToolGateway:
             async with self._lock:
                 if self._clients.get(device_id) is client:
                     self._clients.pop(device_id, None)
-                    if self._default_device_id == device_id:
-                        self._default_device_id = next(
-                            reversed(self._clients), None
-                        )
             await client.stop()
 
     async def starlette_handler(self, websocket: WebSocket) -> None:
@@ -137,14 +135,5 @@ class SystemToolGateway:
             return self.DEFAULT_DEVICE_ID
         return normalized.removeprefix(f"{self.path.rstrip('/')}/")
 
-    def _default_client(self) -> ConnectedSystemClient | None:
-        if self._default_device_id is not None:
-            client = self._clients.get(self._default_device_id)
-            if client is not None and not client.closed.is_set():
-                return client
-
-        for device_id, client in reversed(self._clients.items()):
-            if not client.closed.is_set():
-                self._default_device_id = device_id
-                return client
-        return None
+    def _active_clients(self) -> list[ConnectedSystemClient]:
+        return [client for client in self._clients.values() if not client.closed.is_set()]

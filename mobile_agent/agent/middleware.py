@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timedelta, timezone, tzinfo
 import os
 from typing import Any, TypeAlias, cast
@@ -176,15 +176,16 @@ class TaskComplexityMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
 class SyncPhoneStateMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
     state_schema = MobileAgentState
 
-    def __init__(self, phone_gateway: DeviceGateway) -> None:
+    def __init__(self, phone_gateway: DeviceGateway, device_id: str | None = None) -> None:
         self.phone_gateway = phone_gateway
+        self.device_id = device_id
 
     def before_model(
         self,
         state: MobileAgentState,
         runtime: Runtime[None],
     ) -> dict[str, PhoneSnapshot | None] | None:
-        snapshot = self._current_snapshot()
+        snapshot = self._current_snapshot(state)
         if state.get("phone_snapshot") == snapshot:
             return None
         return {"phone_snapshot": snapshot}
@@ -216,7 +217,7 @@ class SyncPhoneStateMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
     ) -> ModelRequest[Any]:
         snapshot = cast(PhoneSnapshot | None, request.state.get("phone_snapshot"))
         if snapshot is None:
-            snapshot = self._current_snapshot()
+            snapshot = self._current_snapshot(request.state)
         if snapshot is None:
             return request
 
@@ -227,22 +228,37 @@ class SyncPhoneStateMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
             ],
         )
 
-    def _current_snapshot(self) -> PhoneSnapshot | None:
+    def _current_snapshot(self, state: Mapping[str, Any] | None = None) -> PhoneSnapshot | None:
+        device_id = self.device_id
+        if device_id is None and state is not None:
+            value = state.get("device_id") or state.get("deviceId")
+            device_id = value if isinstance(value, str) and value else None
         try:
-            session = self.phone_gateway.get_session()
+            session = (
+                self.phone_gateway.get_session(device_id)
+                if device_id is not None
+                else self.phone_gateway.get_session()
+            )
         except Exception:
             return None
 
         if session.device_info is None:
             return None
-        return build_phone_snapshot(session)
+        return build_phone_snapshot(session, device_id=device_id)
 
 
 class ModeToolAccessMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
     state_schema = MobileAgentState
 
-    def __init__(self, phone_tool_names: set[str]) -> None:
+    def __init__(
+        self,
+        phone_tool_names: set[str],
+        device_scoped_tool_names: set[str] | None = None,
+    ) -> None:
         self.phone_tool_names = frozenset(phone_tool_names)
+        self.device_scoped_tool_names = frozenset(
+            device_scoped_tool_names or phone_tool_names
+        )
 
     def wrap_model_call(
         self,
@@ -263,6 +279,7 @@ class ModeToolAccessMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         request: ToolCallRequest,
         handler: ToolHandler,
     ) -> ToolResult:
+        request = self._with_bound_device_id(request)
         if self._is_blocked(request.tool_call["name"]) or self._exceeds_local_phone_limit(
             request
         ):
@@ -274,11 +291,25 @@ class ModeToolAccessMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         request: ToolCallRequest,
         handler: AsyncToolHandler,
     ) -> ToolResult:
+        request = self._with_bound_device_id(request)
         if self._is_blocked(request.tool_call["name"]) or self._exceeds_local_phone_limit(
             request
         ):
             return self._blocked_message(request)
         return await handler(request)
+
+    def _with_bound_device_id(self, request: ToolCallRequest) -> ToolCallRequest:
+        if request.tool_call["name"] not in self.device_scoped_tool_names:
+            return request
+        state = request.state if isinstance(request.state, Mapping) else {}
+        value = state.get("device_id") or state.get("deviceId")
+        if not isinstance(value, str) or not value:
+            return request
+        tool_call = {
+            **request.tool_call,
+            "args": {**request.tool_call["args"], "device_id": value},
+        }
+        return request.override(tool_call=tool_call)
 
     def _with_visible_tools(self, request: ModelRequest[Any]) -> ModelRequest[Any]:
         return request.override(

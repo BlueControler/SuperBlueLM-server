@@ -12,9 +12,11 @@ STATE_MESSAGE_PREFIX = "[PHONE_STATE]"
 
 
 class PhoneSnapshot(TypedDict):
+    device_id: str | None
     width: int
     height: int
     screenshot: str | None
+    screenshot_mime_type: str
     ui: str | None
     current_package: str | None
     activity: str | None
@@ -29,6 +31,8 @@ class PhoneTodoStep(TypedDict):
 
 
 class MobileAgentState(AgentState[object], total=False):
+    device_id: NotRequired[str]
+    deviceId: NotRequired[str]
     phone_snapshot: NotRequired[Annotated[PhoneSnapshot | None, PrivateStateAttr]]
     task_complexity_emitted: NotRequired[Annotated[bool, PrivateStateAttr]]
     phone_todo_steps: NotRequired[
@@ -36,14 +40,21 @@ class MobileAgentState(AgentState[object], total=False):
     ]
 
 
-def build_phone_snapshot(session: ConnectedDeviceSession) -> PhoneSnapshot:
+def build_phone_snapshot(
+    session: ConnectedDeviceSession,
+    device_id: str | None = None,
+) -> PhoneSnapshot:
     if session.device_info is None:
         raise RuntimeError("Device session has no device_info yet.")
 
     return {
+        "device_id": device_id,
         "width": session.device_info.width,
         "height": session.device_info.height,
         "screenshot": session.device_info.screenshot,
+        "screenshot_mime_type": getattr(
+            session.device_info, "screenshot_mime_type", "image/png"
+        ),
         "ui": session.device_info.ui,
         "current_package": session.device_info.current_package,
         "activity": session.device_info.activity,
@@ -57,6 +68,7 @@ def build_phone_state_message(snapshot: PhoneSnapshot) -> HumanMessage:
             "text": (
                 f"{STATE_MESSAGE_PREFIX}\n"
                 "当前手机页面状态如下，请基于这些信息决定下一步：\n"
+                f"deviceId={snapshot['device_id']}\n"
                 f"screenWidth={snapshot['width']}\n"
                 f"screenHeight={snapshot['height']}\n"
                 f"currentPackage={snapshot['current_package']}\n"
@@ -71,7 +83,9 @@ def build_phone_state_message(snapshot: PhoneSnapshot) -> HumanMessage:
         content.append(
             {
                 "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{screenshot}"},
+                "image_url": {
+                    "url": f"data:{snapshot['screenshot_mime_type']};base64,{screenshot}"
+                },
             }
         )
 

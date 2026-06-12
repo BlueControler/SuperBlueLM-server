@@ -13,6 +13,7 @@ class _DeviceInfo:
     width: int = 1080
     height: int = 2400
     screenshot: str = "base64-screenshot"
+    screenshot_mime_type: str = "image/webp"
     ui: str = "<node text='Search' />"
     current_package: str = "com.example"
     activity: str = ".MainActivity"
@@ -26,8 +27,10 @@ class _Session:
 class _Gateway:
     def __init__(self) -> None:
         self.session = _Session()
+        self.requested_device_ids: list[str | None] = []
 
-    def get_session(self) -> _Session:
+    def get_session(self, device_id: str | None = None) -> _Session:
+        self.requested_device_ids.append(device_id)
         return self.session
 
 
@@ -69,8 +72,28 @@ def test_sync_phone_state_injects_latest_ui_tree_and_screenshot_into_model() -> 
 
     phone_state = captured[-1]
     assert isinstance(phone_state, HumanMessage)
+    assert "deviceId=None" in phone_state.content[0]["text"]
     assert "ui=<node text='Search' />" in phone_state.content[0]["text"]
     assert phone_state.content[1] == {
         "type": "image_url",
-        "image_url": {"url": "data:image/png;base64,base64-screenshot"},
+        "image_url": {"url": "data:image/webp;base64,base64-screenshot"},
     }
+
+
+def test_sync_phone_state_selects_device_from_agent_state() -> None:
+    gateway = _Gateway()
+    middleware = SyncPhoneStateMiddleware(gateway)
+
+    result = middleware.before_model({"device_id": "device-uuid-1"}, runtime=None)
+
+    assert result is not None
+    assert gateway.requested_device_ids == ["device-uuid-1"]
+
+
+def test_sync_phone_state_accepts_protocol_device_id_alias() -> None:
+    gateway = _Gateway()
+    middleware = SyncPhoneStateMiddleware(gateway)
+
+    middleware.before_model({"deviceId": "device-uuid-2"}, runtime=None)
+
+    assert gateway.requested_device_ids == ["device-uuid-2"]

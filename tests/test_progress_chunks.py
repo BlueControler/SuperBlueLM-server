@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 from mobile_agent import progress
+from mobile_agent.gateways.phone import DeviceGatewayError
 from mobile_agent.tools.external import create_external_tools
 from mobile_agent.tools.phone import create_phone_tools
 from mobile_agent.tools.system import create_system_tools
@@ -26,8 +29,10 @@ class _FakeSession:
 class _FakePhoneGateway:
     def __init__(self) -> None:
         self.session = _FakeSession()
+        self.device_ids: list[str | None] = []
 
-    def get_session(self) -> _FakeSession:
+    def get_session(self, device_id: str | None = None) -> _FakeSession:
+        self.device_ids.append(device_id)
         return self.session
 
 
@@ -44,7 +49,7 @@ class _FakeSystemGateway:
     def __init__(self) -> None:
         self.client = _FakeSystemClient()
 
-    def get_default_client(self) -> _FakeSystemClient:
+    def get_default_client(self, device_id: str | None = None) -> _FakeSystemClient:
         return self.client
 
 
@@ -108,6 +113,30 @@ def test_phone_tool_emits_started_and_completed_progress(monkeypatch: Any) -> No
     assert emitted[0]["phase"] == "phone_tool"
     assert emitted[-1]["label"] == "tap"
     assert emitted[-1]["status"] == "completed"
+
+
+def test_phone_tool_routes_to_explicit_device_id() -> None:
+    gateway = _FakePhoneGateway()
+    tools = {tool.name: tool for tool in create_phone_tools(gateway)}
+
+    asyncio.run(tools["tap"].ainvoke({"x": 10, "y": 20, "device_id": "device-uuid-1"}))
+
+    assert gateway.device_ids == ["device-uuid-1"]
+
+
+def test_bound_phone_tool_rejects_device_id_override() -> None:
+    gateway = _FakePhoneGateway()
+    tools = {
+        tool.name: tool
+        for tool in create_phone_tools(gateway, default_device_id="device-uuid-1")
+    }
+
+    with pytest.raises(DeviceGatewayError, match="cannot override"):
+        asyncio.run(
+            tools["tap"].ainvoke(
+                {"x": 10, "y": 20, "device_id": "device-uuid-2"}
+            )
+        )
 
 
 def test_system_tool_emits_started_and_completed_progress(monkeypatch: Any) -> None:

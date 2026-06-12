@@ -26,6 +26,8 @@ def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway)
     main_cloud_model = build_cloud_model()
     phone_tools = create_phone_tools(phone_gateway)
     phone_tool_names = {tool.name for tool in phone_tools}
+    system_tools = create_system_tools(system_gateway)
+    device_scoped_tool_names = phone_tool_names | {tool.name for tool in system_tools}
     phone_subagent_model = build_phone_subagent_model(main_cloud_model)
     phone_delegation_tool = create_phone_delegation_tool(
         PhoneSubagentRunner(phone_gateway, phone_subagent_model)
@@ -34,7 +36,7 @@ def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway)
         list[AgentMiddleware[AgentState[Any], None, Any]],
         [
             ResetPhoneTodoMiddleware(),
-            ModeToolAccessMiddleware(phone_tool_names),
+            ModeToolAccessMiddleware(phone_tool_names, device_scoped_tool_names),
             TaskComplexityMiddleware(),
             RouteModelMiddleware(),
             RoutedSystemPromptMiddleware(),
@@ -46,7 +48,7 @@ def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway)
         tools=[
             *phone_tools,
             phone_delegation_tool,
-            *create_system_tools(system_gateway),
+            *system_tools,
             *create_external_tools(),
         ],
         system_prompt="",
