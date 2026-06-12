@@ -12,9 +12,13 @@ from pydantic import BaseModel, Field
 from pydantic.json_schema import SkipJsonSchema
 
 from ..json_types import JsonObject
+from ..gateways.phone import (
+    DEVICE_NOT_CONNECTED_MESSAGE,
+    DeviceGatewayError,
+)
 from ..progress import emit_task_progress
 from .phone_subagent import PhoneTodoExecution, redact_phone_text
-from .state import MobileAgentState, PhoneTodoStep
+from .state import MobileAgentState, PhoneTodoStep, device_id_from_mapping
 
 
 class PhoneTodoRunner(Protocol):
@@ -84,14 +88,17 @@ async def execute_tracked_phone_todo(
         completed_steps=_completed_step_payloads(steps),
     )
 
-    if device_id is None:
-        result = await runner.execute(todo, allow_short_chain=allow_short_chain)
-    else:
-        result = await runner.execute(
-            todo,
-            allow_short_chain=allow_short_chain,
-            device_id=device_id,
-        )
+    try:
+        if device_id is None:
+            result = await runner.execute(todo, allow_short_chain=allow_short_chain)
+        else:
+            result = await runner.execute(
+                todo,
+                allow_short_chain=allow_short_chain,
+                device_id=device_id,
+            )
+    except DeviceGatewayError:
+        result = _device_not_connected_execution(todo)
     redacted_summary = redact_phone_text(result.summary)
     redacted_error = redact_phone_text(result.error) if result.error else None
     progress_status: Literal["completed", "failed"] = (
@@ -122,6 +129,23 @@ async def execute_tracked_phone_todo(
     return result, next_steps
 
 
+def _device_not_connected_execution(todo: str) -> PhoneTodoExecution:
+    return PhoneTodoExecution(
+        status="failed",
+        todo=redact_phone_text(todo),
+        summary=DEVICE_NOT_CONNECTED_MESSAGE,
+        phoneState={
+            "currentPackage": None,
+            "activity": None,
+            "hasScreenshot": False,
+            "hasUi": False,
+        },
+        toolCallCount=0,
+        needsMainAgentPlan=True,
+        error="device_not_connected",
+    )
+
+
 def create_phone_delegation_tool(runner: PhoneTodoRunner) -> BaseTool:
     @tool(
         "execute_phone_todo",
@@ -146,7 +170,7 @@ def create_phone_delegation_tool(runner: PhoneTodoRunner) -> BaseTool:
             runner,
             todo,
             allow_short_chain=allow_short_chain,
-            device_id=_state_device_id(runtime.state),
+            device_id=_runtime_device_id(runtime),
         )
         return Command(
             update={
@@ -164,11 +188,12 @@ def create_phone_delegation_tool(runner: PhoneTodoRunner) -> BaseTool:
     return execute_phone_todo
 
 
-def _state_device_id(state: object) -> str | None:
-    if not isinstance(state, dict):
-        return None
-    value = state.get("device_id") or state.get("deviceId")
-    return value if isinstance(value, str) and value else None
+def _runtime_device_id(runtime: ToolRuntime) -> str | None:
+    return (
+        device_id_from_mapping(runtime.state)
+        or device_id_from_mapping(runtime.config.get("metadata"))
+        or device_id_from_mapping(runtime.config.get("configurable"))
+    )
 
 
 def _completed_step_payloads(steps: tuple[PhoneTodoStep, ...]) -> list[JsonObject]:

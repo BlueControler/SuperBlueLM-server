@@ -12,6 +12,7 @@ from mobile_agent.agent.phone_delegation import (
     execute_tracked_phone_todo,
 )
 from mobile_agent.agent.phone_subagent import PhoneTodoExecution
+from mobile_agent.gateways.phone import DeviceGatewayError
 
 
 def _execution(
@@ -48,6 +49,33 @@ class _Runner:
     ) -> PhoneTodoExecution:
         self.calls.append((todo, allow_short_chain))
         return self.results.pop(0)
+
+
+def test_phone_delegation_converts_device_disconnect_to_recoverable_result() -> None:
+    class DisconnectedRunner:
+        async def execute(
+            self,
+            todo: str,
+            *,
+            allow_short_chain: bool,
+            device_id: str | None = None,
+        ) -> PhoneTodoExecution:
+            raise DeviceGatewayError("device_not_connected")
+
+    result, _ = asyncio.run(
+        execute_tracked_phone_todo(
+            (),
+            DisconnectedRunner(),
+            "Go home",
+            allow_short_chain=False,
+            device_id="device-1",
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error == "device_not_connected"
+    assert result.summary == "手机连接已断开，请重新连接后重试"
+    assert result.needs_main_agent_plan is True
 
 
 def test_phone_todo_progress_total_grows_as_main_agent_adds_steps(
@@ -249,6 +277,46 @@ def test_phone_delegation_tool_preserves_injected_runtime(
     assert result.update["phone_todo_steps"][-1]["index"] == 2
     assert result.update["messages"][0].tool_call_id == "call_1"
     assert runner.calls == [("Open the app", False)]
+
+
+def test_phone_delegation_passes_device_id_from_run_metadata() -> None:
+    class DeviceRunner:
+        def __init__(self) -> None:
+            self.device_ids: list[str | None] = []
+
+        async def execute(
+            self,
+            todo: str,
+            *,
+            allow_short_chain: bool,
+            device_id: str | None = None,
+        ) -> PhoneTodoExecution:
+            self.device_ids.append(device_id)
+            return _execution(todo)
+
+    runner = DeviceRunner()
+    tool = create_phone_delegation_tool(runner)
+    runtime = ToolRuntime(
+        state={},
+        context=None,
+        config={"metadata": {"deviceId": "device-metadata-1"}},
+        stream_writer=lambda _: None,
+        tool_call_id="call_1",
+        store=None,
+    )
+
+    asyncio.run(
+        tool.ainvoke(
+            {
+                "name": "execute_phone_todo",
+                "args": {"todo": "Open the app", "runtime": runtime},
+                "id": "call_1",
+                "type": "tool_call",
+            }
+        )
+    )
+
+    assert runner.device_ids == ["device-metadata-1"]
 
 
 def test_reset_phone_todo_middleware_returns_fresh_immutable_state() -> None:

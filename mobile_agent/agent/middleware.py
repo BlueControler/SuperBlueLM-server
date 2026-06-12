@@ -27,6 +27,7 @@ from .state import (
     PhoneSnapshot,
     build_phone_snapshot,
     build_phone_state_message,
+    device_id_from_mapping,
 )
 from .task_complexity import classify_task_complexity
 
@@ -231,8 +232,7 @@ class SyncPhoneStateMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
     def _current_snapshot(self, state: Mapping[str, Any] | None = None) -> PhoneSnapshot | None:
         device_id = self.device_id
         if device_id is None and state is not None:
-            value = state.get("device_id") or state.get("deviceId")
-            device_id = value if isinstance(value, str) and value else None
+            device_id = device_id_from_mapping(state)
         try:
             session = (
                 self.phone_gateway.get_session(device_id)
@@ -302,8 +302,13 @@ class ModeToolAccessMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         if request.tool_call["name"] not in self.device_scoped_tool_names:
             return request
         state = request.state if isinstance(request.state, Mapping) else {}
-        value = state.get("device_id") or state.get("deviceId")
-        if not isinstance(value, str) or not value:
+        config = getattr(request.runtime, "config", {})
+        value = (
+            device_id_from_mapping(state)
+            or device_id_from_mapping(config.get("metadata"))
+            or device_id_from_mapping(config.get("configurable"))
+        )
+        if value is None:
             return request
         tool_call = {
             **request.tool_call,

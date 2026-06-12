@@ -322,7 +322,7 @@ def _tool_budget(allow_short_chain: bool) -> int:
         if allow_short_chain
         else "PHONE_SUBAGENT_MAX_TOOL_CALLS"
     )
-    default = "4" if allow_short_chain else "1"
+    default = "4"
     try:
         return max(int(os.getenv(env_name, default)), 1)
     except ValueError:

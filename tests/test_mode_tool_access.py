@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 from langchain.tools.tool_node import ToolCallRequest
@@ -77,6 +78,7 @@ def _tool_call_request(
     args: dict[str, Any] | None = None,
     state: dict[str, Any] | None = None,
     messages: list[Any] | None = None,
+    runtime: Any = None,
 ) -> ToolCallRequest:
     request_state = {"messages": messages or []}
     if state:
@@ -90,7 +92,7 @@ def _tool_call_request(
         },
         tool=None,
         state=request_state,
-        runtime=None,
+        runtime=runtime,
     )
 
 
@@ -259,3 +261,23 @@ def test_device_scoped_tool_is_bound_to_thread_device_id(monkeypatch: Any) -> No
 
     assert result == "ok"
     assert captured[0].tool_call["args"]["device_id"] == "thread-device"
+
+
+def test_device_scoped_tool_is_bound_to_run_metadata(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        "mobile_agent.agent.middleware.model_runtime.status",
+        lambda: {"mode": "cloud"},
+    )
+    middleware = ModeToolAccessMiddleware({"tap"}, {"tap", "list_apps"})
+    request = _tool_call_request(
+        "list_apps",
+        runtime=SimpleNamespace(config={"metadata": {"deviceId": "metadata-device"}}),
+    )
+    captured: list[ToolCallRequest] = []
+
+    middleware.wrap_tool_call(
+        request,
+        lambda bound: captured.append(bound) or "ok",
+    )
+
+    assert captured[0].tool_call["args"]["device_id"] == "metadata-device"

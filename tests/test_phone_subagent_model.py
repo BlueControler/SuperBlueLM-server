@@ -48,10 +48,32 @@ def test_phone_subagent_model_uses_independent_openai_compatible_config(
     assert captured["api_key"].get_secret_value() == "phone-secret"
 
 
+def test_phone_subagent_model_reuses_main_agent_api_key(
+    monkeypatch: Any,
+) -> None:
+    _clear_phone_model_env(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    def fake_chat_openai(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(runtime, "ChatOpenAI", fake_chat_openai)
+    monkeypatch.setenv("PHONE_SUBAGENT_MODEL", "gpt-5-mini")
+    monkeypatch.setenv("OPENAI_API_KEY", "main-agent-secret")
+
+    runtime.build_phone_subagent_model("openai:gpt-5.4")
+
+    assert captured["model"] == "gpt-5-mini"
+    assert captured["api_key"].get_secret_value() == "main-agent-secret"
+
+
 def test_phone_subagent_model_uses_provider_model_string_without_client_config(
     monkeypatch: Any,
 ) -> None:
     _clear_phone_model_env(monkeypatch)
+    monkeypatch.setattr(runtime, "load_dotenv", lambda: False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("PHONE_SUBAGENT_MODEL", "gpt-5-mini")
 
     assert (

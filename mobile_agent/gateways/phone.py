@@ -19,10 +19,18 @@ from .rpc import (
 )
 
 VERBOSE_HEARTBEAT = os.getenv("VERBOSE_HEARTBEAT", "").lower() in {"1", "true", "yes"}
+DEFAULT_SESSION_RECONNECT_WAIT_SECONDS = 3.0
+DEVICE_NOT_CONNECTED_CODE = "device_not_connected"
+DEVICE_NOT_CONNECTED_MESSAGE = "手机连接已断开，请重新连接后重试"
 
 
 class DeviceGatewayError(RuntimeError):
     pass
+
+
+class DeviceNotConnectedError(DeviceGatewayError):
+    def __init__(self) -> None:
+        super().__init__(DEVICE_NOT_CONNECTED_CODE)
 
 
 class ProtocolViolation(DeviceGatewayError, JsonLineProtocolViolation):
@@ -207,14 +215,14 @@ class DeviceGateway:
     def __init__(self, path_prefix: str = "/adb") -> None:
         self.path_prefix = path_prefix.rstrip("/")
         self._sessions: dict[str, ConnectedDeviceSession] = {}
-        self._lock = asyncio.Lock()
+        self._session_changed = asyncio.Condition()
 
     def get_session(self, device_id: str | None = None) -> ConnectedDeviceSession:
         if device_id is not None:
             session = self._sessions.get(device_id)
             if session is not None and not session.closed.is_set():
                 return session
-            raise DeviceGatewayError(f"No connected device is available for {device_id!r}.")
+            raise DeviceNotConnectedError()
 
         active_sessions = self._active_sessions()
         if len(active_sessions) == 1:
@@ -223,7 +231,32 @@ class DeviceGateway:
             raise DeviceGatewayError(
                 "Multiple devices are connected; device_id is required."
             )
-        raise DeviceGatewayError("No connected device is available.")
+        raise DeviceNotConnectedError()
+
+    async def wait_for_session(
+        self,
+        device_id: str | None = None,
+        timeout: float | None = None,
+    ) -> ConnectedDeviceSession:
+        wait_seconds = _session_reconnect_wait_seconds() if timeout is None else max(timeout, 0)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait_seconds
+
+        async with self._session_changed:
+            while True:
+                try:
+                    return self.get_session(device_id)
+                except DeviceNotConnectedError:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise DeviceNotConnectedError() from None
+                    try:
+                        await asyncio.wait_for(
+                            self._session_changed.wait(),
+                            timeout=remaining,
+                        )
+                    except TimeoutError:
+                        raise DeviceNotConnectedError() from None
 
     async def handler(self, websocket: JsonLineWebSocket) -> None:
         request = websocket.request
@@ -234,22 +267,25 @@ class DeviceGateway:
 
         await session.start()
         await session.wait_ready()
-        async with self._lock:
+        async with self._session_changed:
             old_session = self._sessions.get(device_id)
             self._sessions[device_id] = session
+            self._session_changed.notify_all()
         if old_session is not None and not old_session.closed.is_set():
             await old_session.websocket.close(
                 code=1000,
                 reason="replaced by a new device connection",
             )
-        async with self._lock:
+        async with self._session_changed:
             self._sessions[device_id] = session
+            self._session_changed.notify_all()
         try:
             await session.closed.wait()
         finally:
-            async with self._lock:
+            async with self._session_changed:
                 if self._sessions.get(device_id) is session:
                     self._sessions.pop(device_id, None)
+                    self._session_changed.notify_all()
             await session.stop()
 
     async def starlette_handler(self, websocket: WebSocket) -> None:
@@ -285,6 +321,17 @@ def _screenshot_mime_type(value: str | None) -> str:
     if isinstance(value, str) and value.startswith("image/"):
         return value
     return "image/png"
+
+
+def _session_reconnect_wait_seconds() -> float:
+    raw = os.getenv(
+        "PHONE_SESSION_RECONNECT_WAIT_SECONDS",
+        str(DEFAULT_SESSION_RECONNECT_WAIT_SECONDS),
+    )
+    try:
+        return max(float(raw), 0)
+    except ValueError:
+        return DEFAULT_SESSION_RECONNECT_WAIT_SECONDS
 
 
 def _sanitize_log_payload(payload: JsonValue) -> JsonValue:

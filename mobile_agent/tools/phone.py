@@ -2,21 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import TypedDict
 
 from langchain_core.tools import BaseTool, tool
 
-from ..gateways.phone import DeviceGateway, DeviceGatewayError
+from ..gateways.phone import (
+    DEVICE_NOT_CONNECTED_CODE,
+    DEVICE_NOT_CONNECTED_MESSAGE,
+    DeviceGateway,
+    DeviceGatewayError,
+    DeviceNotConnectedError,
+)
 from ..json_types import JsonObject, JsonValue
 from ..progress import emit_task_progress
-
-
-class PhoneToolSummary(TypedDict):
-    ok: bool
-    currentPackage: JsonValue
-    activity: JsonValue
-    has_screenshot: bool
-    has_ui: bool
 
 
 def create_phone_tools(
@@ -38,13 +35,9 @@ def create_phone_tools(
         )
         try:
             selected_device_id = _select_device_id(device_id, default_device_id)
-            session = (
-                gateway.get_session(selected_device_id)
-                if selected_device_id is not None
-                else gateway.get_session()
-            )
+            session = await gateway.wait_for_session(selected_device_id)
             result = await session.send_command(message, data)
-        except Exception as exc:
+        except DeviceNotConnectedError as exc:
             emit_task_progress(
                 label=tool_name,
                 status="failed",
@@ -53,7 +46,19 @@ def create_phone_tools(
                 tool_name=tool_name,
                 error=str(exc),
             )
-            raise
+            return _device_not_connected_result()
+        except DeviceGatewayError as exc:
+            emit_task_progress(
+                label=tool_name,
+                status="failed",
+                phase="phone_tool",
+                message=f"Phone tool failed: {tool_name}",
+                tool_name=tool_name,
+                error=str(exc),
+            )
+            if _is_device_not_connected_error(exc):
+                return _device_not_connected_result()
+            return {"error": "phone_tool_failed", "message": str(exc), "recoverable": False}
         emit_task_progress(
             label=tool_name,
             status="completed",
@@ -156,7 +161,9 @@ def create_phone_tools(
         return_direct=True,
     )
     async def interact(message: str, device_id: str | None = None) -> str:
-        await send("interact", "interact", {"message": message}, device_id)
+        result = await send("interact", "interact", {"message": message}, device_id)
+        if "error" in result:
+            return _dump_result(result)
         return message
 
     @tool(
@@ -165,7 +172,9 @@ def create_phone_tools(
         return_direct=True,
     )
     async def take_over(message: str, device_id: str | None = None) -> str:
-        await send("take_over", "interact", {"message": message}, device_id)
+        result = await send("take_over", "interact", {"message": message}, device_id)
+        if "error" in result:
+            return _dump_result(result)
         return message
 
     return [
@@ -185,7 +194,9 @@ def create_phone_tools(
     ]
 
 
-def _summarize_result(result: JsonObject) -> PhoneToolSummary:
+def _summarize_result(result: JsonObject) -> JsonObject:
+    if "error" in result:
+        return result
     return {
         "ok": True,
         "currentPackage": result.get("currentPackage"),
@@ -206,5 +217,27 @@ def _select_device_id(
     return bound_device_id
 
 
-def _dump_result(result: PhoneToolSummary) -> str:
+def _device_not_connected_result() -> JsonObject:
+    return {
+        "error": DEVICE_NOT_CONNECTED_CODE,
+        "message": DEVICE_NOT_CONNECTED_MESSAGE,
+        "recoverable": True,
+    }
+
+
+def _is_device_not_connected_error(error: DeviceGatewayError) -> bool:
+    message = str(error).lower()
+    return isinstance(error, DeviceNotConnectedError) or any(
+        marker in message
+        for marker in (
+            DEVICE_NOT_CONNECTED_CODE,
+            "no connected device",
+            "device disconnected",
+            "device is disconnected",
+            "device connection",
+        )
+    )
+
+
+def _dump_result(result: JsonObject) -> str:
     return json.dumps(result, ensure_ascii=False)

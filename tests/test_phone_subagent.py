@@ -87,7 +87,7 @@ def test_phone_subagent_exposes_only_phone_tools_and_default_budget(
     assert "weather_query" not in tool_names
     budget_middleware = captured["middleware"][-1]
     assert isinstance(budget_middleware, PhoneToolBudgetMiddleware)
-    assert budget_middleware.limit == 1
+    assert budget_middleware.limit == 4
     assert isinstance(captured["middleware"][0], SyncPhoneStateMiddleware)
 
 

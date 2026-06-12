@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
-
-import pytest
 
 from mobile_agent import progress
 from mobile_agent.gateways.phone import DeviceGatewayError
@@ -32,6 +31,14 @@ class _FakePhoneGateway:
         self.device_ids: list[str | None] = []
 
     def get_session(self, device_id: str | None = None) -> _FakeSession:
+        self.device_ids.append(device_id)
+        return self.session
+
+    async def wait_for_session(
+        self,
+        device_id: str | None = None,
+        timeout: float = 3.0,
+    ) -> _FakeSession:
         self.device_ids.append(device_id)
         return self.session
 
@@ -131,12 +138,82 @@ def test_bound_phone_tool_rejects_device_id_override() -> None:
         for tool in create_phone_tools(gateway, default_device_id="device-uuid-1")
     }
 
-    with pytest.raises(DeviceGatewayError, match="cannot override"):
+    result = json.loads(
         asyncio.run(
-            tools["tap"].ainvoke(
-                {"x": 10, "y": 20, "device_id": "device-uuid-2"}
-            )
+            tools["tap"].ainvoke({"x": 10, "y": 20, "device_id": "device-uuid-2"})
         )
+    )
+
+    assert result["error"] == "phone_tool_failed"
+    assert result["recoverable"] is False
+
+
+def test_phone_tool_returns_recoverable_error_when_device_does_not_reconnect() -> None:
+    class DisconnectedGateway:
+        async def wait_for_session(
+            self,
+            device_id: str | None = None,
+            timeout: float = 3.0,
+        ) -> None:
+            raise DeviceGatewayError("device_not_connected")
+
+    tools = {tool.name: tool for tool in create_phone_tools(DisconnectedGateway())}
+
+    result = json.loads(asyncio.run(tools["home"].ainvoke({"device_id": "device-1"})))
+
+    assert result == {
+        "error": "device_not_connected",
+        "message": "手机连接已断开，请重新连接后重试",
+        "recoverable": True,
+    }
+
+
+def test_return_direct_phone_tools_preserve_device_not_connected_error() -> None:
+    class DisconnectedGateway:
+        async def wait_for_session(
+            self,
+            device_id: str | None = None,
+            timeout: float = 3.0,
+        ) -> None:
+            raise DeviceGatewayError("device_not_connected")
+
+    tools = {tool.name: tool for tool in create_phone_tools(DisconnectedGateway())}
+
+    for tool_name in ("interact", "take_over"):
+        result = json.loads(
+            asyncio.run(tools[tool_name].ainvoke({"message": "请操作手机"}))
+        )
+        assert result == {
+            "error": "device_not_connected",
+            "message": "手机连接已断开，请重新连接后重试",
+            "recoverable": True,
+        }
+
+
+def test_phone_tool_returns_recoverable_error_when_device_disconnects_during_command() -> None:
+    class DisconnectingSession:
+        async def send_command(self, message: str, data: Any) -> None:
+            del message, data
+            raise DeviceGatewayError("Device is disconnected.")
+
+    class DisconnectingGateway:
+        async def wait_for_session(
+            self,
+            device_id: str | None = None,
+            timeout: float = 3.0,
+        ) -> DisconnectingSession:
+            del device_id, timeout
+            return DisconnectingSession()
+
+    tools = {tool.name: tool for tool in create_phone_tools(DisconnectingGateway())}
+
+    result = json.loads(asyncio.run(tools["home"].ainvoke({"device_id": "device-1"})))
+
+    assert result == {
+        "error": "device_not_connected",
+        "message": "手机连接已断开，请重新连接后重试",
+        "recoverable": True,
+    }
 
 
 def test_system_tool_emits_started_and_completed_progress(monkeypatch: Any) -> None:

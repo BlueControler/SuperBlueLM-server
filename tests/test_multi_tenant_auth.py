@@ -242,6 +242,31 @@ def test_adb_status_uses_device_id_from_path(monkeypatch: object) -> None:
     assert requested == ["device-uuid-1"]
 
 
+def test_plain_adb_status_keeps_single_device_compatibility(monkeypatch: object) -> None:
+    requested: list[str | None] = []
+    session = SimpleNamespace(device_info=None)
+
+    def get_session(device_id: str | None = None) -> object:
+        requested.append(device_id)
+        return session
+
+    monkeypatch.setattr(http_app.phone_gateway, "get_session", get_session)
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/adb/status",
+            "headers": [],
+            "path_params": {},
+        }
+    )
+
+    response = asyncio.run(http_app.adb_status(request))
+
+    assert response.status_code == 200
+    assert requested == [None]
+
+
 async def _wait_for_session(gateway: DeviceGateway, device_id: str) -> object:
     for _ in range(50):
         try:
@@ -316,6 +341,39 @@ def test_device_gateway_tracks_multiple_device_ids() -> None:
         await first_socket.close()
         await second_socket.close()
         await asyncio.gather(first_task, second_task)
+
+    asyncio.run(run())
+
+
+def test_device_gateway_waits_for_device_reconnect() -> None:
+    async def run() -> None:
+        gateway = DeviceGateway()
+        waiting = asyncio.create_task(
+            gateway.wait_for_session("device-1", timeout=0.5)
+        )
+        await asyncio.sleep(0)
+        socket = _FakeWebSocket("/adb/device-1")
+        handler = asyncio.create_task(gateway.handler(socket))
+
+        session = await waiting
+
+        assert session is gateway.get_session("device-1")
+        await socket.close()
+        await handler
+
+    asyncio.run(run())
+
+
+def test_device_gateway_wait_timeout_returns_device_not_connected_error() -> None:
+    async def run() -> None:
+        gateway = DeviceGateway()
+
+        try:
+            await gateway.wait_for_session("device-1", timeout=0.01)
+        except DeviceGatewayError as exc:
+            assert exc.args[0] == "device_not_connected"
+        else:
+            raise AssertionError("missing device must time out")
 
     asyncio.run(run())
 

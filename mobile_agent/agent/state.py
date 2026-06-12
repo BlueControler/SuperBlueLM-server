@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Annotated, Literal
 
 from langchain.agents.middleware.types import AgentState, PrivateStateAttr
@@ -38,6 +39,13 @@ class MobileAgentState(AgentState[object], total=False):
     phone_todo_steps: NotRequired[
         Annotated[tuple[PhoneTodoStep, ...], PrivateStateAttr]
     ]
+
+
+def device_id_from_mapping(value: object) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    device_id = value.get("device_id") or value.get("deviceId")
+    return device_id if isinstance(device_id, str) and device_id else None
 
 
 def build_phone_snapshot(
