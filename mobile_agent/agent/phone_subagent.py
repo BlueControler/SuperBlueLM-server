@@ -182,8 +182,17 @@ class PhoneSubagentRunner:
                 device_id,
             )
 
+        session = (
+            self.phone_gateway.get_session(device_id)
+            if device_id is not None
+            else self.phone_gateway.get_session()
+        )
         budget = _tool_budget(allow_short_chain)
-        tools = create_phone_tools(self.phone_gateway, default_device_id=device_id)
+        tools = create_phone_tools(
+            self.phone_gateway,
+            default_device_id=device_id,
+            expected_session=session,
+        )
         phone_tool_names = {tool.name for tool in tools}
         agent = self.agent_factory(
             model=self.model,
@@ -322,7 +331,7 @@ def _tool_budget(allow_short_chain: bool) -> int:
         if allow_short_chain
         else "PHONE_SUBAGENT_MAX_TOOL_CALLS"
     )
-    default = "4"
+    default = "12"
     try:
         return max(int(os.getenv(env_name, default)), 1)
     except ValueError:

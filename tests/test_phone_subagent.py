@@ -87,8 +87,73 @@ def test_phone_subagent_exposes_only_phone_tools_and_default_budget(
     assert "weather_query" not in tool_names
     budget_middleware = captured["middleware"][-1]
     assert isinstance(budget_middleware, PhoneToolBudgetMiddleware)
-    assert budget_middleware.limit == 4
+    assert budget_middleware.limit == 12
     assert isinstance(captured["middleware"][0], SyncPhoneStateMiddleware)
+
+
+def test_phone_subagent_binds_tools_to_session_at_todo_start() -> None:
+    class CommandSession(_Session):
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def send_command(self, message: str, data: Any) -> dict[str, Any]:
+            del data
+            self.calls.append(message)
+            return {}
+
+    original_session = CommandSession()
+    replacement_session = CommandSession()
+
+    class SwitchingGateway:
+        current = original_session
+
+        def get_session(self, device_id: str | None = None) -> CommandSession:
+            del device_id
+            return self.current
+
+        async def wait_for_session(
+            self,
+            device_id: str | None = None,
+        ) -> CommandSession:
+            del device_id
+            return self.current
+
+    gateway = SwitchingGateway()
+    tool_result: list[str] = []
+
+    class ReconnectingAgent:
+        def __init__(self, tools: list[Any]) -> None:
+            self.tools = {tool.name: tool for tool in tools}
+
+        async def ainvoke(self, state: dict[str, Any]) -> dict[str, Any]:
+            del state
+            gateway.current = replacement_session
+            tool_result.append(await self.tools["home"].ainvoke({"device_id": "device-1"}))
+            return {
+                "messages": [],
+                "structured_response": {
+                    "status": "failed",
+                    "summary": "device disconnected",
+                    "needsMainAgentPlan": True,
+                },
+            }
+
+    runner = PhoneSubagentRunner(
+        gateway,
+        "openai:phone-small",
+        agent_factory=lambda **kwargs: ReconnectingAgent(kwargs["tools"]),
+    )
+
+    asyncio.run(
+        runner.execute(
+            "Go home",
+            allow_short_chain=False,
+            device_id="device-1",
+        )
+    )
+
+    assert '"error": "device_not_connected"' in tool_result[0]
+    assert replacement_session.calls == []
 
 
 def test_phone_subagent_uses_bounded_short_chain_budget(monkeypatch: Any) -> None:

@@ -18,9 +18,13 @@ The request must include `custom` in `stream_mode`:
 
 ```json
 {
-  "stream_mode": ["messages-tuple", "updates", "tasks", "custom"]
+  "stream_mode": ["messages-tuple", "updates", "tasks", "custom"],
+  "on_disconnect": "cancel"
 }
 ```
+
+`on_disconnect` must be `cancel`. Agent Server defaults to `continue`, which
+allows the old run to keep executing after the frontend stream disconnects.
 
 The Android frontend already sends this stream mode from:
 

@@ -216,6 +216,37 @@ def test_phone_tool_returns_recoverable_error_when_device_disconnects_during_com
     }
 
 
+def test_phone_tool_does_not_continue_on_replaced_session() -> None:
+    original_session = _FakeSession()
+    replacement_session = _FakeSession()
+
+    class ReconnectedGateway:
+        async def wait_for_session(
+            self,
+            device_id: str | None = None,
+            timeout: float = 3.0,
+        ) -> _FakeSession:
+            del device_id, timeout
+            return replacement_session
+
+    tools = {
+        tool.name: tool
+        for tool in create_phone_tools(
+            ReconnectedGateway(),
+            expected_session=original_session,
+        )
+    }
+
+    result = json.loads(asyncio.run(tools["home"].ainvoke({"device_id": "device-1"})))
+
+    assert result == {
+        "error": "device_not_connected",
+        "message": "手机连接已断开，请重新连接后重试",
+        "recoverable": True,
+    }
+    assert replacement_session.calls == []
+
+
 def test_system_tool_emits_started_and_completed_progress(monkeypatch: Any) -> None:
     emitted: list[dict[str, Any]] = []
     gateway = _FakeSystemGateway()

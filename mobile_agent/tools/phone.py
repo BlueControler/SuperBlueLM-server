@@ -19,6 +19,7 @@ from ..progress import emit_task_progress
 def create_phone_tools(
     gateway: DeviceGateway,
     default_device_id: str | None = None,
+    expected_session: object | None = None,
 ) -> list[BaseTool]:
     async def send(
         tool_name: str,
@@ -36,6 +37,8 @@ def create_phone_tools(
         try:
             selected_device_id = _select_device_id(device_id, default_device_id)
             session = await gateway.wait_for_session(selected_device_id)
+            if expected_session is not None and session is not expected_session:
+                raise DeviceNotConnectedError()
             result = await session.send_command(message, data)
         except DeviceNotConnectedError as exc:
             emit_task_progress(
