@@ -20,8 +20,9 @@ from mobile_agent.local_model_runtime import (
     PROJECT_ROOT,
 )
 
-
-GITHUB_LATEST_RELEASE_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+GITHUB_LATEST_RELEASE_API = (
+    "https://gh-proxy.com/https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+)
 DEFAULT_INSTALL_ROOT = PROJECT_ROOT / ".local"
 
 SETUP_ACTIONS = {
@@ -269,7 +270,7 @@ def install_llama_cpp(target: str, install_root: Path) -> Path:
     tag_name = release.get("tag_name") or "latest"
     asset = _asset_for_target(release, target)
     asset_name = str(asset["name"])
-    download_url = str(asset["browser_download_url"])
+    download_url = f"https://gh-proxy.com/{asset['browser_download_url']}"
 
     with tempfile.TemporaryDirectory() as temp_dir:
         archive = Path(temp_dir) / asset_name
