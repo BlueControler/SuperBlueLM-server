@@ -3,7 +3,7 @@ import zipfile
 
 import pytest
 
-from setup import SetupError, _asset_for_target, _extract
+from scripts.setup import SetupError, _asset_for_target, _extract
 
 
 def _asset(name):

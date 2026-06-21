@@ -14,7 +14,7 @@ from mobile_agent.tools.external import (
     external_tools_status_payload,
     query_weather,
 )
-import setup as setup
+import scripts.setup as setup
 
 
 class FakeHttpCaller:
@@ -312,9 +312,7 @@ def test_query_weather_falls_back_to_rest_when_mcp_weather_is_empty(
     monkeypatch: Any,
 ) -> None:
     monkeypatch.setenv("AMAP_MAPS_API_KEY", "test key")
-    amap = FakeAmapClient(
-        {"content": [{"type": "text", "text": '{"city":null,"forecasts":null}'}]}
-    )
+    amap = FakeAmapClient({"content": [{"type": "text", "text": '{"city":null,"forecasts":null}'}]})
     rest_weather = {
         "status": "1",
         "forecasts": [{"city": "天津市", "adcode": "120000", "casts": [{}]}],
@@ -379,9 +377,7 @@ def test_amap_rest_get_retries_once_after_transport_error(monkeypatch: Any) -> N
     client = FakeAsyncClient()
     monkeypatch.setattr(external.httpx, "AsyncClient", lambda **kwargs: client)
 
-    result = asyncio.run(
-        external._amap_rest_get_json("https://example.test", {"key": "test key"})
-    )
+    result = asyncio.run(external._amap_rest_get_json("https://example.test", {"key": "test key"}))
 
     assert result == {"status": "1"}
     assert client.calls == 2
