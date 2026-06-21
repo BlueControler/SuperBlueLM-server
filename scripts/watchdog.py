@@ -53,7 +53,7 @@ async def _fetch_latest_commit_sha(client: AsyncClient) -> str | None:
         logger.error("WATCHDOG_GITHUB_REPO is empty")
         return None
 
-    url = f"https://gh-proxy.com/https://api.github.com/repos/{cfg.github_repo}/commits/{cfg.github_branch}"
+    url = f"https://api.github.com/repos/{cfg.github_repo}/commits/{cfg.github_branch}"
     try:
         response = await client.get(url)
         response.raise_for_status()
