@@ -100,9 +100,9 @@ async def _get_local_commit_sha() -> str | None:
 
 
 async def _start_core_process() -> asyncio.subprocess.Process:
-    logger.info("Starting core process with './start-langgraph.sh'")
+    logger.info("Starting core process with 'scripts/start-langgraph.sh'")
     return await asyncio.create_subprocess_exec(
-        "./start-langgraph.sh",
+        "scripts/start-langgraph.sh",
         cwd=str(ROOT_DIR),
         start_new_session=True,
     )
