@@ -4,6 +4,8 @@ import asyncio
 from typing import Any
 
 from langchain.tools import ToolRuntime
+from langchain_core.messages import AIMessage
+from langgraph.graph import END
 
 from mobile_agent import progress
 from mobile_agent.agent.phone_delegation import (
@@ -40,14 +42,19 @@ class _Runner:
     def __init__(self, *results: PhoneTodoExecution) -> None:
         self.results = list(results)
         self.calls: list[tuple[str, bool]] = []
+        self.trace_parent_ids: list[str | None] = []
 
     async def execute(
         self,
         todo: str,
         *,
         allow_short_chain: bool,
+        device_id: str | None = None,
+        trace_parent_id: str | None = None,
     ) -> PhoneTodoExecution:
+        del device_id
         self.calls.append((todo, allow_short_chain))
+        self.trace_parent_ids.append(trace_parent_id)
         return self.results.pop(0)
 
 
@@ -237,7 +244,7 @@ def test_phone_delegation_tool_schema_exposes_validated_main_agent_inputs() -> N
     assert schema["properties"]["todo"]["maxLength"] == 1000
 
 
-def test_phone_delegation_tool_preserves_injected_runtime(
+def test_phone_delegation_tool_preserves_injected_runtime_without_restarting_done_step(
     monkeypatch: Any,
 ) -> None:
     emitted: list[dict[str, Any]] = []
@@ -274,9 +281,96 @@ def test_phone_delegation_tool_preserves_injected_runtime(
         )
     )
 
-    assert result.update["phone_todo_steps"][-1]["index"] == 2
+    assert "phone_todo_steps" not in result.update
     assert result.update["messages"][0].tool_call_id == "call_1"
-    assert runner.calls == [("Open the app", False)]
+    assert '"already_done": true' in result.update["messages"][0].content
+    assert runner.calls == []
+
+
+def test_phone_delegation_ends_run_when_subagent_returns_failed_result() -> None:
+    runner = _Runner(
+        PhoneTodoExecution(
+            status="failed",
+            todo="Go home",
+            summary="Phone subagent did not return a structured result.",
+            phoneState={
+                "currentPackage": "com.example",
+                "activity": ".MainActivity",
+                "hasScreenshot": True,
+                "hasUi": True,
+            },
+            toolCallCount=0,
+            needsMainAgentPlan=True,
+            error="missing_structured_response",
+        )
+    )
+    tool = create_phone_delegation_tool(runner)
+    runtime = ToolRuntime(
+        state={"phone_todo_steps": ()},
+        context=None,
+        config={},
+        stream_writer=lambda _: None,
+        tool_call_id="call_1",
+        store=None,
+    )
+
+    command = asyncio.run(
+        tool.ainvoke(
+            {
+                "name": "execute_phone_todo",
+                "args": {"todo": "Go home", "runtime": runtime},
+                "id": "call_1",
+                "type": "tool_call",
+            }
+        )
+    )
+
+    assert command.goto == END
+    assert command.update["run_failure_reason"] == "missing_structured_response"
+    assert command.update["messages"][0].status == "error"
+
+
+def test_phone_delegation_ends_run_after_deterministic_phone_success() -> None:
+    runner = _Runner(
+        PhoneTodoExecution(
+            status="completed",
+            todo="打开微信",
+            summary="已发起打开应用操作。",
+            phoneState={
+                "currentPackage": "com.tencent.mm",
+                "activity": ".ui.LauncherUI",
+                "hasScreenshot": True,
+                "hasUi": True,
+            },
+            toolCallCount=1,
+            needsMainAgentPlan=False,
+        )
+    )
+    tool = create_phone_delegation_tool(runner)
+    runtime = ToolRuntime(
+        state={"phone_todo_steps": ()},
+        context=None,
+        config={},
+        stream_writer=lambda _: None,
+        tool_call_id="call_1",
+        store=None,
+    )
+
+    command = asyncio.run(
+        tool.ainvoke(
+            {
+                "name": "execute_phone_todo",
+                "args": {"todo": "打开微信", "runtime": runtime},
+                "id": "call_1",
+                "type": "tool_call",
+            }
+        )
+    )
+
+    assert command.goto == END
+    assert command.update["messages"][0].status == "success"
+    assert isinstance(command.update["messages"][1], AIMessage)
+    assert command.update["messages"][1].content == "已发起打开应用操作。"
 
 
 def test_phone_delegation_passes_device_id_from_run_metadata() -> None:
@@ -319,6 +413,32 @@ def test_phone_delegation_passes_device_id_from_run_metadata() -> None:
     assert runner.device_ids == ["device-metadata-1"]
 
 
+def test_phone_delegation_passes_trace_parent_id_from_tool_call_id() -> None:
+    runner = _Runner(_execution("Open the app"))
+    tool = create_phone_delegation_tool(runner)
+    runtime = ToolRuntime(
+        state={"phone_todo_steps": ()},
+        context=None,
+        config={},
+        stream_writer=lambda _: None,
+        tool_call_id="call_parent",
+        store=None,
+    )
+
+    asyncio.run(
+        tool.ainvoke(
+            {
+                "name": "execute_phone_todo",
+                "args": {"todo": "Open the app", "runtime": runtime},
+                "id": "call_parent",
+                "type": "tool_call",
+            }
+        )
+    )
+
+    assert runner.trace_parent_ids == ["tool_call_parent"]
+
+
 def test_reset_phone_todo_middleware_returns_fresh_immutable_state() -> None:
     update = ResetPhoneTodoMiddleware().before_agent(
         {
@@ -339,4 +459,7 @@ def test_reset_phone_todo_middleware_returns_fresh_immutable_state() -> None:
     assert update == {
         "phone_todo_steps": (),
         "task_complexity_emitted": False,
+        "awaiting_user_action": False,
+        "awaiting_user_reason": "",
+        "run_failure_reason": "",
     }

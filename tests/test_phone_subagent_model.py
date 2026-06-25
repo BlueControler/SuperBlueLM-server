@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import mobile_agent.local_model_runtime as runtime
@@ -22,6 +23,18 @@ def test_phone_subagent_model_reuses_main_model_when_not_configured(
     main_model = object()
 
     assert runtime.build_phone_subagent_model(main_model) is main_model
+
+
+def test_phone_subagent_model_warns_when_reusing_main_model(
+    monkeypatch: Any,
+    caplog: Any,
+) -> None:
+    _clear_phone_model_env(monkeypatch)
+    caplog.set_level(logging.WARNING, logger=runtime.__name__)
+
+    runtime.build_phone_subagent_model(object())
+
+    assert "PHONE_SUBAGENT_MODEL is not configured" in caplog.text
 
 
 def test_phone_subagent_model_uses_independent_openai_compatible_config(

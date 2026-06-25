@@ -6,6 +6,7 @@ from typing import Literal
 
 from langchain_core.tools import BaseTool, tool
 
+from ..action_control import PhoneActionControlError, dispatch_phone_command
 from ..gateways.phone import (
     DEVICE_NOT_CONNECTED_CODE,
     DEVICE_NOT_CONNECTED_MESSAGE,
@@ -40,7 +41,12 @@ def create_phone_tools(
             session = await gateway.wait_for_session(selected_device_id)
             if expected_session is not None and session is not expected_session:
                 raise DeviceNotConnectedError()
-            result = await session.send_command(message, data)
+            result = await dispatch_phone_command(
+                session,
+                message,
+                data,
+                device_id=selected_device_id,
+            )
         except DeviceNotConnectedError as exc:
             emit_task_progress(
                 label=tool_name,
@@ -63,6 +69,20 @@ def create_phone_tools(
             if _is_device_not_connected_error(exc):
                 return _device_not_connected_result()
             return {"error": "phone_tool_failed", "message": str(exc), "recoverable": False}
+        except PhoneActionControlError as exc:
+            emit_task_progress(
+                label=tool_name,
+                status="failed",
+                phase="phone_tool",
+                message=f"Phone tool rejected: {tool_name}",
+                tool_name=tool_name,
+                error=str(exc),
+            )
+            return {
+                "error": "phone_action_rejected",
+                "message": str(exc),
+                "recoverable": False,
+            }
         emit_task_progress(
             label=tool_name,
             status="completed",

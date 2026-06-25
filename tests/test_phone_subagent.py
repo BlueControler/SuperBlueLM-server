@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from typing import Any
 
 import pytest
+from langchain.tools.tool_node import ToolCallRequest
 from langchain_core.messages import AIMessage, ToolMessage
 
 from mobile_agent.agent.phone_subagent import (
     PhoneSubagentRunner,
+    PhoneSubagentTraceMiddleware,
     PhoneToolBudgetExceededError,
     PhoneToolBudgetMiddleware,
     PhoneToolRepeatedActionError,
@@ -16,6 +19,8 @@ from mobile_agent.agent.phone_subagent import (
     redact_phone_text,
 )
 from mobile_agent.agent.middleware import SyncPhoneStateMiddleware
+from mobile_agent.action_control import phone_action_registry
+from mobile_agent.trace import TraceEmitter, request_context
 
 
 @dataclass
@@ -51,6 +56,23 @@ class _RaisingAgent:
         raise self.error
 
 
+class _HangingAgent:
+    async def ainvoke(self, state: dict[str, Any]) -> dict[str, Any]:
+        await asyncio.sleep(60)
+        return {}
+
+
+def _assert_controlled_wechat_launch(calls: list[tuple[str, dict[str, Any]]]) -> None:
+    assert len(calls) == 1
+    command, payload = calls[0]
+    assert command == "launch"
+    assert payload["package"] == "com.tencent.mm"
+    assert isinstance(payload["runId"], str) and payload["runId"]
+    assert isinstance(payload["actionId"], str) and payload["actionId"]
+    assert payload["actionIndex"] == 1
+    assert isinstance(payload["deadlineEpochMs"], int)
+
+
 def _completed_agent(messages: list[Any] | None = None) -> _Agent:
     return _Agent(
         {
@@ -61,6 +83,20 @@ def _completed_agent(messages: list[Any] | None = None) -> _Agent:
                 "needsMainAgentPlan": True,
             },
         }
+    )
+
+
+def _trace_tool_request(
+    name: str,
+    *,
+    args: dict[str, Any] | None = None,
+    call_id: str = "call-1",
+) -> ToolCallRequest:
+    return ToolCallRequest(
+        tool_call={"name": name, "args": args or {}, "id": call_id, "type": "tool_call"},
+        tool=None,
+        state={},
+        runtime=None,
     )
 
 
@@ -224,6 +260,391 @@ def test_phone_subagent_returns_redacted_server_owned_state_summary() -> None:
     assert "private-ui" not in str(payload)
 
 
+def test_phone_subagent_returns_explicit_failure_when_structured_response_is_missing() -> None:
+    runner = PhoneSubagentRunner(
+        _Gateway(),
+        "openai:phone-small",
+        agent_factory=lambda **kwargs: _Agent({"messages": [AIMessage(content="plain reply")] }),
+    )
+
+    result = asyncio.run(runner.execute("Tap the visible search box", allow_short_chain=False))
+
+    assert result.status == "failed"
+    assert result.error == "missing_structured_response"
+    assert result.terminal is True
+
+
+def test_phone_subagent_keeps_successful_phone_action_when_structured_response_is_missing() -> None:
+    runner = PhoneSubagentRunner(
+        _Gateway(),
+        "openai:phone-small",
+        agent_factory=lambda **kwargs: _Agent(
+            {
+                "messages": [
+                    ToolMessage(
+                        content="ok",
+                        tool_call_id="call-1",
+                        name="home",
+                        status="success",
+                    )
+                ]
+            }
+        ),
+    )
+
+    result = asyncio.run(runner.execute("返回桌面", allow_short_chain=False))
+
+    assert result.status == "completed"
+    assert result.tool_call_count == 1
+    assert result.needs_main_agent_plan is True
+    assert result.error is None
+
+
+def test_phone_subagent_classifies_upstream_http_500() -> None:
+    class UpstreamServerError(RuntimeError):
+        status_code = 500
+
+    runner = PhoneSubagentRunner(
+        _Gateway(),
+        "openai:phone-small",
+        agent_factory=lambda **kwargs: _RaisingAgent(UpstreamServerError("gateway failed")),
+    )
+
+    result = asyncio.run(runner.execute("Tap the visible search box", allow_short_chain=False))
+
+    assert result.status == "failed"
+    assert result.error == "llm_http_500"
+    assert result.terminal is False
+    assert result.retryable is False
+
+
+def test_phone_subagent_has_a_hard_execution_timeout(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        "mobile_agent.agent.phone_subagent._execution_timeout_seconds",
+        lambda: 0,
+    )
+    runner = PhoneSubagentRunner(
+        _Gateway(),
+        "openai:phone-small",
+        agent_factory=lambda **kwargs: _HangingAgent(),
+    )
+
+    result = asyncio.run(runner.execute("Tap the visible search box", allow_short_chain=False))
+
+    assert result.status == "timeout"
+    assert result.terminal is True
+    assert result.retryable is False
+
+
+def test_phone_subagent_fast_launches_wechat_without_model_call() -> None:
+    class LaunchSession(_Session):
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, str]]] = []
+
+        async def send_command(self, command: str, payload: dict[str, str]) -> dict[str, str]:
+            self.calls.append((command, payload))
+            return {}
+
+    class LaunchGateway:
+        def __init__(self) -> None:
+            self.session = LaunchSession()
+
+        def get_session(self, device_id: str | None = None) -> LaunchSession:
+            del device_id
+            return self.session
+
+    gateway = LaunchGateway()
+    runner = PhoneSubagentRunner(
+        gateway,
+        "openai:phone-small",
+        agent_factory=lambda **kwargs: (_ for _ in ()).throw(AssertionError("model must not run")),
+    )
+
+    result = asyncio.run(runner.execute("打开微信", allow_short_chain=False))
+
+    assert result.status == "completed"
+    assert result.todo == "打开微信"
+    _assert_controlled_wechat_launch(gateway.session.calls)
+
+
+def test_phone_subagent_fast_launches_wechat_from_main_agent_package_annotation() -> None:
+    class LaunchSession(_Session):
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, str]]] = []
+
+        async def send_command(self, command: str, payload: dict[str, str]) -> dict[str, str]:
+            self.calls.append((command, payload))
+            return {}
+
+    class LaunchGateway:
+        def __init__(self) -> None:
+            self.session = LaunchSession()
+
+        def get_session(self, device_id: str | None = None) -> LaunchSession:
+            del device_id
+            return self.session
+
+    model_invoked = False
+
+    def agent_factory(**kwargs: Any) -> _Agent:
+        nonlocal model_invoked
+        del kwargs
+        model_invoked = True
+        return _completed_agent()
+
+    gateway = LaunchGateway()
+    runner = PhoneSubagentRunner(gateway, "openai:phone-small", agent_factory=agent_factory)
+
+    result = asyncio.run(
+        runner.execute("打开微信应用（包名 com.tencent.mm）", allow_short_chain=False)
+    )
+
+    assert result.status == "completed"
+    assert model_invoked is False
+    _assert_controlled_wechat_launch(gateway.session.calls)
+
+
+def test_phone_subagent_fast_launches_wechat_when_main_agent_adds_navigation_details() -> None:
+    class LaunchSession(_Session):
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, str]]] = []
+
+        async def send_command(self, command: str, payload: dict[str, str]) -> dict[str, str]:
+            self.calls.append((command, payload))
+            return {}
+
+    class LaunchGateway:
+        def __init__(self) -> None:
+            self.session = LaunchSession()
+
+        def get_session(self, device_id: str | None = None) -> LaunchSession:
+            del device_id
+            return self.session
+
+    model_invoked = False
+
+    def agent_factory(**kwargs: Any) -> _Agent:
+        nonlocal model_invoked
+        del kwargs
+        model_invoked = True
+        return _completed_agent()
+
+    gateway = LaunchGateway()
+    runner = PhoneSubagentRunner(gateway, "openai:phone-small", agent_factory=agent_factory)
+
+    result = asyncio.run(
+        runner.execute(
+            "找到并打开‘微信’App。如果不确定哪个是微信，请先在桌面上左右滑动查找微信图标。",
+            allow_short_chain=False,
+        )
+    )
+
+    assert result.status == "completed"
+    assert model_invoked is False
+    _assert_controlled_wechat_launch(gateway.session.calls)
+
+
+def test_phone_subagent_fast_launch_emits_child_trace_under_parent() -> None:
+    class LaunchSession(_Session):
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, str]]] = []
+
+        async def send_command(self, command: str, payload: dict[str, str]) -> dict[str, str]:
+            self.calls.append((command, payload))
+            return {}
+
+    class LaunchGateway:
+        def __init__(self) -> None:
+            self.session = LaunchSession()
+
+        def get_session(self, device_id: str | None = None) -> LaunchSession:
+            del device_id
+            return self.session
+
+    events: list[dict[str, Any]] = []
+    emitter = TraceEmitter(lambda: events.append)
+    runner = PhoneSubagentRunner(
+        LaunchGateway(),
+        "openai:phone-small",
+        agent_factory=lambda **kwargs: (_ for _ in ()).throw(AssertionError("model must not run")),
+        trace_emitter=emitter,
+    )
+
+    with request_context(thread_id="thread-1", run_id="run-1"):
+        phone_action_registry.start_run("run-1", "thread-1")
+        emitter.step_upsert(
+            step_id="tool_parent",
+            kind="phone_action",
+            title="执行手机操作",
+            summary="根据用户目标执行手机自动化任务。",
+            status="running",
+        )
+        result = asyncio.run(
+            runner.execute(
+                "打开微信应用（包名 com.tencent.mm）",
+                allow_short_chain=False,
+                trace_parent_id="tool_parent",
+            )
+    )
+
+    assert result.status == "completed"
+    assert "com.tencent.mm" not in result.summary
+    child_steps = [
+        event["step"]
+        for event in events
+        if event.get("event") == "step.upsert"
+        and event.get("step", {}).get("parentId") == "tool_parent"
+    ]
+    assert [step["title"] for step in child_steps] == ["打开应用", "打开应用"]
+    assert child_steps[0]["status"] == "running"
+    assert child_steps[-1]["status"] == "succeeded"
+    combined = json.dumps(events, ensure_ascii=False)
+    assert "安全参数" in combined
+    assert "内部包名" in combined
+    assert "com.tencent.mm" not in combined
+
+
+def test_phone_subagent_tool_trace_maps_common_actions_to_safe_child_steps() -> None:
+    events: list[dict[str, Any]] = []
+    emitter = TraceEmitter(lambda: events.append)
+    middleware = PhoneSubagentTraceMiddleware(
+        parent_id="tool_parent",
+        emitter=emitter,
+    )
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    "ok": True,
+                    "x": 123,
+                    "y": 456,
+                    "text": "password=raw",
+                    "screenshot": "base64-screenshot",
+                    "ui": "<node text='private-ui' />",
+                },
+                ensure_ascii=False,
+            ),
+            tool_call_id=request.tool_call["id"],
+            name=request.tool_call["name"],
+            status="success",
+        )
+
+    with request_context(thread_id="thread-1", run_id="run-1"):
+        emitter.step_upsert(
+            step_id="tool_parent",
+            kind="phone_action",
+            title="执行手机操作",
+            summary="根据用户目标执行手机自动化任务。",
+            status="running",
+        )
+        for request in (
+            _trace_tool_request("observe", call_id="observe-1"),
+            _trace_tool_request("tap", args={"x": 100, "y": 200}, call_id="tap-1"),
+            _trace_tool_request("type", args={"text": "password=raw"}, call_id="type-1"),
+            _trace_tool_request(
+                "swipe",
+                args={"start_x": 1, "start_y": 2, "end_x": 3, "end_y": 4},
+                call_id="swipe-1",
+            ),
+        ):
+            asyncio.run(middleware.awrap_tool_call(request, handler))
+
+    child_steps = [
+        event["step"]
+        for event in events
+        if event.get("event") == "step.upsert"
+        and event.get("step", {}).get("parentId") == "tool_parent"
+    ]
+    titles = [step["title"] for step in child_steps]
+    assert "观察屏幕" in titles
+    assert "点击屏幕" in titles
+    assert "输入文本" in titles
+    assert "滑动屏幕" in titles
+    assert all(step["visibleToUser"] is True for step in child_steps)
+    combined = json.dumps(events, ensure_ascii=False)
+    assert "不展示精确坐标" in combined
+    assert "不展示完整敏感文本" in combined
+    assert "base64-screenshot" not in combined
+    assert "private-ui" not in combined
+    assert "password=raw" not in combined
+
+
+def test_phone_subagent_terminal_decision_emits_safe_child_trace() -> None:
+    events: list[dict[str, Any]] = []
+    emitter = TraceEmitter(lambda: events.append)
+    runner = PhoneSubagentRunner(
+        _Gateway(),
+        "openai:phone-small",
+        agent_factory=lambda **kwargs: _Agent(
+            {
+                "messages": [],
+                "structured_response": {
+                    "status": "completed",
+                    "summary": "已完成 token=secret",
+                    "needsMainAgentPlan": False,
+                },
+            }
+        ),
+        trace_emitter=emitter,
+    )
+
+    with request_context(thread_id="thread-1", run_id="run-1"):
+        emitter.step_upsert(
+            step_id="tool_parent",
+            kind="phone_action",
+            title="执行手机操作",
+            summary="根据用户目标执行手机自动化任务。",
+            status="running",
+        )
+        result = asyncio.run(
+            runner.execute(
+                "确认目标操作完成",
+                allow_short_chain=False,
+                trace_parent_id="tool_parent",
+            )
+        )
+
+    assert result.status == "completed"
+    decision_steps = [
+        event["step"]
+        for event in events
+        if event.get("event") == "step.upsert"
+        and event.get("step", {}).get("title") == "判断结果"
+    ]
+    assert decision_steps[-1]["parentId"] == "tool_parent"
+    assert decision_steps[-1]["status"] == "succeeded"
+    combined = json.dumps(events, ensure_ascii=False)
+    assert "已完成 token=***" in combined
+    assert "secret" not in combined
+
+
+def test_phone_subagent_trace_noops_without_trace_context() -> None:
+    events: list[dict[str, Any]] = []
+    middleware = PhoneSubagentTraceMiddleware(
+        parent_id="tool_parent",
+        emitter=TraceEmitter(lambda: events.append),
+    )
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="ok",
+            tool_call_id=request.tool_call["id"],
+            name=request.tool_call["name"],
+            status="success",
+        )
+
+    result = asyncio.run(
+        middleware.awrap_tool_call(
+            _trace_tool_request("tap", args={"x": 1, "y": 2}),
+            handler,
+        )
+    )
+
+    assert isinstance(result, ToolMessage)
+    assert events == []
+
+
 def test_phone_subagent_rejects_sensitive_todo_before_child_model_invocation() -> None:
     invoked = False
 
@@ -258,7 +679,7 @@ def test_phone_subagent_rejects_sensitive_todo_before_child_model_invocation() -
             PhoneToolBudgetExceededError(executed_count=1, limit=1),
             "budget_exhausted",
         ),
-        (PhoneToolSequenceError("parallel"), "failed"),
+        (PhoneToolSequenceError("parallel"), "stopped"),
         (RuntimeError("failed"), "failed"),
     ],
 )

@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timedelta, timezone, tzinfo
 import os
+import re
 from typing import Any, TypeAlias, cast
+from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
@@ -64,6 +66,13 @@ LOCAL_ALLOWED_PHONE_TOOLS = frozenset(
         "take_over",
     }
 )
+_DIRECT_APP_LAUNCHES = {
+    "微信": "com.tencent.mm",
+    "wechat": "com.tencent.mm",
+    "飞书": "com.ss.android.lark",
+    "lark": "com.ss.android.lark",
+}
+_LAUNCH_TRAILING_PUNCTUATION = " \t\r\n，。,.、:：;；!！?？）)]}】'\"”’"
 
 
 def _agent_timezone() -> tzinfo:
@@ -172,6 +181,68 @@ class TaskComplexityMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         runtime: Runtime[None],
     ) -> dict[str, bool] | None:
         return self.before_model(state, runtime)
+
+
+class DirectPhoneIntentMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
+    """Routes a pure known-app launch to the existing phone delegation tool."""
+
+    state_schema = MobileAgentState
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: ModelHandler,
+    ) -> ModelResponse[Any]:
+        return self._direct_response(request) or handler(request)
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: AsyncModelHandler,
+    ) -> ModelResponse[Any]:
+        response = self._direct_response(request)
+        return response if response is not None else await handler(request)
+
+    def _direct_response(self, request: ModelRequest[Any]) -> ModelResponse[Any] | None:
+        launch = _simple_known_app_launch(_latest_human_text(request.messages))
+        if launch is None:
+            return None
+        app_name, package = launch
+        return ModelResponse(
+            result=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": PHONE_DELEGATION_TOOL,
+                            "args": {
+                                "todo": f"打开{app_name}（包名 {package}）",
+                                "allow_short_chain": False,
+                            },
+                            "id": f"direct_launch_{uuid4().hex}",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        )
+
+
+def _simple_known_app_launch(text: str) -> tuple[str, str] | None:
+    action = re.search(r"(?:打开|启动|launch|open)", text, re.IGNORECASE)
+    if action is None:
+        return None
+    after_action = text[action.end() :].strip()
+    for app_name, package in _DIRECT_APP_LAUNCHES.items():
+        match = re.search(re.escape(app_name), after_action, re.IGNORECASE)
+        if match is None:
+            continue
+        trailing = after_action[match.end() :]
+        trailing = re.sub(r"^(?:应用|app)", "", trailing, flags=re.IGNORECASE)
+        if trailing.strip(_LAUNCH_TRAILING_PUNCTUATION):
+            continue
+        return app_name, package
+    return None
 
 
 class SyncPhoneStateMiddleware(AgentMiddleware[MobileAgentState, None, Any]):

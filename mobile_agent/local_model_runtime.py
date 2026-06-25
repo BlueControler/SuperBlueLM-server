@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import subprocess
@@ -17,6 +18,8 @@ from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
 from .json_types import JsonObject
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL_REPO = "ggml-org/gemma-4-E2B-it-GGUF"
@@ -239,6 +242,9 @@ def build_phone_subagent_model(main_cloud_model: ChatOpenAI | str) -> ChatOpenAI
     load_dotenv()
     model_name = os.getenv("PHONE_SUBAGENT_MODEL")
     if not model_name:
+        logger.warning(
+            "PHONE_SUBAGENT_MODEL is not configured; reusing the main model for phone structured output."
+        )
         return main_cloud_model
 
     api_key = os.getenv("PHONE_SUBAGENT_API_KEY") or os.getenv("OPENAI_API_KEY")
