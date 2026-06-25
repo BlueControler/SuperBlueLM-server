@@ -6,7 +6,7 @@ from typing import Annotated, Any, Literal, Protocol, cast
 
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain.tools import ToolRuntime
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, tool
 from langgraph.graph import END
 from langgraph.runtime import Runtime
@@ -229,9 +229,8 @@ def create_phone_delegation_tool(runner: PhoneTodoRunner) -> BaseTool:
         if result.status in {"failed", "rejected", "cancelled", "timeout", "stopped", "budget_exhausted"}:
             update["run_failure_reason"] = result.error or result.status
             return Command(update=update, goto=END)
-        # 正常完成且不需要主 agent 再规划：附加总结文本后结束
+        # 正常完成且不需要主 agent 再规划：结束工具节点，让直接意图中间件生成最终回复。
         if result.status == "completed" and not result.needs_main_agent_plan:
-            messages.append(AIMessage(content=redact_phone_text(result.summary)))
             return Command(update=update, goto=END)
         return Command(update=update)
 

@@ -207,6 +207,9 @@ class DirectPhoneIntentMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         launch = _simple_known_app_launch(_latest_human_text(request.messages))
         if launch is None:
             return None
+        final_response = _completed_phone_todo_response(request.state)
+        if final_response is not None:
+            return final_response
         app_name, package = launch
         return ModelResponse(
             result=[
@@ -226,6 +229,18 @@ class DirectPhoneIntentMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
                 )
             ]
         )
+
+
+def _completed_phone_todo_response(state: Mapping[str, Any]) -> ModelResponse[Any] | None:
+    steps = state.get("phone_todo_steps")
+    if not isinstance(steps, (list, tuple)) or not steps:
+        return None
+    last_step = steps[-1]
+    if not isinstance(last_step, Mapping):
+        return None
+    summary = last_step.get("summary")
+    content = summary if isinstance(summary, str) and summary else "手机操作已完成。"
+    return ModelResponse(result=[AIMessage(content=content)])
 
 
 def _simple_known_app_launch(text: str) -> tuple[str, str] | None:

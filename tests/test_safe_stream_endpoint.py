@@ -241,15 +241,15 @@ def test_safe_stream_does_not_turn_a_missing_terminal_into_success(monkeypatch) 
     )
 
     frames = _parse_sse(response.text)
+    # 修复后：有 text 但无 terminal → 发 stream.error + run.terminal(interrupted)
     assert [event for event, _ in frames] == [
         "stream.started",
         "assistant.delta",
-        "stream.eof",
+        "stream.error",
+        "trace.v1",
     ]
-    assert [payload["streamSeq"] for _, payload in frames] == [1, 2, 3]
-    assert "event: stream.error" not in response.text
-    assert "run.terminal" not in response.text
-    assert "succeeded" not in response.text
+    assert frames[-1][1]["event"] == "run.terminal"
+    assert frames[-1][1]["status"] == "interrupted"
 
 
 def test_trace_step_without_terminal_emits_transport_eof_only(monkeypatch) -> None:
@@ -286,15 +286,15 @@ def test_trace_step_without_terminal_emits_transport_eof_only(monkeypatch) -> No
     )
 
     frames = _parse_sse(response.text)
+    # 修复后：有 trace 但无 terminal → 发 stream.error + run.terminal(interrupted)
     assert [event for event, _ in frames] == [
         "stream.started",
         "trace.v1",
-        "stream.eof",
+        "stream.error",
+        "trace.v1",
     ]
-    assert [payload["streamSeq"] for _, payload in frames] == [1, 2, 3]
-    assert "event: stream.error" not in response.text
-    assert "run.terminal" not in response.text
-    assert "succeeded" not in response.text
+    assert frames[-1][1]["event"] == "run.terminal"
+    assert frames[-1][1]["status"] == "interrupted"
 
 
 def test_safe_stream_still_errors_on_empty_stream_without_terminal(monkeypatch) -> None:
@@ -313,13 +313,15 @@ def test_safe_stream_still_errors_on_empty_stream_without_terminal(monkeypatch) 
     )
 
     frames = _parse_sse(response.text)
+    # 修复后：空流无 terminal → 发 stream.error + run.terminal(failed)
     assert [event for event, _ in frames] == [
         "stream.started",
         "task_progress",
         "stream.error",
+        "trace.v1",
     ]
-    assert [payload["streamSeq"] for _, payload in frames] == [1, 2, 3]
-    assert frames[-1][1]["message"] == "任务未返回结束状态，已停止后续操作。"
+    assert frames[-1][1]["event"] == "run.terminal"
+    assert frames[-1][1]["status"] == "failed"
 
 
 def test_encoded_trace_frame_still_fits_after_stream_seq_is_injected() -> None:

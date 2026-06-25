@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from typing_extensions import NotRequired
 
 from ..action_control import PhoneActionCancelledError, PhoneActionControlError, PhoneActionLimitError, dispatch_phone_command
-from ..gateways.phone import DeviceGateway
+from ..gateways.phone import ConnectedDeviceSession, DeviceGateway, DeviceNotConnectedError
 from ..prompt_assets import PHONE_SUBAGENT_SYSTEM_PROMPT
 from ..trace import TraceDetailKind, TraceEmitter, TraceStepStatus, current_context
 from ..tools.phone import create_phone_tools
@@ -565,11 +565,21 @@ class PhoneSubagentRunner:
         if launch_result is not None:
             return launch_result
 
-        session = (
-            self.phone_gateway.get_session(device_id)
-            if device_id is not None
-            else self.phone_gateway.get_session()
-        )
+        session: ConnectedDeviceSession
+        try:
+            session = (
+                self.phone_gateway.get_session(device_id)
+                if device_id is not None
+                else self.phone_gateway.get_session()
+            )
+        except DeviceNotConnectedError:
+            logger.warning("Phone subagent cannot start: device not connected.")
+            return PhoneTodoExecution.failed(
+                todo=redact_phone_text(todo),
+                error="device_not_connected",
+                phone_state=self._phone_state_summary(device_id),
+                retryable=False,
+            )
         budget = _tool_budget(allow_short_chain)
         tools = create_phone_tools(
             self.phone_gateway,
@@ -1019,6 +1029,27 @@ class PhoneSubagentRunner:
                 status="failed",
             )
             return PhoneTodoExecution.rejected(todo, "手机操作已被系统安全策略拒绝。", self._phone_state_summary(device_id))
+        except DeviceNotConnectedError:
+            logger.warning(f"Fast launch skipped for {package}: device not connected")
+            trace.detail(
+                step_id=step_id,
+                kind="error",
+                title="设备断开",
+                text="手机连接已断开，无法执行操作。",
+            )
+            trace.complete_step(
+                step_id=step_id,
+                kind="phone_action",
+                title="打开应用",
+                summary="手机连接已断开，操作未执行。",
+                status="failed",
+            )
+            return PhoneTodoExecution.failed(
+                todo=redact_phone_text(todo),
+                error="device_not_connected",
+                phone_state=self._phone_state_summary(device_id),
+                retryable=False,
+            )
         except Exception as exc:
             logger.warning(f"Fast launch failed for {package}: {exc}")
             trace.detail(

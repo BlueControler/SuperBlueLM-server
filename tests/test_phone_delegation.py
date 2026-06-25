@@ -4,7 +4,6 @@ import asyncio
 from typing import Any
 
 from langchain.tools import ToolRuntime
-from langchain_core.messages import AIMessage
 from langgraph.graph import END
 
 from mobile_agent import progress
@@ -369,8 +368,8 @@ def test_phone_delegation_ends_run_after_deterministic_phone_success() -> None:
 
     assert command.goto == END
     assert command.update["messages"][0].status == "success"
-    assert isinstance(command.update["messages"][1], AIMessage)
-    assert command.update["messages"][1].content == "已发起打开应用操作。"
+    assert len(command.update["messages"]) == 1
+    assert command.update["phone_todo_steps"][0]["summary"] == "已发起打开应用操作。"
 
 
 def test_phone_delegation_passes_device_id_from_run_metadata() -> None:

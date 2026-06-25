@@ -168,50 +168,96 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
                                 "mobile_upstream_stream_error run_id={} thread_id={} upstream_status={} upstream_body={}",
                                 run_id, thread_id, response.status_code, error_body,
                             )
+                            # 区分 409（线程忙）和其他错误，统一发业务终态
+                            if response.status_code == 409:
+                                terminal_status = "thread_busy"
+                                error_message = "当前会话有任务正在执行，请等待完成后再试。"
+                                retryable = True
+                            else:
+                                terminal_status = "failed"
+                                error_message = f"上游服务返回 {response.status_code}"
+                                retryable = response.status_code in {408, 429} or response.status_code >= 500
                             yield encode(
                                 SafeSseFrame(
                                     "stream.error",
                                     {
                                         "type": "stream.error",
-                                        "message": f"上游服务返回 {response.status_code}",
+                                        "message": error_message,
                                         "detail": error_body,
-                                        "retryable": response.status_code in {408, 429} or response.status_code >= 500,
+                                        "retryable": retryable,
                                     },
                                 )
                             )
+                            yield encode(
+                                SafeSseFrame(
+                                    "trace.v1",
+                                    {
+                                        "type": "trace.v1",
+                                        "version": 1,
+                                        "runId": run_id,
+                                        "eventId": f"evt_{uuid4().hex[:12]}",
+                                        "seq": 0,
+                                        "event": "run.terminal",
+                                        "status": terminal_status,
+                                    },
+                                )
+                            )
+                            phone_action_registry.mark_terminal(run_id)
+                            phone_action_registry.mark_backend_status(run_id, terminal_status)
                             return
                         async for frame in _decode_sse(response.aiter_lines()):
                             for safe_frame in filter_.feed(frame):
                                 yield encode(safe_frame)
                         if filter_.terminal_status is None:
+                            # 无论有没有 trace/text，缺少 terminal 就是异常终态
+                            reason = "upstream_ended_without_terminal"
+                            await _cancel_backend_and_device_run(
+                                run_id,
+                                headers=headers,
+                                reason=reason,
+                            )
                             if filter_.has_any_text or filter_.has_trace_event:
-                                logger.info(
-                                    "mobile_run_stream_ended_without_terminal run_id={} thread_id={} has_text={} has_trace={}",
-                                    run_id, thread_id,
-                                    filter_.has_any_text,
-                                    filter_.has_trace_event,
-                                )
+                                terminal_status = "interrupted"
+                                error_message = "任务连接中断，部分结果可能未完成。"
                             else:
-                                await _cancel_backend_and_device_run(
-                                    run_id,
-                                    headers=headers,
-                                    reason="upstream_ended_without_terminal",
+                                terminal_status = "failed"
+                                error_message = "任务未返回结束状态，已停止后续操作。"
+                            yield encode(
+                                SafeSseFrame(
+                                    "stream.error",
+                                    {
+                                        "type": "stream.error",
+                                        "message": error_message,
+                                        "retryable": True,
+                                    },
                                 )
-                                yield encode(
-                                    SafeSseFrame(
-                                        "stream.error",
-                                        {
-                                            "type": "stream.error",
-                                            "message": "任务未返回结束状态，已停止后续操作。",
-                                            "retryable": True,
-                                        },
-                                    )
+                            )
+                            yield encode(
+                                SafeSseFrame(
+                                    "trace.v1",
+                                    {
+                                        "type": "trace.v1",
+                                        "version": 1,
+                                        "runId": run_id,
+                                        "eventId": f"evt_{uuid4().hex[:12]}",
+                                        "seq": 0,
+                                        "event": "run.terminal",
+                                        "status": terminal_status,
+                                    },
                                 )
-                                return
+                            )
+                            phone_action_registry.mark_terminal(run_id)
+                            phone_action_registry.mark_backend_status(run_id, terminal_status)
+                            return
+                        # ✅ 只有 filter_.terminal_status is not None 才走正常终态路径
                         # 内部 LangGraph 流关闭后，等待 500ms 让 trace terminal 等异步事件 flush 到 SSE 通道
                         await asyncio.sleep(0.5)
                         for safe_frame in filter_.finish():
                             yield encode(safe_frame)
+                        logger.info(
+                            "mobile_run_stream_finished run_id={} thread_id={} terminal_status={}",
+                            run_id, thread_id, filter_.terminal_status,
+                        )
                         phone_action_registry.mark_terminal(run_id)
                         phone_action_registry.mark_backend_status(
                             run_id,
@@ -260,6 +306,16 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
             )
         finally:
             phone_action_registry.clear_stream_cancellation(run_id)
+            # 兜底：无论任何路径退出（正常/异常/取消），确保 run 被标记为终态。
+            # 如果 TraceEmitter 的 run.terminal 未到达（例如 TRACE_V1_EMIT_ENABLED
+            # 曾为 false），这个兜底能防止 LangSmith run 永远悬挂。
+            if filter_.terminal_status is None:
+                logger.warning(
+                    "mobile_run_stream_no_terminal_at_finally run_id={} thread_id={}",
+                    run_id, thread_id,
+                )
+                phone_action_registry.mark_terminal(run_id)
+                phone_action_registry.mark_backend_status(run_id, "stream_closed")
 
     return StreamingResponse(
         generate(),
@@ -353,6 +409,40 @@ async def _cancel_backend_and_device_run(
     return backend_status
 
 
+async def _cancel_active_run_on_thread(
+    thread_id: str,
+    base_url: str,
+    headers: Mapping[str, str],
+) -> bool:
+    """Try to cancel any active run on a thread when we don't have the run id."""
+    timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            # List runs on the thread, find the active one
+            list_url = f"{base_url}/threads/{thread_id}/runs"
+            response = await client.get(list_url, headers=dict(headers))
+            if response.status_code != 200:
+                return False
+            runs = response.json()
+            if not isinstance(runs, list):
+                return False
+            # Find the first running/pending run
+            active = next(
+                (r for r in runs if isinstance(r, dict) and r.get("status") in ("running", "pending")),
+                None,
+            )
+            if active is None:
+                return False
+            backend_run_id = active.get("run_id") or active.get("id")
+            if not backend_run_id:
+                return False
+            cancel_url = f"{base_url}/threads/{thread_id}/runs/{backend_run_id}/cancel"
+            cancel_resp = await client.post(cancel_url, headers=dict(headers))
+            return 200 <= cancel_resp.status_code < 300
+    except Exception:
+        return False
+
+
 async def cancel_upstream_run(run_id: str, headers: Mapping[str, str]) -> str:
     """Cancel the native LangGraph run associated with a mobile run.
 
@@ -362,8 +452,16 @@ async def cancel_upstream_run(run_id: str, headers: Mapping[str, str]) -> str:
     run_info = phone_action_registry.backend_run_info(run_id)
     if run_info is None:
         logger.info("mobile_run_backend_cancel_skipped run_id={} reason=not_bound", run_id)
-        phone_action_registry.mark_backend_status(run_id, "not_started")
-        return "not_started"
+        # 未绑定 backend run id 时，尝试查询并取消 thread 上活跃的 backend run
+        thread_id = phone_action_registry.thread_id_for(run_id)
+        base_url = os.getenv("LANGGRAPH_INTERNAL_BASE_URL", "").strip().rstrip("/")
+        if thread_id and base_url:
+            cancelled = await _cancel_active_run_on_thread(thread_id, base_url, headers)
+            if cancelled:
+                phone_action_registry.mark_backend_status(run_id, "cancel_requested")
+                return "cancel_requested"
+        phone_action_registry.mark_backend_status(run_id, "unknown_not_bound")
+        return "unknown_not_bound"
     thread_id, backend_run_id = run_info
     base_url = os.getenv("LANGGRAPH_INTERNAL_BASE_URL", "").strip().rstrip("/")
     if not base_url or not thread_id:

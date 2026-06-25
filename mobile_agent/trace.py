@@ -314,10 +314,10 @@ class TraceEmitter:
         self._writer_provider = writer_provider or get_stream_writer
         if enabled is not None:
             self._enabled = enabled
-        elif writer_provider is not None:
-            self._enabled = True
         else:
-            self._enabled = os.getenv("TRACE_V1_EMIT_ENABLED", "false").strip().lower() == "true"
+            # run.terminal 是业务关键事件，不能依赖环境变量吞掉。
+            # 无论 TRACE_V1_EMIT_ENABLED 如何设置，终端事件始终发出。
+            self._enabled = True
 
     def run_started(self, summary: str = "正在分析请求。") -> dict[str, Any] | None:
         return self._emit("run.started", {"summary": _limit_text(summary, MAX_TRACE_SUMMARY_CHARS)})

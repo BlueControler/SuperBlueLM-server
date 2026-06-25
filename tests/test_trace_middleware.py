@@ -319,6 +319,22 @@ def test_before_agent_uses_client_owned_mobile_run_id_from_runtime_config() -> N
     middleware.after_agent({**state, **update}, runtime)
 
 
+def test_before_agent_uses_client_owned_mobile_run_id_from_runtime_metadata() -> None:
+    events: list[dict[str, Any]] = []
+    middleware = TraceMiddleware(TraceEmitter(lambda: events.append))
+    state: dict[str, Any] = {"messages": []}
+    runtime = SimpleNamespace(
+        config={"metadata": {"thread_id": "thread-1", "mobile_run_id": "run-client-1"}},
+    )
+
+    update = middleware.before_agent(state, runtime)
+
+    assert update["trace_run_id"] == "run-client-1"
+    assert events[0]["runId"] == "run-client-1"
+    assert events[0]["threadId"] == "thread-1"
+    middleware.after_agent({**state, **update}, runtime)
+
+
 def test_model_error_resumes_trace_session_and_emits_failed_terminal() -> None:
     events: list[dict[str, Any]] = []
     agent = create_deep_agent(

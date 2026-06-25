@@ -10,6 +10,7 @@ from langchain.tools.tool_node import ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 from langgraph.types import Command
+from loguru import logger
 
 from ..action_control import phone_action_registry, phone_action_scope
 from ..trace import (
@@ -48,6 +49,10 @@ class TraceMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
             thread_id=_thread_id(runtime, state),
             run_id=_mobile_run_id(runtime, state),
         )
+        logger.info(
+            "trace_before_agent run_id={} thread_id={} emitter_enabled={}",
+            context.run_id, context.thread_id, self.emitter._enabled,
+        )
         phone_action_registry.start_run(context.run_id, context.thread_id)
         analysis_step_id = f"phase_{context.run_id[:24]}"
         self.emitter.run_started()
@@ -82,19 +87,31 @@ class TraceMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         runtime: Runtime[None],
     ) -> dict[str, object] | None:
         if not self._resume_trace_context(state, runtime):
+            logger.warning("trace_after_agent_skipped reason=context_resume_failed")
             return None
+        trace_run_id = state.get("trace_run_id")
         if isinstance(state.get("run_failure_reason"), str) and state["run_failure_reason"]:
+            status = "failed"
+            reason = state["run_failure_reason"]
             self._finish_analysis(state, "failed")
             self.emitter.run_terminal("failed")
             self._mark_action_run_terminal(state)
         elif state.get("awaiting_user_action") is True:
+            status = "waiting_for_user"
+            reason = "awaiting_user_action"
             self._finish_analysis(state, "waiting_for_user")
             self.emitter.run_terminal("waiting_for_user")
             self._mark_action_run_terminal(state)
         else:
+            status = "succeeded"
+            reason = "normal_completion"
             self._finish_analysis(state, "succeeded")
             self.emitter.run_terminal("succeeded")
             self._mark_action_run_terminal(state)
+        logger.info(
+            "trace_after_agent run_id={} status={} reason={} emitter_enabled={}",
+            trace_run_id, status, reason, self.emitter._enabled,
+        )
         clear_request_context()
         return None
 
@@ -368,6 +385,11 @@ def _thread_id(runtime: object, state: Mapping[str, Any]) -> str | None:
         value = configurable.get("thread_id")
         if isinstance(value, str) and value:
             return value
+    metadata = config.get("metadata", {})
+    if isinstance(metadata, Mapping):
+        value = metadata.get("thread_id") or metadata.get("threadId")
+        if isinstance(value, str) and value:
+            return value
     value = state.get("thread_id") or state.get("threadId")
     return value if isinstance(value, str) and value else None
 
@@ -378,6 +400,11 @@ def _mobile_run_id(runtime: object, state: Mapping[str, Any]) -> str | None:
         configurable = config.get("configurable", {})
         if isinstance(configurable, Mapping):
             value = configurable.get("mobile_run_id")
+            if isinstance(value, str) and value:
+                return value
+        metadata = config.get("metadata", {})
+        if isinstance(metadata, Mapping):
+            value = metadata.get("mobile_run_id") or metadata.get("mobileRunId")
             if isinstance(value, str) and value:
                 return value
     value = state.get("mobile_run_id")
