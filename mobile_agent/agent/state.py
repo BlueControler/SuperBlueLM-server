@@ -39,6 +39,11 @@ class MobileAgentState(AgentState[object], total=False):
     phone_todo_steps: NotRequired[
         Annotated[tuple[PhoneTodoStep, ...], PrivateStateAttr]
     ]
+    awaiting_user_action: NotRequired[Annotated[bool, PrivateStateAttr]]
+    awaiting_user_reason: NotRequired[Annotated[str, PrivateStateAttr]]
+    run_failure_reason: NotRequired[Annotated[str, PrivateStateAttr]]
+    trace_run_id: NotRequired[Annotated[str, PrivateStateAttr]]
+    trace_analysis_step_id: NotRequired[Annotated[str, PrivateStateAttr]]
 
 
 def device_id_from_mapping(value: object) -> str | None:

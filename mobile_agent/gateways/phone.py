@@ -128,6 +128,23 @@ class ConnectedDeviceSession(JsonLineRpcSession):
         self._update_device_info_from_payload(action_result)
         return action_result
 
+    async def cancel_run(self, run_id: str) -> None:
+        """Ask the Android executor to stop queued work for one logical run."""
+        if not self.ready.is_set():
+            raise DeviceGatewayError("Device has not completed connect.")
+        response = await self.send_rpc_request(
+            "cancel",
+            {"runId": run_id},
+            timeout=min(_phone_command_timeout_seconds(), 5.0),
+        )
+        if response.message == "error":
+            error = ErrorData.model_validate(to_json_value(response.data))
+            raise DeviceGatewayError(error.message)
+        if response.message != "cancelled":
+            raise DeviceGatewayError(
+                f"Expected 'cancelled' response, got {response.message!r}."
+            )
+
     async def _handle_client_request(self, envelope: JsonLineEnvelope) -> None:
         if not self.ready.is_set():
             if envelope.message != "connect":
@@ -262,6 +279,10 @@ class DeviceGateway:
                         )
                     except TimeoutError:
                         raise DeviceNotConnectedError() from None
+
+    async def cancel_run(self, run_id: str, device_id: str | None = None) -> None:
+        session = self.get_session(device_id)
+        await session.cancel_run(run_id)
 
     async def handler(self, websocket: JsonLineWebSocket) -> None:
         request = websocket.request

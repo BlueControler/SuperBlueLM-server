@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import inspect
+import json
 from typing import Annotated, Any, Literal, Protocol, cast
 
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool, tool
+from langgraph.graph import END
 from langgraph.runtime import Runtime
 from langgraph.types import Command
 from pydantic import BaseModel, Field
@@ -17,6 +20,7 @@ from ..gateways.phone import (
     DeviceGatewayError,
 )
 from ..progress import emit_task_progress
+from ..trace import tool_trace_step_id
 from .phone_subagent import PhoneTodoExecution, redact_phone_text
 from .state import MobileAgentState, PhoneTodoStep, device_id_from_mapping
 
@@ -28,6 +32,7 @@ class PhoneTodoRunner(Protocol):
         *,
         allow_short_chain: bool,
         device_id: str | None = None,
+        trace_parent_id: str | None = None,
     ) -> PhoneTodoExecution: ...
 
 
@@ -55,6 +60,9 @@ class ResetPhoneTodoMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         return {
             "phone_todo_steps": (),
             "task_complexity_emitted": False,
+            "awaiting_user_action": False,
+            "awaiting_user_reason": "",
+            "run_failure_reason": "",
         }
 
     async def abefore_agent(
@@ -72,6 +80,7 @@ async def execute_tracked_phone_todo(
     *,
     allow_short_chain: bool,
     device_id: str | None = None,
+    trace_parent_id: str | None = None,
 ) -> tuple[PhoneTodoExecution, tuple[PhoneTodoStep, ...]]:
     index = len(steps) + 1
     progress_key = f"phone-todo-{index}"
@@ -89,13 +98,19 @@ async def execute_tracked_phone_todo(
     )
 
     try:
+        trace_kwargs = _trace_parent_kwargs(runner, trace_parent_id)
         if device_id is None:
-            result = await runner.execute(todo, allow_short_chain=allow_short_chain)
+            result = await runner.execute(
+                todo,
+                allow_short_chain=allow_short_chain,
+                **trace_kwargs,
+            )
         else:
             result = await runner.execute(
                 todo,
                 allow_short_chain=allow_short_chain,
                 device_id=device_id,
+                **trace_kwargs,
             )
     except DeviceGatewayError:
         result = _device_not_connected_execution(todo)
@@ -165,25 +180,59 @@ def create_phone_delegation_tool(runner: PhoneTodoRunner) -> BaseTool:
             tuple[PhoneTodoStep, ...],
             runtime.state.get("phone_todo_steps", ()),
         )
+        # 同一 run 内只允许执行一次手机 TODO——防止主 Agent 的 LLM 循环重试。
+        # 重复调用直接返回之前已完成的步骤结果，不再启动子 Agent。
+        if steps:
+            last_step = steps[-1]
+            return Command(
+                update={
+                    "messages": [
+                        ToolMessage(
+                            content=json.dumps({
+                                "status": "completed",
+                                "todo": redact_phone_text(todo),
+                                "summary": f"已执行手机操作（共 {len(steps)} 步）。",
+                                "terminal": True,
+                                "retryable": False,
+                                "already_done": True,
+                            }),
+                            tool_call_id=runtime.tool_call_id or "execute_phone_todo",
+                            name="execute_phone_todo",
+                            status="success",
+                        ),
+                    ],
+                },
+                goto=END,
+            )
+
         result, next_steps = await execute_tracked_phone_todo(
             steps,
             runner,
             todo,
             allow_short_chain=allow_short_chain,
             device_id=_runtime_device_id(runtime),
+            trace_parent_id=tool_trace_step_id(runtime.tool_call_id),
         )
-        return Command(
-            update={
-                "phone_todo_steps": next_steps,
-                "messages": [
-                    ToolMessage(
-                        content=result.model_dump_json(by_alias=True),
-                        tool_call_id=runtime.tool_call_id or "execute_phone_todo",
-                        name="execute_phone_todo",
-                    )
-                ],
-            }
-        )
+        messages = [
+            ToolMessage(
+                content=result.model_dump_json(by_alias=True),
+                tool_call_id=runtime.tool_call_id or "execute_phone_todo",
+                name="execute_phone_todo",
+                status="error" if result.status in {"failed", "rejected", "cancelled", "timeout", "stopped"} else "success",
+            )
+        ]
+        update: dict[str, object] = {
+            "phone_todo_steps": next_steps,
+            "messages": messages,
+        }
+        # 不可重试终态 → 立即结束 run
+        if result.status in {"failed", "rejected", "cancelled", "timeout", "stopped", "budget_exhausted"}:
+            update["run_failure_reason"] = result.error or result.status
+            return Command(update=update, goto=END)
+        # 正常完成且不需要主 agent 再规划：结束工具节点，让直接意图中间件生成最终回复。
+        if result.status == "completed" and not result.needs_main_agent_plan:
+            return Command(update=update, goto=END)
+        return Command(update=update)
 
     return execute_phone_todo
 
@@ -194,6 +243,16 @@ def _runtime_device_id(runtime: ToolRuntime) -> str | None:
         or device_id_from_mapping(runtime.config.get("metadata"))
         or device_id_from_mapping(runtime.config.get("configurable"))
     )
+
+
+def _trace_parent_kwargs(
+    runner: PhoneTodoRunner,
+    trace_parent_id: str | None,
+) -> dict[str, str]:
+    if trace_parent_id is None:
+        return {}
+    parameters = inspect.signature(runner.execute).parameters
+    return {"trace_parent_id": trace_parent_id} if "trace_parent_id" in parameters else {}
 
 
 def _completed_step_payloads(steps: tuple[PhoneTodoStep, ...]) -> list[JsonObject]:
