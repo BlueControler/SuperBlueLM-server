@@ -141,6 +141,20 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:2024/network/status -Conten
 langgraph dev
 ```
 
+真机要从手机访问电脑上的服务端时，建议显式监听局域网地址：
+
+```bash
+langgraph dev --host 0.0.0.0 --port 2024
+```
+
+然后在 Windows PowerShell 中运行连接检查脚本：
+
+```powershell
+.\scripts\setup_phone_connection.ps1
+```
+
+脚本会检查 `2024` 端口监听、本机局域网访问地址、防火墙规则和 ADB 设备。若手机通过 USB 调试连接且已授权，脚本会自动配置 `adb reverse tcp:2024 tcp:2024`，此时 Android App 的服务地址填 `http://127.0.0.1:2024`。如果走同一 Wi-Fi/LAN 直连，服务地址填脚本输出的 `http://<电脑局域网IP>:2024`；校园网或公共 Wi-Fi 可能禁止同网设备互访，此时优先使用 USB 反向代理。
+
 ## Nginx 端口转发
 
 如需把 `langgraph dev` 的默认端口 `127.0.0.1:2024` 暴露到其他地址/端口，可在本机 Nginx 配置中加入一个反向代理服务。关键点是保留 WebSocket 和 SSE 的相关设置。配置见 `nginx.conf`。
