@@ -27,6 +27,36 @@ def test_filter_drops_tool_call_arguments_and_tool_results() -> None:
     assert stream.feed(tool_result) == []
 
 
+def test_filter_drops_tool_call_messages_with_nested_metadata() -> None:
+    stream = SafeStreamFilter()
+
+    frames = stream.feed(
+        SseFrame(
+            event="messages-tuple",
+            data=json.dumps([
+                {
+                    "type": "ai",
+                    "content": "I will call weather_query for Beijing.",
+                    "additional_kwargs": {
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "weather_query",
+                                    "arguments": '{"city":"Beijing"}',
+                                }
+                            }
+                        ]
+                    },
+                    "response_metadata": {"finish_reason": "tool_calls"},
+                },
+                {"langgraph_node": "model", "checkpoint_ns": "model:tool-call"},
+            ]),
+        )
+    )
+
+    assert frames == []
+
+
 def test_filter_strips_think_across_chunks_and_keeps_safe_answer_text() -> None:
     stream = SafeStreamFilter()
     first = stream.feed(

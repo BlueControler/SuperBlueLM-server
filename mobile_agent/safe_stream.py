@@ -577,7 +577,7 @@ def _assistant_text(raw: str) -> tuple[str | None, str | None]:
     message_type = str(message.get("type") or message.get("role") or kwargs.get("type") or "").lower()
     if message_type == "tool" or "toolmessage" in message_type:
         return None, None
-    if message.get("tool_calls") or kwargs.get("tool_calls") or message.get("tool_call_chunks") or kwargs.get("tool_call_chunks"):
+    if _has_tool_call_signal(message, kwargs):
         return None, None
     content = message.get("content", kwargs.get("content"))
     text = _content_to_text(content)
@@ -590,6 +590,34 @@ def _assistant_text(raw: str) -> tuple[str | None, str | None]:
         or ""
     ).strip() or None
     return text, invocation_id
+
+
+def _has_tool_call_signal(message: Mapping[str, Any], kwargs: Mapping[str, Any]) -> bool:
+    additional_kwargs = _mapping_value(message, "additional_kwargs")
+    response_metadata = _mapping_value(message, "response_metadata")
+    kwargs_additional = _mapping_value(kwargs, "additional_kwargs")
+    kwargs_response_metadata = _mapping_value(kwargs, "response_metadata")
+    finish_reason = str(
+        response_metadata.get("finish_reason")
+        or kwargs_response_metadata.get("finish_reason")
+        or ""
+    ).lower()
+    return bool(
+        message.get("tool_calls")
+        or kwargs.get("tool_calls")
+        or message.get("tool_call_chunks")
+        or kwargs.get("tool_call_chunks")
+        or additional_kwargs.get("tool_calls")
+        or kwargs_additional.get("tool_calls")
+        or additional_kwargs.get("function_call")
+        or kwargs_additional.get("function_call")
+        or finish_reason == "tool_calls"
+    )
+
+
+def _mapping_value(mapping: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    value = mapping.get(key)
+    return value if isinstance(value, Mapping) else {}
 
 
 def _content_to_text(value: object) -> str:
