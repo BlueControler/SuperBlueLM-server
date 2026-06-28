@@ -73,6 +73,34 @@ _DIRECT_APP_LAUNCHES = {
     "lark": "com.ss.android.lark",
 }
 _LAUNCH_TRAILING_PUNCTUATION = " \t\r\n，。,.、:：;；!！?？）)]}】'\"”’"
+_KNOWN_WEATHER_LOCATIONS = {
+    "北京",
+    "上海",
+    "天津",
+    "重庆",
+    "深圳",
+    "广州",
+    "杭州",
+    "南京",
+    "成都",
+    "武汉",
+    "西安",
+    "苏州",
+    "东莞",
+    "佛山",
+    "长沙",
+    "郑州",
+    "青岛",
+    "厦门",
+    "福州",
+    "合肥",
+    "昆明",
+    "沈阳",
+    "大连",
+    "济南",
+    "宁波",
+    "无锡",
+}
 
 
 def _agent_timezone() -> tzinfo:
@@ -291,6 +319,58 @@ def _simple_known_app_launch(text: str) -> tuple[str, str] | None:
             continue
         return app_name, package
     return None
+
+
+class WeatherInfoIntentMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
+    """Short-circuits weather requests that lack a city/default location."""
+
+    state_schema = MobileAgentState
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: ModelHandler,
+    ) -> ModelResponse[Any]:
+        return self._direct_response(request) or handler(request)
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: AsyncModelHandler,
+    ) -> ModelResponse[Any]:
+        response = self._direct_response(request)
+        return response if response is not None else await handler(request)
+
+    def _direct_response(self, request: ModelRequest[Any]) -> ModelResponse[Any] | None:
+        text = _latest_human_text(request.messages)
+        if not _weather_query_needs_city(text):
+            return None
+        return ModelResponse(
+            result=[
+                AIMessage(
+                    content=(
+                        "我可以帮你分析天气和出行建议，但当前请求里没有城市，"
+                        "也没有配置默认天气城市。请告诉我所在城市后，我再查询实时天气；"
+                        "如果你只是想要通用建议，也可以直接说明。"
+                    )
+                )
+            ]
+        )
+
+
+def _weather_query_needs_city(text: str) -> bool:
+    normalized = text.strip()
+    if "天气" not in normalized:
+        return False
+    if re.search(r"(?:打开|启动|launch|open).*(?:天气|weather)", normalized, re.IGNORECASE):
+        return False
+    if os.getenv("DEFAULT_AMAP_CITY_ADCODE", "").strip() or os.getenv(
+        "DEFAULT_AMAP_CITY_NAME", ""
+    ).strip():
+        return False
+    if re.search(r"[\u4e00-\u9fa5]{2,12}(?:市|省|自治区|特别行政区)", normalized):
+        return False
+    return not any(location in normalized for location in _KNOWN_WEATHER_LOCATIONS)
 
 
 class SyncPhoneStateMiddleware(AgentMiddleware[MobileAgentState, None, Any]):

@@ -154,15 +154,21 @@ def test_unexpected_upstream_failure_is_converted_to_a_safe_sse_error(
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     frames = _parse_sse(response.text)
-    assert [event for event, _ in frames] == ["stream.started", "stream.error"]
-    assert [payload["streamSeq"] for _, payload in frames] == [1, 2]
+    assert [event for event, _ in frames] == ["stream.started", "trace.v1", "stream.error"]
+    assert [payload["streamSeq"] for _, payload in frames] == [1, 2, 3]
     assert frames[0][1]["type"] == "stream.started"
     assert frames[0][1]["message"] == "已接收请求，正在连接 Agent。"
-    assert frames[1][1] == {
+    assert frames[1][1]["event"] == "run.terminal"
+    assert frames[1][1]["status"] == "failed"
+    assert frames[1][1]["reason"] == "stream_error"
+    assert frames[1][1]["seq"] > 0
+    assert frames[2][1] == {
         "type": "stream.error",
         "message": "服务连接中断，请稍后重试。",
         "retryable": True,
-        "streamSeq": 2,
+        "terminalStatus": "failed",
+        "terminalReason": "stream_error",
+        "streamSeq": 3,
     }
 
 
@@ -241,15 +247,18 @@ def test_safe_stream_does_not_turn_a_missing_terminal_into_success(monkeypatch) 
     )
 
     frames = _parse_sse(response.text)
-    # 修复后：有 text 但无 terminal → 发 stream.error + run.terminal(interrupted)
+    # 有 text 但无 terminal 仍是失败终态；terminal 必须先于 stream.error，避免前端吞掉终态。
     assert [event for event, _ in frames] == [
         "stream.started",
         "assistant.delta",
-        "stream.error",
         "trace.v1",
+        "stream.error",
     ]
-    assert frames[-1][1]["event"] == "run.terminal"
-    assert frames[-1][1]["status"] == "interrupted"
+    assert frames[-2][1]["event"] == "run.terminal"
+    assert frames[-2][1]["status"] == "failed"
+    assert frames[-2][1]["reason"] == "upstream_ended_without_terminal"
+    assert frames[-2][1]["seq"] > 0
+    assert frames[-1][1]["terminalReason"] == "upstream_ended_without_terminal"
 
 
 def test_trace_step_without_terminal_emits_transport_eof_only(monkeypatch) -> None:
@@ -286,15 +295,18 @@ def test_trace_step_without_terminal_emits_transport_eof_only(monkeypatch) -> No
     )
 
     frames = _parse_sse(response.text)
-    # 修复后：有 trace 但无 terminal → 发 stream.error + run.terminal(interrupted)
+    # 有 trace 但无 terminal 时，补充一个可排序的 failed terminal 后再发送错误。
     assert [event for event, _ in frames] == [
         "stream.started",
         "trace.v1",
-        "stream.error",
         "trace.v1",
+        "stream.error",
     ]
-    assert frames[-1][1]["event"] == "run.terminal"
-    assert frames[-1][1]["status"] == "interrupted"
+    assert frames[-2][1]["event"] == "run.terminal"
+    assert frames[-2][1]["status"] == "failed"
+    assert frames[-2][1]["reason"] == "upstream_ended_without_terminal"
+    assert frames[-2][1]["seq"] == 2
+    assert frames[-1][1]["terminalStatus"] == "failed"
 
 
 def test_safe_stream_still_errors_on_empty_stream_without_terminal(monkeypatch) -> None:
@@ -313,15 +325,57 @@ def test_safe_stream_still_errors_on_empty_stream_without_terminal(monkeypatch) 
     )
 
     frames = _parse_sse(response.text)
-    # 修复后：空流无 terminal → 发 stream.error + run.terminal(failed)
+    # 空流无 terminal → 先发业务 failed terminal，再发 transport error。
     assert [event for event, _ in frames] == [
         "stream.started",
         "task_progress",
-        "stream.error",
         "trace.v1",
+        "stream.error",
     ]
-    assert frames[-1][1]["event"] == "run.terminal"
-    assert frames[-1][1]["status"] == "failed"
+    assert frames[-2][1]["event"] == "run.terminal"
+    assert frames[-2][1]["status"] == "failed"
+    assert frames[-2][1]["reason"] == "upstream_ended_without_terminal"
+    assert frames[-1][1]["terminalReason"] == "upstream_ended_without_terminal"
+
+
+def test_safe_stream_emits_heartbeat_while_upstream_is_quiet(monkeypatch) -> None:
+    monkeypatch.setenv("LANGGRAPH_INTERNAL_BASE_URL", "http://internal.example")
+    monkeypatch.setenv("MOBILE_AGENT_STREAM_HEARTBEAT_SECONDS", "1")
+    _DelayedStreamingAsyncClient.delays = [1.2, 0.0, 0.0]
+    _DelayedStreamingAsyncClient.lines = [
+        "event: custom",
+        "data: "
+        + json.dumps(
+            {
+                "type": "trace.v1",
+                "version": 1,
+                "runId": "run-1",
+                "eventId": "event-1",
+                "seq": 1,
+                "event": "run.terminal",
+                "status": "succeeded",
+            },
+            ensure_ascii=False,
+        ),
+        "",
+    ]
+    monkeypatch.setattr("mobile_agent.safe_stream.httpx.AsyncClient", _DelayedStreamingAsyncClient)
+
+    response = TestClient(app).post(
+        "/mobile/threads/thread-1/runs/stream",
+        json={"input": {"messages": []}},
+        headers={"X-Mobile-Run-Id": "run-client-1"},
+    )
+
+    frames = _parse_sse(response.text)
+    assert [event for event, _ in frames] == [
+        "stream.started",
+        "stream.heartbeat",
+        "trace.v1",
+        "stream.eof",
+    ]
+    assert frames[1][1]["type"] == "stream.heartbeat"
+    assert frames[1][1]["runId"] == "run-client-1"
 
 
 def test_encoded_trace_frame_still_fits_after_stream_seq_is_injected() -> None:
@@ -381,6 +435,28 @@ class _StreamingResponse:
 
     async def aiter_lines(self) -> AsyncIterator[str]:
         for line in self._lines:
+            yield line
+
+
+class _DelayedStreamingAsyncClient(_StreamingAsyncClient):
+    delays: list[float] = []
+
+    def stream(self, *_: object, **__: object) -> "_DelayedStreamingResponse":
+        return _DelayedStreamingResponse(self.lines, self.delays)
+
+
+class _DelayedStreamingResponse(_StreamingResponse):
+    def __init__(self, lines: list[str], delays: list[float]) -> None:
+        super().__init__(lines)
+        self._delays = delays
+
+    async def aiter_lines(self) -> AsyncIterator[str]:
+        for index, line in enumerate(self._lines):
+            delay = self._delays[index] if index < len(self._delays) else 0.0
+            if delay > 0:
+                import asyncio
+
+                await asyncio.sleep(delay)
             yield line
 
 

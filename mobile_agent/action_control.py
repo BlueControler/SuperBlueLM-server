@@ -73,6 +73,8 @@ class PhoneRun:
     status: RunStatus = "active"
     device_id: str | None = None
     cancellation_reason: str | None = None
+    cancel_source: str | None = None
+    terminal_reason: str | None = None
     next_action_index: int = 1
     actions: list[PhoneAction] = field(default_factory=list)
     cancel_stream: Callable[[], None] | None = None
@@ -132,6 +134,8 @@ class PhoneActionRegistry:
                     )
                     existing.status = "active"
                     existing.cancellation_reason = None
+                    existing.cancel_source = None
+                    existing.terminal_reason = None
                     existing.cancel_stream = None
                 if existing.thread_id is None and thread_id is not None:
                     existing.thread_id = thread_id
@@ -222,6 +226,8 @@ class PhoneActionRegistry:
         run_id: str,
         *,
         reason: str,
+        cancel_source: str | None = None,
+        terminal_reason: str | None = None,
         cancel_stream: bool = True,
     ) -> str | None:
         callback: Callable[[], None] | None = None
@@ -231,11 +237,19 @@ class PhoneActionRegistry:
                 return None
             run.last_accessed_at = monotonic()
             if run.status == "terminal":
+                run.cancel_source = cancel_source or run.cancel_source
+                run.terminal_reason = terminal_reason or reason or run.terminal_reason
+                self._persist_locked()
                 return run.device_id
             if run.status == "cancelled":
+                run.cancel_source = cancel_source or run.cancel_source
+                run.terminal_reason = terminal_reason or reason or run.terminal_reason
+                self._persist_locked()
                 return run.device_id
             run.status = "cancelled"
             run.cancellation_reason = reason
+            run.cancel_source = cancel_source or reason
+            run.terminal_reason = terminal_reason or reason
             for action in run.actions:
                 if action.status == "queued":
                     action.status = "cancelled"
@@ -245,7 +259,12 @@ class PhoneActionRegistry:
             self._persist_locked()
         if callback is not None:
             callback()
-        logger.info("phone_run_cancelled run_id={} reason={}", run_id, reason)
+        logger.info(
+            "phone_run_cancelled run_id={} reason={} cancel_source={}",
+            run_id,
+            reason,
+            cancel_source or reason,
+        )
         return device_id
 
     def bind_stream_cancellation(
@@ -314,12 +333,16 @@ class PhoneActionRegistry:
                 run.last_accessed_at = monotonic()
             return run.thread_id if run is not None else None
 
-    def mark_terminal(self, run_id: str) -> None:
+    def mark_terminal(self, run_id: str, *, terminal_reason: str | None = None) -> None:
         with self._lock:
             run = self._runs.get(run_id)
             if run is None or run.status == "cancelled":
+                if run is not None and terminal_reason:
+                    run.terminal_reason = terminal_reason
+                    self._persist_locked()
                 return
             run.status = "terminal"
+            run.terminal_reason = terminal_reason or run.terminal_reason
             run.last_accessed_at = monotonic()
             for action in run.actions:
                 if action.status == "queued":
@@ -345,6 +368,9 @@ class PhoneActionRegistry:
                 "deviceId": run.device_id,
                 "backendRunId": run.backend_run_id,
                 "backendStatus": run.backend_status,
+                "cancellationReason": run.cancellation_reason,
+                "cancelSource": run.cancel_source,
+                "terminalReason": run.terminal_reason,
                 "actions": [
                     {
                         "actionId": action.action_id,
@@ -417,6 +443,9 @@ class PhoneActionRegistry:
                 device_id=item.get("deviceId") if isinstance(item.get("deviceId"), str) else None,
                 backend_run_id=backend_run_id,
                 backend_status=item.get("backendStatus") if isinstance(item.get("backendStatus"), str) else "unknown",
+                cancellation_reason=item.get("cancellationReason") if isinstance(item.get("cancellationReason"), str) else None,
+                cancel_source=item.get("cancelSource") if isinstance(item.get("cancelSource"), str) else None,
+                terminal_reason=item.get("terminalReason") if isinstance(item.get("terminalReason"), str) else None,
             )
         return restored
 
@@ -431,6 +460,9 @@ class PhoneActionRegistry:
                 "deviceId": run.device_id,
                 "backendRunId": run.backend_run_id,
                 "backendStatus": run.backend_status,
+                "cancellationReason": run.cancellation_reason,
+                "cancelSource": run.cancel_source,
+                "terminalReason": run.terminal_reason,
             }
             for run in self._runs.values()
             if run.thread_id is not None and run.backend_run_id is not None

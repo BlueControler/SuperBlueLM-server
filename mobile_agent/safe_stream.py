@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -59,6 +60,7 @@ class SafeStreamFilter:
         self.terminal_status: str | None = None
         self._has_any_text = False
         self._has_trace_event = False
+        self._last_trace_seq = 0
 
     @property
     def has_any_text(self) -> bool:
@@ -67,6 +69,10 @@ class SafeStreamFilter:
     @property
     def has_trace_event(self) -> bool:
         return self._has_trace_event
+
+    @property
+    def next_trace_seq(self) -> int:
+        return self._last_trace_seq + 1
 
     def feed(self, upstream_event: SseFrame) -> list[SafeSseFrame]:
         event = upstream_event.event.lower()
@@ -86,6 +92,10 @@ class SafeStreamFilter:
         payload_type = payload.get("type")
         if payload_type == "trace.v1":
             safe = _safe_trace_payload(payload)
+            if safe is not None:
+                sequence = safe.get("seq")
+                if isinstance(sequence, int) and sequence > self._last_trace_seq:
+                    self._last_trace_seq = sequence
             if safe is not None and safe.get("event") == "run.terminal":
                 status = safe.get("status")
                 self.terminal_status = status if isinstance(status, str) else None
@@ -137,11 +147,23 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
     async def generate() -> AsyncIterator[str]:
         filter_ = SafeStreamFilter()
         stream_seq = 0
+        terminal_emitted = False
 
         def encode(frame: SafeSseFrame) -> str:
             nonlocal stream_seq
             stream_seq += 1
             return _encode_frame(frame, stream_seq=stream_seq)
+
+        def synthetic_terminal(status: str, reason: str) -> SafeSseFrame:
+            nonlocal terminal_emitted
+            terminal_emitted = True
+            filter_.terminal_status = status
+            return _terminal_frame(
+                run_id,
+                status=status,
+                reason=reason,
+                seq=filter_.next_trace_seq,
+            )
 
         timeout = httpx.Timeout(connect=10.0, read=None, write=60.0, pool=10.0)
         execution_timeout_seconds = _positive_env(
@@ -170,42 +192,42 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
                             )
                             # 区分 409（线程忙）和其他错误，统一发业务终态
                             if response.status_code == 409:
-                                terminal_status = "thread_busy"
+                                terminal_status = "failed"
+                                terminal_reason = "thread_busy"
                                 error_message = "当前会话有任务正在执行，请等待完成后再试。"
                                 retryable = True
                             else:
                                 terminal_status = "failed"
+                                terminal_reason = f"upstream_http_{response.status_code}"
                                 error_message = f"上游服务返回 {response.status_code}"
                                 retryable = response.status_code in {408, 429} or response.status_code >= 500
                             yield encode(
-                                SafeSseFrame(
-                                    "stream.error",
-                                    {
-                                        "type": "stream.error",
-                                        "message": error_message,
-                                        "detail": error_body,
-                                        "retryable": retryable,
-                                    },
-                                )
+                                synthetic_terminal(terminal_status, terminal_reason)
                             )
                             yield encode(
-                                SafeSseFrame(
-                                    "trace.v1",
-                                    {
-                                        "type": "trace.v1",
-                                        "version": 1,
-                                        "runId": run_id,
-                                        "eventId": f"evt_{uuid4().hex[:12]}",
-                                        "seq": 0,
-                                        "event": "run.terminal",
-                                        "status": terminal_status,
-                                    },
+                                _stream_error(
+                                    error_message,
+                                    retryable=retryable,
+                                    detail=error_body,
+                                    terminal_status=terminal_status,
+                                    terminal_reason=terminal_reason,
                                 )
                             )
-                            phone_action_registry.mark_terminal(run_id)
-                            phone_action_registry.mark_backend_status(run_id, terminal_status)
+                            phone_action_registry.mark_terminal(run_id, terminal_reason=terminal_reason)
+                            phone_action_registry.mark_backend_status(run_id, terminal_reason)
                             return
-                        async for frame in _decode_sse(response.aiter_lines()):
+                        heartbeat_seconds = _positive_float_env(
+                            "MOBILE_AGENT_STREAM_HEARTBEAT_SECONDS",
+                            15.0,
+                        )
+                        async for frame in _stream_with_heartbeats(
+                            response.aiter_lines(),
+                            heartbeat_seconds=heartbeat_seconds,
+                            run_id=run_id,
+                        ):
+                            if isinstance(frame, SafeSseFrame):
+                                yield encode(frame)
+                                continue
                             for safe_frame in filter_.feed(frame):
                                 yield encode(safe_frame)
                         if filter_.terminal_status is None:
@@ -216,37 +238,24 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
                                 headers=headers,
                                 reason=reason,
                             )
-                            if filter_.has_any_text or filter_.has_trace_event:
-                                terminal_status = "interrupted"
-                                error_message = "任务连接中断，部分结果可能未完成。"
-                            else:
-                                terminal_status = "failed"
-                                error_message = "任务未返回结束状态，已停止后续操作。"
-                            yield encode(
-                                SafeSseFrame(
-                                    "stream.error",
-                                    {
-                                        "type": "stream.error",
-                                        "message": error_message,
-                                        "retryable": True,
-                                    },
-                                )
+                            terminal_status = "failed"
+                            error_message = (
+                                "任务连接中断，部分结果可能未完成。"
+                                if filter_.has_any_text or filter_.has_trace_event
+                                else "任务未返回结束状态，已停止后续操作。"
                             )
                             yield encode(
-                                SafeSseFrame(
-                                    "trace.v1",
-                                    {
-                                        "type": "trace.v1",
-                                        "version": 1,
-                                        "runId": run_id,
-                                        "eventId": f"evt_{uuid4().hex[:12]}",
-                                        "seq": 0,
-                                        "event": "run.terminal",
-                                        "status": terminal_status,
-                                    },
+                                synthetic_terminal(terminal_status, reason)
+                            )
+                            yield encode(
+                                _stream_error(
+                                    error_message,
+                                    retryable=True,
+                                    terminal_status=terminal_status,
+                                    terminal_reason=reason,
                                 )
                             )
-                            phone_action_registry.mark_terminal(run_id)
+                            phone_action_registry.mark_terminal(run_id, terminal_reason=reason)
                             phone_action_registry.mark_backend_status(run_id, terminal_status)
                             return
                         # ✅ 只有 filter_.terminal_status is not None 才走正常终态路径
@@ -266,41 +275,47 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
         except TimeoutError:
             logger_message = "任务执行超过服务端时限，已请求停止。"
             logger.warning("mobile_run_execution_timeout run_id={} thread_id={}", run_id, thread_id)
-            await _cancel_backend_and_device_run(run_id, headers=headers, reason="execution_timeout")
+            reason = "server_timeout"
+            await _cancel_backend_and_device_run(run_id, headers=headers, reason=reason)
             yield encode(
-                SafeSseFrame(
-                    "stream.error",
-                    {
-                        "type": "stream.error",
-                        "message": logger_message,
-                        "retryable": False,
-                    },
+                synthetic_terminal("failed", reason)
+            )
+            yield encode(
+                _stream_error(
+                    logger_message,
+                    retryable=False,
+                    terminal_status="failed",
+                    terminal_reason=reason,
+                    cancel_source=reason,
                 )
             )
         except asyncio.CancelledError:
             logger.info("mobile_run_stream_cancelled run_id={} thread_id={}", run_id, thread_id)
-            # Do not treat every proxy-task cancellation as a user cancellation.
-            # Android can drop and recreate the SSE connection while the native
-            # LangGraph run is still inside a tool call. Explicit stop and the
-            # execution timeout paths already cancel the upstream run.
+            await _cancel_backend_and_device_run(
+                run_id,
+                headers=headers,
+                reason="client_disconnected",
+            )
             raise
         # 代理边界不允许把内部异常变成半截 SSE 响应；取消信号继承自
         # BaseException，不会被此处捕获，仍可正常终止请求。
         except Exception:
             logger.warning("mobile_run_stream_error run_id={} thread_id={}", run_id, thread_id)
+            reason = "stream_error"
             await _cancel_backend_and_device_run(
                 run_id,
                 headers=headers,
-                reason="stream_error",
+                reason=reason,
             )
             yield encode(
-                SafeSseFrame(
-                    "stream.error",
-                    {
-                        "type": "stream.error",
-                        "message": "服务连接中断，请稍后重试。",
-                        "retryable": True,
-                    },
+                synthetic_terminal("failed", reason)
+            )
+            yield encode(
+                _stream_error(
+                    "服务连接中断，请稍后重试。",
+                    retryable=True,
+                    terminal_status="failed",
+                    terminal_reason=reason,
                 )
             )
         finally:
@@ -308,12 +323,12 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
             # 兜底：无论任何路径退出（正常/异常/取消），确保 run 被标记为终态。
             # 如果 TraceEmitter 的 run.terminal 未到达（例如 TRACE_V1_EMIT_ENABLED
             # 曾为 false），这个兜底能防止 LangSmith run 永远悬挂。
-            if filter_.terminal_status is None:
+            if filter_.terminal_status is None and not terminal_emitted:
                 logger.warning(
                     "mobile_run_stream_no_terminal_at_finally run_id={} thread_id={}",
                     run_id, thread_id,
                 )
-                phone_action_registry.mark_terminal(run_id)
+                phone_action_registry.mark_terminal(run_id, terminal_reason="stream_closed")
                 phone_action_registry.mark_backend_status(run_id, "stream_closed")
 
     return StreamingResponse(
@@ -348,10 +363,9 @@ def _with_mobile_run_config(raw: bytes, *, run_id: str, thread_id: str) -> bytes
     # 不再用 MOBILE_AGENT_MAX_RECURSION 覆盖它——移动端代理的超时安全网
     # 由 MOBILE_AGENT_MAX_EXECUTION_SECONDS 保证。
     payload["config"] = config
-    # Keep the native LangGraph run alive if the mobile SSE proxy disconnects.
-    # Explicit /cancel and execution timeout remain the authoritative cancel
-    # paths; otherwise long tool calls can be interrupted mid-flight.
-    payload["on_disconnect"] = "continue"
+    # LangGraph's stream API defaults to `continue`.  That leaves a tool run
+    # alive after the mobile SSE client has timed out or disconnected.
+    payload["on_disconnect"] = "cancel"
     # No task may silently sit behind a stale run on the same LangGraph
     # thread. The client must receive a deterministic rejection instead.
     payload["multitask_strategy"] = "reject"
@@ -365,15 +379,124 @@ def _positive_env(name: str, default: int) -> int:
         return default
 
 
+def _positive_float_env(name: str, default: float) -> float:
+    try:
+        return max(float(os.getenv(name, str(default))), 0.1)
+    except ValueError:
+        return default
+
+
+async def _stream_with_heartbeats(
+    lines: AsyncIterator[str],
+    *,
+    heartbeat_seconds: float,
+    run_id: str,
+) -> AsyncIterator[SseFrame | SafeSseFrame]:
+    sentinel = object()
+    queue: asyncio.Queue[SseFrame | BaseException | object] = asyncio.Queue()
+
+    async def read_upstream() -> None:
+        try:
+            async for frame in _decode_sse(lines):
+                await queue.put(frame)
+        except BaseException as exc:
+            await queue.put(exc)
+        finally:
+            await queue.put(sentinel)
+
+    reader = asyncio.create_task(read_upstream())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=heartbeat_seconds)
+            except asyncio.TimeoutError:
+                yield _stream_heartbeat(run_id)
+                continue
+            if item is sentinel:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        if not reader.done():
+            reader.cancel()
+            try:
+                await reader
+            except asyncio.CancelledError:
+                pass
+
+
+def _terminal_frame(
+    run_id: str,
+    *,
+    status: str,
+    reason: str,
+    seq: int,
+    cancel_source: str | None = None,
+) -> SafeSseFrame:
+    data: dict[str, Any] = {
+        "type": "trace.v1",
+        "version": 1,
+        "runId": run_id,
+        "eventId": f"evt_{uuid4().hex[:12]}",
+        "seq": max(seq, 1),
+        "event": "run.terminal",
+        "status": status,
+        "reason": _bounded(reason, 128),
+    }
+    if cancel_source:
+        data["cancelSource"] = _bounded(cancel_source, 64)
+    return SafeSseFrame("trace.v1", data)
+
+
+def _stream_error(
+    message: str,
+    *,
+    retryable: bool,
+    terminal_status: str | None = None,
+    terminal_reason: str | None = None,
+    cancel_source: str | None = None,
+    detail: str | None = None,
+) -> SafeSseFrame:
+    data: dict[str, Any] = {
+        "type": "stream.error",
+        "message": message,
+        "retryable": retryable,
+    }
+    if terminal_status:
+        data["terminalStatus"] = terminal_status
+    if terminal_reason:
+        data["terminalReason"] = _bounded(terminal_reason, 128)
+    if cancel_source:
+        data["cancelSource"] = _bounded(cancel_source, 64)
+    if detail:
+        data["detail"] = detail
+    return SafeSseFrame("stream.error", data)
+
+
+def _stream_heartbeat(run_id: str) -> SafeSseFrame:
+    return SafeSseFrame(
+        "stream.heartbeat",
+        {
+            "type": "stream.heartbeat",
+            "runId": _bounded(run_id, 128),
+            "timestamp": int(time.time() * 1000),
+        },
+    )
+
+
 async def _cancel_device_run(
     run_id: str,
     *,
     reason: str,
+    cancel_source: str | None = None,
     cancel_stream: bool,
 ) -> None:
     device_id = phone_action_registry.cancel_run(
         run_id,
         reason=reason,
+        cancel_source=cancel_source or reason,
+        terminal_reason=reason,
         cancel_stream=cancel_stream,
     )
     if device_id is None:
@@ -391,11 +514,14 @@ async def _cancel_backend_and_device_run(
     *,
     headers: Mapping[str, str],
     reason: str,
+    cancel_source: str | None = None,
 ) -> str:
     """Fence local/device work and ask LangGraph to interrupt its real run."""
     device_id = phone_action_registry.cancel_run(
         run_id,
         reason=reason,
+        cancel_source=cancel_source or reason,
+        terminal_reason=reason,
         cancel_stream=False,
     )
     backend_status = await cancel_upstream_run(run_id, headers)
@@ -577,7 +703,7 @@ def _assistant_text(raw: str) -> tuple[str | None, str | None]:
     message_type = str(message.get("type") or message.get("role") or kwargs.get("type") or "").lower()
     if message_type == "tool" or "toolmessage" in message_type:
         return None, None
-    if _has_tool_call_signal(message, kwargs):
+    if message.get("tool_calls") or kwargs.get("tool_calls") or message.get("tool_call_chunks") or kwargs.get("tool_call_chunks"):
         return None, None
     content = message.get("content", kwargs.get("content"))
     text = _content_to_text(content)
@@ -590,34 +716,6 @@ def _assistant_text(raw: str) -> tuple[str | None, str | None]:
         or ""
     ).strip() or None
     return text, invocation_id
-
-
-def _has_tool_call_signal(message: Mapping[str, Any], kwargs: Mapping[str, Any]) -> bool:
-    additional_kwargs = _mapping_value(message, "additional_kwargs")
-    response_metadata = _mapping_value(message, "response_metadata")
-    kwargs_additional = _mapping_value(kwargs, "additional_kwargs")
-    kwargs_response_metadata = _mapping_value(kwargs, "response_metadata")
-    finish_reason = str(
-        response_metadata.get("finish_reason")
-        or kwargs_response_metadata.get("finish_reason")
-        or ""
-    ).lower()
-    return bool(
-        message.get("tool_calls")
-        or kwargs.get("tool_calls")
-        or message.get("tool_call_chunks")
-        or kwargs.get("tool_call_chunks")
-        or additional_kwargs.get("tool_calls")
-        or kwargs_additional.get("tool_calls")
-        or additional_kwargs.get("function_call")
-        or kwargs_additional.get("function_call")
-        or finish_reason == "tool_calls"
-    )
-
-
-def _mapping_value(mapping: Mapping[str, Any], key: str) -> Mapping[str, Any]:
-    value = mapping.get(key)
-    return value if isinstance(value, Mapping) else {}
 
 
 def _content_to_text(value: object) -> str:
@@ -665,6 +763,12 @@ def _safe_trace_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
             safe["status"] = status
         else:
             return None
+        reason = payload.get("reason")
+        if isinstance(reason, str) and reason:
+            safe["reason"] = _bounded(reason, 128)
+        cancel_source = payload.get("cancelSource")
+        if isinstance(cancel_source, str) and cancel_source:
+            safe["cancelSource"] = _bounded(cancel_source, 64)
     elif event_name == "run.started":
         summary = payload.get("summary")
         if isinstance(summary, str) and summary:

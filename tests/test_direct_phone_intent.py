@@ -8,9 +8,13 @@ from deepagents import create_deep_agent
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.messages.tool import ToolMessage
-from langchain_core.tools import tool
 
-from mobile_agent.agent.middleware import DirectPhoneIntentMiddleware
+from mobile_agent.agent.middleware import DirectPhoneIntentMiddleware, WeatherInfoIntentMiddleware
+from mobile_agent.agent.phone_delegation import (
+    ResetPhoneTodoMiddleware,
+    create_phone_delegation_tool,
+)
+from mobile_agent.agent.phone_subagent import PhoneTodoExecution
 
 
 class _FailingBindableFakeChatModel(FakeMessagesListChatModel):
@@ -23,6 +27,35 @@ class _FailingBindableFakeChatModel(FakeMessagesListChatModel):
         raise AssertionError("model must not run for a direct app launch")
 
 
+class _Runner:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, bool]] = []
+
+    async def execute(
+        self,
+        todo: str,
+        *,
+        allow_short_chain: bool,
+        device_id: str | None = None,
+        trace_parent_id: str | None = None,
+    ) -> PhoneTodoExecution:
+        del device_id, trace_parent_id
+        self.calls.append((todo, allow_short_chain))
+        return PhoneTodoExecution(
+            status="completed",
+            todo=todo,
+            summary="已发起打开应用操作。",
+            phoneState={
+                "currentPackage": "com.ss.android.lark",
+                "activity": ".main.app.MainActivity",
+                "hasScreenshot": True,
+                "hasUi": True,
+            },
+            toolCallCount=1,
+            needsMainAgentPlan=False,
+        )
+
+
 @dataclass(frozen=True)
 class _Request:
     messages: list[Any]
@@ -32,7 +65,7 @@ class _Request:
         return replace(self, **changes)
 
 
-def test_simple_feishu_launch_bypasses_model_and_calls_launch_tool() -> None:
+def test_simple_feishu_launch_bypasses_model_and_delegates_known_package() -> None:
     middleware = DirectPhoneIntentMiddleware()
     request = _Request(
         messages=[HumanMessage(content="请用你的手机工具帮我打开飞书")],
@@ -47,24 +80,27 @@ def test_simple_feishu_launch_bypasses_model_and_calls_launch_tool() -> None:
     message = response.result[0]
     assert isinstance(message, AIMessage)
     assert len(message.tool_calls) == 1
-    assert message.tool_calls[0]["name"] == "launch"
-    assert message.tool_calls[0]["args"] == {"package": "com.ss.android.lark"}
+    assert message.tool_calls[0]["name"] == "execute_phone_todo"
+    assert message.tool_calls[0]["args"] == {
+        "todo": "打开飞书（包名 com.ss.android.lark）",
+        "allow_short_chain": False,
+    }
 
 
-def test_completed_direct_launch_returns_final_summary_without_model() -> None:
+def test_completed_direct_launch_returns_final_summary_without_redelegating() -> None:
     middleware = DirectPhoneIntentMiddleware()
     request = _Request(
         messages=[HumanMessage(content="打开飞书app")],
         state={
-            "messages": [
-                HumanMessage(content="打开飞书app"),
-                ToolMessage(
-                    content='{"ok":true,"currentPackage":"com.ss.android.lark"}',
-                    tool_call_id="direct-launch",
-                    name="launch",
-                    status="success",
-                ),
-            ]
+            "phone_todo_steps": (
+                {
+                    "index": 1,
+                    "progressKey": "phone-todo-1",
+                    "name": "打开飞书（包名 com.ss.android.lark）",
+                    "status": "completed",
+                    "summary": "已发起打开应用操作。",
+                },
+            )
         },
     )
 
@@ -75,22 +111,19 @@ def test_completed_direct_launch_returns_final_summary_without_model() -> None:
 
     message = response.result[0]
     assert isinstance(message, AIMessage)
-    assert message.content == "已发起打开飞书。"
+    assert message.content == "已发起打开应用操作。"
     assert message.tool_calls == []
 
 
-def test_direct_launch_agent_stops_after_launch_completion() -> None:
-    calls: list[str] = []
-
-    @tool("launch", description="Launch an Android app by package name.")
-    async def launch(package: str) -> str:
-        calls.append(package)
-        return '{"ok":true,"currentPackage":"com.ss.android.lark"}'
-
+def test_direct_launch_agent_stops_after_phone_todo_completion() -> None:
+    runner = _Runner()
     agent = create_deep_agent(
         model=_FailingBindableFakeChatModel(responses=[]),
-        tools=[launch],
-        middleware=[DirectPhoneIntentMiddleware()],
+        tools=[create_phone_delegation_tool(runner)],
+        middleware=[
+            ResetPhoneTodoMiddleware(),
+            DirectPhoneIntentMiddleware(),
+        ],
     )
 
     result = asyncio.run(
@@ -100,8 +133,8 @@ def test_direct_launch_agent_stops_after_launch_completion() -> None:
         )
     )
 
-    assert calls == ["com.ss.android.lark"]
-    assert result["messages"][-1].content == "已发起打开飞书。"
+    assert runner.calls == [("打开飞书（包名 com.ss.android.lark）", False)]
+    assert result["messages"][-1].content == "已发起打开应用操作。"
     assert sum(isinstance(message, ToolMessage) for message in result["messages"]) == 1
 
 
@@ -109,6 +142,38 @@ def test_launch_with_follow_up_work_keeps_model_planning() -> None:
     middleware = DirectPhoneIntentMiddleware()
     request = _Request(
         messages=[HumanMessage(content="打开飞书并给小王发送消息")],
+        state={},
+    )
+    expected = object()
+
+    response = middleware.wrap_model_call(request, lambda _: expected)
+
+    assert response is expected
+
+
+def test_weather_without_city_returns_clarification_without_running_model_or_phone() -> None:
+    middleware = WeatherInfoIntentMiddleware()
+    request = _Request(
+        messages=[HumanMessage(content="请告诉我今天的天气情况和出行建议")],
+        state={},
+    )
+
+    response = middleware.wrap_model_call(
+        request,
+        lambda _: (_ for _ in ()).throw(AssertionError("model must not run")),
+    )
+
+    message = response.result[0]
+    assert isinstance(message, AIMessage)
+    assert "城市" in message.content
+    assert "实时天气" in message.content
+    assert message.tool_calls == []
+
+
+def test_weather_with_city_keeps_model_or_weather_tool_planning() -> None:
+    middleware = WeatherInfoIntentMiddleware()
+    request = _Request(
+        messages=[HumanMessage(content="请查询深圳今天的天气情况和出行建议")],
         state={},
     )
     expected = object()
