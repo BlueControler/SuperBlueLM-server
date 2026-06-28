@@ -122,12 +122,6 @@ def test_unknown_tool_never_exposes_its_raw_name_or_arguments() -> None:
     assert spec["safe_args_summary"]({"token": "secret", "password": "raw"}) == "正在执行受控操作。"
 
 
-def test_phone_todo_risk_classifier_blocks_sensitive_actions_only() -> None:
-    assert trace.is_high_risk_phone_todo("打开地图查询路线") is False
-    assert trace.is_high_risk_phone_todo("发送消息给张三") is True
-    assert trace.is_high_risk_phone_todo("删除这条日程") is True
-
-
 def test_trace_writer_failure_never_breaks_agent_execution_or_size_limit() -> None:
     def broken_writer(_: dict[str, Any]) -> None:
         raise RuntimeError("custom stream unavailable")

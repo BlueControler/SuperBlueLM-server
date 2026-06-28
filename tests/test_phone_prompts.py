@@ -1,4 +1,4 @@
-from mobile_agent.prompt_assets import PHONE_SUBAGENT_SYSTEM_PROMPT, SYSTEM_PROMPT
+from mobile_agent.prompt_assets import SYSTEM_PROMPT
 
 
 def test_main_prompt_assigns_planning_execution_and_result_review_to_main_agent() -> None:
@@ -9,8 +9,3 @@ def test_main_prompt_assigns_planning_execution_and_result_review_to_main_agent(
     assert "目标完成后再给用户最终答复" in SYSTEM_PROMPT
     assert "必须调用 execute_phone_todo" not in SYSTEM_PROMPT
     assert "子 agent" not in SYSTEM_PROMPT
-
-
-def test_legacy_phone_subagent_prompt_is_not_main_agent_contract() -> None:
-    assert "只执行主 agent 下发的一条明确 TODO" in PHONE_SUBAGENT_SYSTEM_PROMPT
-    assert "顺序执行完成当前 TODO 所需的少量动作" in PHONE_SUBAGENT_SYSTEM_PROMPT

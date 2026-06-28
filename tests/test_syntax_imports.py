@@ -14,8 +14,6 @@ def test_core_python_files_compile() -> None:
         "mobile_agent/tools/external.py",
         "mobile_agent/tools/system.py",
         "mobile_agent/agent/middleware.py",
-        "mobile_agent/agent/phone_subagent.py",
-        "mobile_agent/agent/phone_delegation.py",
     ]
 
     for relative_path in files:

@@ -113,7 +113,6 @@ TOOL_DISPLAY_REGISTRY: dict[str, ToolDisplaySpec] = {
     "create_event": _spec("创建日程", "approval", "该操作涉及日程变更，需要用户确认。", "", risk="high"),
     "update_event": _spec("修改日程", "approval", "该操作涉及日程变更，需要用户确认。", "", risk="high"),
     "update_reminders": _spec("修改提醒", "approval", "该操作涉及日程变更，需要用户确认。", "", risk="high"),
-    "execute_phone_todo": _spec("执行手机操作", "phone_action", "根据用户目标执行手机自动化任务。", "手机自动化任务已返回安全结果。"),
     "interact": _spec("等待你处理", "approval", "该操作需要你确认。我不会继续自动执行。", "", risk="high"),
     "take_over": _spec("等待你接管", "approval", "该操作需要你确认。我不会继续自动执行。", "", risk="high"),
 }
@@ -123,19 +122,6 @@ _FALLBACK_TOOL_SPEC = _spec(
     "generic",
     "正在执行受控操作。",
     "已完成受控操作。",
-)
-_HIGH_RISK_PHONE_TODO_MARKERS = (
-    "发送",
-    "删除",
-    "支付",
-    "下单",
-    "转账",
-    "拨打",
-    "授权",
-    "登录",
-    "密码",
-    "验证码",
-    "提交",
 )
 
 
@@ -288,18 +274,9 @@ def tool_trace_step_id(tool_call_id: str | None) -> str | None:
     return f"tool_{_limit_text(tool_call_id, _MAX_IDENTIFIER_CHARS - len('tool_'))}"
 
 
-def is_high_risk_phone_todo(todo: str) -> bool:
-    return any(marker in todo for marker in _HIGH_RISK_PHONE_TODO_MARKERS)
-
-
 def is_high_risk_tool(tool_name: str, args: dict[str, object]) -> bool:
     spec = display_spec_for(tool_name)
-    if spec["risk"] == "high":
-        return True
-    if tool_name != "execute_phone_todo":
-        return False
-    todo = args.get("todo")
-    return isinstance(todo, str) and is_high_risk_phone_todo(todo)
+    return spec["risk"] == "high"
 
 
 class TraceEmitter:
@@ -476,7 +453,6 @@ __all__ = [
     "clear_request_context",
     "current_context",
     "display_spec_for",
-    "is_high_risk_phone_todo",
     "is_high_risk_tool",
     "request_context",
     "tool_trace_step_id",

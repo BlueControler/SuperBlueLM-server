@@ -27,14 +27,6 @@ def test_factory_wires_main_agent_to_raw_phone_tools(
     monkeypatch.setattr(factory, "build_cloud_model", lambda: main_model)
     monkeypatch.setattr(factory, "create_system_tools", lambda gateway: [])
     monkeypatch.setattr(factory, "create_external_tools", lambda: [])
-    monkeypatch.setattr(
-        factory,
-        "PhoneSubagentRunner",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("phone subagent must not be built")
-        ),
-        raising=False,
-    )
 
     factory.build_agent(_Gateway(), _Gateway())
 

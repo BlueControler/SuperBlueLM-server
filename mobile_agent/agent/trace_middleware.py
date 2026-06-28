@@ -370,8 +370,6 @@ def _tool_call_summary(tool_name: str, spec: Mapping[str, Any]) -> str:
         return "滚动页面。"
     if tool_name in {"create_event", "update_event", "update_reminders"}:
         return "日程相关操作。"
-    if tool_name == "execute_phone_todo":
-        return "执行手机操作。"
     title = spec.get("title")
     return str(title) if isinstance(title, str) and title else "执行受控操作。"
 

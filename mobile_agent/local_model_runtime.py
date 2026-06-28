@@ -238,29 +238,6 @@ def build_cloud_model() -> ChatOpenAI | str:
     return "openai:gpt-5.4"
 
 
-def build_phone_subagent_model(main_cloud_model: ChatOpenAI | str) -> ChatOpenAI | str:
-    load_dotenv()
-    model_name = os.getenv("PHONE_SUBAGENT_MODEL")
-    if not model_name:
-        logger.warning(
-            "PHONE_SUBAGENT_MODEL is not configured; reusing the main model for phone structured output."
-        )
-        return main_cloud_model
-
-    api_key = os.getenv("PHONE_SUBAGENT_API_KEY") or os.getenv("OPENAI_API_KEY")
-    base_url = os.getenv("PHONE_SUBAGENT_BASE_URL") or None
-    max_tokens = int(os.getenv("PHONE_SUBAGENT_MAX_TOKENS", "2048"))
-    if api_key or base_url:
-        return ChatOpenAI(
-            api_key=SecretStr(api_key or "sk-local"),
-            base_url=base_url,
-            model=model_name,
-            max_tokens=max_tokens,  # type: ignore[call-arg]
-        )
-
-    return f"openai:{model_name}"
-
-
 def _resolve_server_binary(value: str | None) -> Path:
     if value:
         return Path(value).expanduser().resolve()
@@ -305,6 +282,5 @@ __all__ = [
     "DEFAULT_MODEL_REPO",
     "LocalModelRuntimeError",
     "build_cloud_model",
-    "build_phone_subagent_model",
     "model_runtime",
 ]
