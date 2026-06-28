@@ -279,11 +279,10 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
             )
         except asyncio.CancelledError:
             logger.info("mobile_run_stream_cancelled run_id={} thread_id={}", run_id, thread_id)
-            await _cancel_backend_and_device_run(
-                run_id,
-                headers=headers,
-                reason="stream_cancelled",
-            )
+            # Do not treat every proxy-task cancellation as a user cancellation.
+            # Android can drop and recreate the SSE connection while the native
+            # LangGraph run is still inside a tool call. Explicit stop and the
+            # execution timeout paths already cancel the upstream run.
             raise
         # 代理边界不允许把内部异常变成半截 SSE 响应；取消信号继承自
         # BaseException，不会被此处捕获，仍可正常终止请求。
@@ -349,9 +348,10 @@ def _with_mobile_run_config(raw: bytes, *, run_id: str, thread_id: str) -> bytes
     # 不再用 MOBILE_AGENT_MAX_RECURSION 覆盖它——移动端代理的超时安全网
     # 由 MOBILE_AGENT_MAX_EXECUTION_SECONDS 保证。
     payload["config"] = config
-    # LangGraph's stream API defaults to `continue`.  That leaves a tool run
-    # alive after the mobile SSE client has timed out or disconnected.
-    payload["on_disconnect"] = "cancel"
+    # Keep the native LangGraph run alive if the mobile SSE proxy disconnects.
+    # Explicit /cancel and execution timeout remain the authoritative cancel
+    # paths; otherwise long tool calls can be interrupted mid-flight.
+    payload["on_disconnect"] = "continue"
     # No task may silently sit behind a stale run on the same LangGraph
     # thread. The client must receive a deterministic rejection instead.
     payload["multitask_strategy"] = "reject"

@@ -65,16 +65,16 @@ def test_upstream_run_config_carries_the_client_owned_mobile_run_id() -> None:
     }
 
 
-def test_safe_stream_forces_langgraph_to_cancel_when_its_sse_client_disconnects() -> None:
+def test_safe_stream_keeps_langgraph_running_when_its_sse_client_disconnects() -> None:
     body = _with_mobile_run_config(
-        b'{"input":{"messages":[]},"on_disconnect":"continue"}',
+        b'{"input":{"messages":[]},"on_disconnect":"cancel"}',
         run_id="run-1",
         thread_id="thread-1",
     )
 
     payload = json.loads(body)
 
-    assert payload["on_disconnect"] == "cancel"
+    assert payload["on_disconnect"] == "continue"
 
 
 def test_safe_stream_rejects_concurrent_thread_runs_and_preserves_config(monkeypatch) -> None:

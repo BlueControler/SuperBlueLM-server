@@ -105,8 +105,8 @@ async def cancel_mobile_run(request: Request) -> JSONResponse:
 
     # Fence device commands before doing network I/O, but do not cancel the
     # proxy task until the native LangGraph cancellation request has been sent.
-    # The stream disconnect is a second cancellation path (`on_disconnect` is
-    # forced to `cancel` by safe_stream).
+    # safe_stream keeps disconnects from becoming implicit upstream cancels, so
+    # this explicit endpoint is the user-driven cancellation path.
     device_id = phone_action_registry.cancel_run(
         run_id,
         reason="user_cancelled",
