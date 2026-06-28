@@ -170,3 +170,5 @@ docs/
 .local/
 
 scripts/start-langgraph.sh
+
+agent_debug/
