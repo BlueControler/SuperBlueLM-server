@@ -20,7 +20,7 @@ def test_trace_stack_order_is_locked() -> None:
     )
 
     assert [type(item).__name__ for item in stack] == [
-        "ResetPhoneTodoMiddleware",
+        "ResetAgentRunStateMiddleware",
         "TraceMiddleware",
         "HighRiskActionGateMiddleware",
         "ModeToolAccessMiddleware",

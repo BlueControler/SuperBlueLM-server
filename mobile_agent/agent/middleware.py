@@ -155,6 +155,29 @@ def _message_content_to_text(content: Any) -> str:
     return ""
 
 
+class ResetAgentRunStateMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
+    state_schema = MobileAgentState
+
+    def before_agent(
+        self,
+        state: MobileAgentState,
+        runtime: Runtime[None],
+    ) -> dict[str, object]:
+        return {
+            "task_complexity_emitted": False,
+            "awaiting_user_action": False,
+            "awaiting_user_reason": "",
+            "run_failure_reason": "",
+        }
+
+    async def abefore_agent(
+        self,
+        state: MobileAgentState,
+        runtime: Runtime[None],
+    ) -> dict[str, object]:
+        return self.before_agent(state, runtime)
+
+
 class TaskComplexityMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
     state_schema = MobileAgentState
 
@@ -184,7 +207,7 @@ class TaskComplexityMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
 
 
 class DirectPhoneIntentMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
-    """Routes a pure known-app launch to the existing phone delegation tool."""
+    """Routes a pure known-app launch directly to the launch phone tool."""
 
     state_schema = MobileAgentState
 
@@ -207,21 +230,22 @@ class DirectPhoneIntentMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         launch = _simple_known_app_launch(_latest_human_text(request.messages))
         if launch is None:
             return None
-        final_response = _completed_phone_todo_response(request.state)
+        final_response = _completed_direct_launch_response(
+            request.state,
+            request.messages,
+            app_name=launch[0],
+        )
         if final_response is not None:
             return final_response
-        app_name, package = launch
+        _, package = launch
         return ModelResponse(
             result=[
                 AIMessage(
                     content="",
                     tool_calls=[
                         {
-                            "name": PHONE_DELEGATION_TOOL,
-                            "args": {
-                                "todo": f"打开{app_name}（包名 {package}）",
-                                "allow_short_chain": False,
-                            },
+                            "name": "launch",
+                            "args": {"package": package},
                             "id": f"direct_launch_{uuid4().hex}",
                             "type": "tool_call",
                         }
@@ -231,16 +255,25 @@ class DirectPhoneIntentMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         )
 
 
-def _completed_phone_todo_response(state: Mapping[str, Any]) -> ModelResponse[Any] | None:
-    steps = state.get("phone_todo_steps")
-    if not isinstance(steps, (list, tuple)) or not steps:
+def _completed_direct_launch_response(
+    state: Mapping[str, Any],
+    request_messages: list[BaseMessage],
+    *,
+    app_name: str,
+) -> ModelResponse[Any] | None:
+    state_messages = state.get("messages", ())
+    candidates: list[Any] = []
+    if isinstance(state_messages, (list, tuple)):
+        candidates.extend(state_messages)
+    candidates.extend(request_messages)
+    if not any(
+        isinstance(message, ToolMessage)
+        and message.name == "launch"
+        and getattr(message, "status", "success") != "error"
+        for message in candidates
+    ):
         return None
-    last_step = steps[-1]
-    if not isinstance(last_step, Mapping):
-        return None
-    summary = last_step.get("summary")
-    content = summary if isinstance(summary, str) and summary else "手机操作已完成。"
-    return ModelResponse(result=[AIMessage(content=content)])
+    return ModelResponse(result=[AIMessage(content=f"已发起打开{app_name}。")])
 
 
 def _simple_known_app_launch(text: str) -> tuple[str, str] | None:
@@ -421,12 +454,14 @@ class ModeToolAccessMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
     def _is_blocked(self, tool_name: str) -> bool:
         if tool_name in ALWAYS_BLOCKED_MAIN_TOOLS:
             return True
+        if tool_name == PHONE_DELEGATION_TOOL:
+            return True
         if model_runtime.status().get("mode") == "local":
-            return tool_name == PHONE_DELEGATION_TOOL or (
+            return (
                 tool_name in self.phone_tool_names
                 and tool_name not in LOCAL_ALLOWED_PHONE_TOOLS
             )
-        return tool_name in self.phone_tool_names
+        return False
 
     def _exceeds_local_phone_limit(self, request: ToolCallRequest) -> bool:
         tool_name = request.tool_call["name"]
@@ -457,8 +492,12 @@ class ModeToolAccessMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
     def _blocked_message(self, request: ToolCallRequest) -> ToolMessage:
         tool_name = request.tool_call["name"]
         mode = model_runtime.status().get("mode", "unknown")
+        if tool_name == PHONE_DELEGATION_TOOL:
+            content = f"Tool {tool_name!r} is deprecated and unavailable in {mode} mode. Use raw phone tools directly."
+        else:
+            content = f"Tool {tool_name!r} is unavailable in {mode} mode."
         return ToolMessage(
-            content=f"Tool {tool_name!r} is unavailable in {mode} mode.",
+            content=content,
             tool_call_id=request.tool_call["id"],
             name=tool_name,
             status="error",

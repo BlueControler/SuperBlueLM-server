@@ -96,11 +96,21 @@ def _tool_call_request(
     )
 
 
-def test_cloud_main_agent_sees_delegation_and_not_raw_phone_tools(
+def test_cloud_main_agent_sees_raw_phone_tools_and_not_delegation(
     monkeypatch: Any,
 ) -> None:
     assert _visible_tool_names(monkeypatch, mode="cloud") == [
-        "execute_phone_todo",
+        "observe",
+        "tap",
+        "type",
+        "launch",
+        "swipe",
+        "keyevent",
+        "back",
+        "home",
+        "wait",
+        "interact",
+        "take_over",
         "weather_query",
     ]
 
@@ -120,7 +130,7 @@ def test_local_main_agent_sees_raw_phone_tools_and_not_delegation(
     ]
 
 
-def test_cloud_main_agent_cannot_bypass_delegation_with_raw_phone_call(
+def test_cloud_main_agent_can_call_raw_phone_tool(
     monkeypatch: Any,
 ) -> None:
     monkeypatch.setattr(
@@ -131,15 +141,13 @@ def test_cloud_main_agent_cannot_bypass_delegation_with_raw_phone_call(
 
     result = middleware.wrap_tool_call(
         _tool_call_request("tap"),
-        lambda request: "unexpected",
+        lambda request: "ok",
     )
 
-    assert isinstance(result, ToolMessage)
-    assert result.status == "error"
-    assert "unavailable in cloud mode" in result.content
+    assert result == "ok"
 
 
-def test_local_main_agent_cannot_bypass_local_guardrail_with_delegation_call(
+def test_execute_phone_todo_is_blocked_in_local_mode(
     monkeypatch: Any,
 ) -> None:
     monkeypatch.setattr(
@@ -156,6 +164,23 @@ def test_local_main_agent_cannot_bypass_local_guardrail_with_delegation_call(
     assert isinstance(result, ToolMessage)
     assert result.status == "error"
     assert "unavailable in local mode" in result.content
+
+
+def test_execute_phone_todo_is_blocked_in_cloud_mode(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        "mobile_agent.agent.middleware.model_runtime.status",
+        lambda: {"mode": "cloud"},
+    )
+    middleware = ModeToolAccessMiddleware({"tap"})
+
+    result = middleware.wrap_tool_call(
+        _tool_call_request("execute_phone_todo"),
+        lambda request: "unexpected",
+    )
+
+    assert isinstance(result, ToolMessage)
+    assert result.status == "error"
+    assert "deprecated" in result.content
 
 
 def test_local_main_agent_cannot_call_high_risk_raw_phone_tool(monkeypatch: Any) -> None:

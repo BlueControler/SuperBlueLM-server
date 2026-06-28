@@ -139,6 +139,48 @@ def test_tool_call_emits_safe_call_args_and_result_details() -> None:
     assert "<node" not in combined
 
 
+
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("launch", {"package": "com.ss.android.lark"}),
+        ("tap", {"x": 120, "y": 240}),
+        ("type", {"text": "hello"}),
+        ("scroll", {"direction": "up", "distance": "medium"}),
+    ],
+)
+def test_raw_phone_tools_emit_safe_trace_steps(tool_name: str, args: dict[str, Any]) -> None:
+    events: list[dict[str, Any]] = []
+    middleware = TraceMiddleware(TraceEmitter(lambda: events.append))
+    state: dict[str, Any] = {"messages": []}
+    state.update(middleware.before_agent(state, SimpleNamespace(config={})) or {})
+
+    async def phone_handler(request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content='{"ok":true,"screenshot":"base64","ui":"<node password=\\"raw\\"/>"}',
+            tool_call_id=request.tool_call["id"],
+            name=tool_name,
+            status="success",
+        )
+
+    result = asyncio.run(
+        middleware.awrap_tool_call(_request(tool_name, state, args), phone_handler)
+    )
+
+    assert isinstance(result, ToolMessage)
+    tool_steps = [
+        event["step"]
+        for event in events
+        if event.get("event") == "step.upsert"
+        and event.get("step", {}).get("stepId") == "tool_call-1"
+    ]
+    assert tool_steps
+    assert tool_steps[-1]["kind"] in {"phone_action", "tool"}
+    assert tool_steps[-1]["visibleToUser"] is True
+    combined = "\n".join(str(event) for event in events)
+    assert "base64" not in combined
+    assert "<node" not in combined
+
 def test_execute_phone_todo_parent_step_can_receive_child_trace() -> None:
     events: list[dict[str, Any]] = []
     emitter = TraceEmitter(lambda: events.append)

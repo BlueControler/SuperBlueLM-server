@@ -340,6 +340,16 @@ async def _wait_for_replaced_session(
     raise AssertionError(f"session {device_id!r} was not replaced")
 
 
+async def _wait_for_close_call(socket: object, expected: tuple[int, str]) -> None:
+    for _ in range(50):
+        if getattr(socket, "close_calls", None) == [expected]:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(
+        f"expected close call {expected!r}, got {getattr(socket, 'close_calls', None)!r}"
+    )
+
+
 def test_device_gateway_rejects_duplicate_connection_without_replacing_active_session() -> None:
     async def run() -> None:
         gateway = DeviceGateway()
@@ -349,13 +359,10 @@ def test_device_gateway_rejects_duplicate_connection_without_replacing_active_se
 
         second_socket = _FakeWebSocket("/adb/device-1")
         second_task = asyncio.create_task(gateway.handler(second_socket))
-        await asyncio.sleep(0.01)
+        await _wait_for_close_call(second_socket, (1008, "device connection already active"))
 
         assert gateway.get_session("device-1") is first_session
         assert first_socket.close_calls == []
-        assert second_socket.close_calls == [
-            (1008, "device connection already active")
-        ]
 
         await first_socket.close()
         await asyncio.gather(first_task, second_task)
