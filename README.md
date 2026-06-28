@@ -4,7 +4,7 @@
 
 这个项目是一个 Android 手机远程操作服务端。
 
-它通过 WebSocket 与手机侧工具通信，并在服务端把手机能力包装成工具（observe、tap、swipe、type、keyevent 等）。云端模式下，主 agent 负责规划、验收和纠错，手机子 agent 负责把一条明确 TODO 转换成受限手机工具调用。
+它通过 WebSocket 与手机侧工具通信，并在服务端把手机能力包装成工具（observe、tap、swipe、type、keyevent 等）。云端模式下，主 agent 直接规划、调用手机工具、读取工具结果、验收和纠错。
 
 当前代码已按单设备模型实现：
 
@@ -17,25 +17,22 @@
 
 1. 手机操作客户端连接 `/adb`，首条消息发送 `connect`。
 2. 系统工具客户端连接 `/system`，提供应用列表、日程、提醒、定位等 API。
-3. 主 agent 直接调用系统工具和外部业务工具；手机 UI 操作通过 `execute_phone_todo` 委派给手机子 agent。
-4. 手机子 agent 仅持有手机工具，并在受限调用预算内执行当前 TODO。
-5. 手机端或系统工具端返回结果，服务端更新状态并继续下一步。
+3. 主 agent 直接调用手机工具、系统工具和外部业务工具。
+4. 手机端或系统工具端返回结果，服务端更新状态并继续下一步。
 
-## 多模型 Agent 架构
+## Agent 架构
 
 网络可用时：
 
 ```text
-主 agent -> execute_phone_todo -> 手机子 agent -> observe/tap/type/swipe 等手机工具
-主 agent -> 系统工具和外部业务工具
+主 agent -> observe/launch/tap/type/scroll/swipe/back/home/wait 等手机工具
+主 agent -> 系统工具
+主 agent -> 飞书、企业微信、地图、天气等外部业务工具
 ```
 
-- 主 agent 使用云端强模型，负责维护计划、创建或修正 TODO、检查执行结果并决定是否结束。
-- 手机子 agent 使用独立可配置模型，只执行一条明确手机 TODO。
-- `allow_short_chain=false` 时，子 agent 默认只执行一个手机工具调用。
-- `allow_short_chain=true` 时，子 agent 可以执行少量确定性连续动作，但仍受调用预算限制。
-- 手机子 agent 不持有系统、飞书、企业微信、地图或天气工具。
-- 云端主 agent 看不到底层手机工具，不能绕过 `execute_phone_todo`。
+- 主 agent 使用云端强模型，负责维护计划、调用一个合适工具、读取返回结果、修正偏差并决定是否结束。
+- 手机 UI 操作不再经过子 agent；`execute_phone_todo` 是废弃工具名，生产 agent 不暴露它，运行时也会显式阻断。
+- 系统工具和外部业务工具由主 agent 直接调用，避免把天气、日程、飞书等结果丢在委派链路里。
 
 网络断开时：
 
@@ -43,18 +40,7 @@
 本地 llama.cpp 模型 -> 每个用户请求至多一次低风险手机工具调用
 ```
 
-离线模式不会启动复杂的主子 agent 循环。服务端只暴露 `observe`、`tap`、`back`、`home`、`wait`、`interact` 和 `take_over`，并拒绝同一请求中的第二次或并行手机动作。多步骤、高风险或不确定任务仍会停止并要求用户确认或交还给更强模型。
-
-手机子 agent 环境变量：
-
-- `PHONE_SUBAGENT_MODEL`: 子 agent 模型名称；为空时复用主云端模型。
-- `PHONE_SUBAGENT_BASE_URL`: 可选 OpenAI-compatible 子模型地址。
-- `PHONE_SUBAGENT_API_KEY`: 子模型 API key；为空时回退 `OPENAI_API_KEY`。
-- `PHONE_SUBAGENT_MAX_TOKENS`: 子模型最大输出 token，默认 `2048`。
-- `PHONE_SUBAGENT_MAX_TOOL_CALLS`: 普通 TODO 最大手机工具调用数，默认 `1`。
-- `PHONE_SUBAGENT_SHORT_CHAIN_MAX_TOOL_CALLS`: 确定性短链最大手机工具调用数，默认 `4`。
-
-`PHONE_SUBAGENT_BASE_URL` 只能指向可信服务。子 agent 为执行页面操作会接收最新截图和 UI 树；服务端会在调用子模型前拒绝包含密码、token、cookie、session 或授权头等敏感值的 TODO，并返回 `needs_user_action` 交由用户接管。
+离线模式不会执行复杂多步自动化。服务端只暴露 `observe`、`tap`、`back`、`home`、`wait`、`interact` 和 `take_over`，并拒绝同一请求中的第二次或并行手机动作。多步骤、高风险或不确定任务仍会停止并要求用户确认或交还给更强模型。
 
 ## 部署
 
@@ -140,6 +126,20 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:2024/network/status -Conten
 ```bash
 langgraph dev
 ```
+
+真机要从手机访问电脑上的服务端时，建议显式监听局域网地址：
+
+```bash
+langgraph dev --host 0.0.0.0 --port 2024
+```
+
+然后在 Windows PowerShell 中运行连接检查脚本：
+
+```powershell
+.\scripts\setup_phone_connection.ps1
+```
+
+脚本会检查 `2024` 端口监听、本机局域网访问地址、防火墙规则和 ADB 设备。若手机通过 USB 调试连接且已授权，脚本会自动配置 `adb reverse tcp:2024 tcp:2024`，此时 Android App 的服务地址填 `http://127.0.0.1:2024`。如果走同一 Wi-Fi/LAN 直连，服务地址填脚本输出的 `http://<电脑局域网IP>:2024`；校园网或公共 Wi-Fi 可能禁止同网设备互访，此时优先使用 USB 反向代理。
 
 ## Nginx 端口转发
 

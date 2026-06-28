@@ -23,21 +23,23 @@ The request must include `custom` in `stream_mode`:
 }
 ```
 
-`on_disconnect` must be `cancel`. Agent Server defaults to `continue`, which
-allows the old run to keep executing after the frontend stream disconnects.
+`on_disconnect` must be `continue`. Explicit `/cancel` and server execution
+timeout are the cancellation paths; a dropped frontend stream must not interrupt
+a backend tool call.
 
 ## Message Rendering Rules
 
 `messages-tuple` contains both assistant messages and internal tool messages.
 Chat bubbles must render assistant/AI messages only and must not display raw
-`ToolMessage.content`. For example, `execute_phone_todo` returns internal JSON
-containing `status`, `phoneState`, `toolCallCount`, and `error`; this payload is
-for main-agent planning and is not a user-facing final response.
+`ToolMessage.content`. For example, phone, system, and external tools can return
+structured JSON that is only for main-agent planning and is not a user-facing
+final response.
 
-Tool execution state should be rendered from `custom.task_progress`. If a run
-ends after a device disconnect without a final assistant message, map
-`device_not_connected` to a friendly reconnect message instead of displaying
-the raw tool JSON.
+Tool execution state should be rendered from `trace.v1`, with
+`custom.task_progress` treated as auxiliary bounded status when present. If a
+run ends after a device disconnect without a final assistant message, map
+`device_not_connected` to a friendly reconnect message instead of displaying the
+raw tool JSON.
 
 The Android frontend already sends this stream mode from:
 
@@ -139,28 +141,19 @@ SuperBlueLM-server\mobile_agent\progress.py
 
 Current wrapped tool groups:
 
-- main-agent phone TODO delegation: `mobile_agent/agent/phone_delegation.py`
 - phone tools: `mobile_agent/tools/phone.py`
 - system tools: `mobile_agent/tools/system.py`
 - external tools: `mobile_agent/tools/external.py`
 
 The helper uses LangGraph `get_stream_writer()`. If a tool runs outside a stream context, progress emission is skipped and the tool continues normally.
 
-### Main-Agent TODO Progress
+### Tool Progress
 
-Cloud-mode phone UI operations are delegated through `execute_phone_todo`.
-Delegation emits `task_progress` with `phase=agent` before and after each phone
-TODO. Atomic `phone_tool` progress is still emitted inside the child execution.
-
-The main agent can append a corrected TODO after observing a failure or an
-unexpected page:
-
-- `progressKey` identifies one TODO row, for example `phone-todo-2`.
-- `currentStep` is the TODO currently executing.
-- `totalSteps` is the number of TODO items currently known by the backend. It may
-  grow while the main agent extends or corrects its plan.
-- `completedSteps` lists completed TODO summaries.
-- A failed TODO remains visible when a corrected TODO is appended.
+Cloud-mode phone UI operations are direct main-agent tool calls. The frontend
+should use `trace.v1` step events as the canonical execution process view.
+Atomic `phone_tool`, `system_tool`, and external tool progress can still be
+emitted by individual tool wrappers when they have additional bounded status to
+show.
 
 ## Frontend Consumption Points
 

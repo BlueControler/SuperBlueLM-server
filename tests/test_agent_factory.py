@@ -7,19 +7,17 @@ from mobile_agent.agent.middleware import (
     ModeToolAccessMiddleware,
     SyncPhoneStateMiddleware,
 )
-from mobile_agent.agent.phone_delegation import ResetPhoneTodoMiddleware
 
 
 class _Gateway:
     pass
 
 
-def test_factory_wires_main_agent_to_restricted_phone_subagent(
+def test_factory_wires_main_agent_to_raw_phone_tools(
     monkeypatch: Any,
 ) -> None:
     captured: dict[str, Any] = {}
     main_model = object()
-    phone_model = object()
 
     def fake_create_deep_agent(**kwargs: Any) -> object:
         captured.update(kwargs)
@@ -27,11 +25,6 @@ def test_factory_wires_main_agent_to_restricted_phone_subagent(
 
     monkeypatch.setattr(factory, "create_deep_agent", fake_create_deep_agent)
     monkeypatch.setattr(factory, "build_cloud_model", lambda: main_model)
-    monkeypatch.setattr(
-        factory,
-        "build_phone_subagent_model",
-        lambda model: phone_model,
-    )
     monkeypatch.setattr(factory, "create_system_tools", lambda gateway: [])
     monkeypatch.setattr(factory, "create_external_tools", lambda: [])
 
@@ -43,10 +36,10 @@ def test_factory_wires_main_agent_to_restricted_phone_subagent(
         "tap",
         "type",
         "launch",
-        "execute_phone_todo",
     }
+    assert "execute_phone_todo" not in {tool.name for tool in captured["tools"]}
     assert any(
-        isinstance(item, ResetPhoneTodoMiddleware)
+        item.__class__.__name__ == "ResetAgentRunStateMiddleware"
         for item in captured["middleware"]
     )
     assert any(

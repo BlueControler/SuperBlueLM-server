@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timedelta, timezone, tzinfo
 import os
+import re
 from typing import Any, TypeAlias, cast
+from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
@@ -64,6 +66,13 @@ LOCAL_ALLOWED_PHONE_TOOLS = frozenset(
         "take_over",
     }
 )
+_DIRECT_APP_LAUNCHES = {
+    "微信": "com.tencent.mm",
+    "wechat": "com.tencent.mm",
+    "飞书": "com.ss.android.lark",
+    "lark": "com.ss.android.lark",
+}
+_LAUNCH_TRAILING_PUNCTUATION = " \t\r\n，。,.、:：;；!！?？）)]}】'\"”’"
 
 
 def _agent_timezone() -> tzinfo:
@@ -146,6 +155,29 @@ def _message_content_to_text(content: Any) -> str:
     return ""
 
 
+class ResetAgentRunStateMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
+    state_schema = MobileAgentState
+
+    def before_agent(
+        self,
+        state: MobileAgentState,
+        runtime: Runtime[None],
+    ) -> dict[str, object]:
+        return {
+            "task_complexity_emitted": False,
+            "awaiting_user_action": False,
+            "awaiting_user_reason": "",
+            "run_failure_reason": "",
+        }
+
+    async def abefore_agent(
+        self,
+        state: MobileAgentState,
+        runtime: Runtime[None],
+    ) -> dict[str, object]:
+        return self.before_agent(state, runtime)
+
+
 class TaskComplexityMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
     state_schema = MobileAgentState
 
@@ -172,6 +204,93 @@ class TaskComplexityMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         runtime: Runtime[None],
     ) -> dict[str, bool] | None:
         return self.before_model(state, runtime)
+
+
+class DirectPhoneIntentMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
+    """Routes a pure known-app launch directly to the launch phone tool."""
+
+    state_schema = MobileAgentState
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: ModelHandler,
+    ) -> ModelResponse[Any]:
+        return self._direct_response(request) or handler(request)
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: AsyncModelHandler,
+    ) -> ModelResponse[Any]:
+        response = self._direct_response(request)
+        return response if response is not None else await handler(request)
+
+    def _direct_response(self, request: ModelRequest[Any]) -> ModelResponse[Any] | None:
+        launch = _simple_known_app_launch(_latest_human_text(request.messages))
+        if launch is None:
+            return None
+        final_response = _completed_direct_launch_response(
+            request.state,
+            request.messages,
+            app_name=launch[0],
+        )
+        if final_response is not None:
+            return final_response
+        _, package = launch
+        return ModelResponse(
+            result=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "launch",
+                            "args": {"package": package},
+                            "id": f"direct_launch_{uuid4().hex}",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        )
+
+
+def _completed_direct_launch_response(
+    state: Mapping[str, Any],
+    request_messages: list[BaseMessage],
+    *,
+    app_name: str,
+) -> ModelResponse[Any] | None:
+    state_messages = state.get("messages", ())
+    candidates: list[Any] = []
+    if isinstance(state_messages, (list, tuple)):
+        candidates.extend(state_messages)
+    candidates.extend(request_messages)
+    if not any(
+        isinstance(message, ToolMessage)
+        and message.name == "launch"
+        and getattr(message, "status", "success") != "error"
+        for message in candidates
+    ):
+        return None
+    return ModelResponse(result=[AIMessage(content=f"已发起打开{app_name}。")])
+
+
+def _simple_known_app_launch(text: str) -> tuple[str, str] | None:
+    action = re.search(r"(?:打开|启动|launch|open)", text, re.IGNORECASE)
+    if action is None:
+        return None
+    after_action = text[action.end() :].strip()
+    for app_name, package in _DIRECT_APP_LAUNCHES.items():
+        match = re.search(re.escape(app_name), after_action, re.IGNORECASE)
+        if match is None:
+            continue
+        trailing = after_action[match.end() :]
+        trailing = re.sub(r"^(?:应用|app)", "", trailing, flags=re.IGNORECASE)
+        if trailing.strip(_LAUNCH_TRAILING_PUNCTUATION):
+            continue
+        return app_name, package
+    return None
 
 
 class SyncPhoneStateMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
@@ -335,12 +454,14 @@ class ModeToolAccessMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
     def _is_blocked(self, tool_name: str) -> bool:
         if tool_name in ALWAYS_BLOCKED_MAIN_TOOLS:
             return True
+        if tool_name == PHONE_DELEGATION_TOOL:
+            return True
         if model_runtime.status().get("mode") == "local":
-            return tool_name == PHONE_DELEGATION_TOOL or (
+            return (
                 tool_name in self.phone_tool_names
                 and tool_name not in LOCAL_ALLOWED_PHONE_TOOLS
             )
-        return tool_name in self.phone_tool_names
+        return False
 
     def _exceeds_local_phone_limit(self, request: ToolCallRequest) -> bool:
         tool_name = request.tool_call["name"]
@@ -371,8 +492,12 @@ class ModeToolAccessMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
     def _blocked_message(self, request: ToolCallRequest) -> ToolMessage:
         tool_name = request.tool_call["name"]
         mode = model_runtime.status().get("mode", "unknown")
+        if tool_name == PHONE_DELEGATION_TOOL:
+            content = f"Tool {tool_name!r} is deprecated and unavailable in {mode} mode. Use raw phone tools directly."
+        else:
+            content = f"Tool {tool_name!r} is unavailable in {mode} mode."
         return ToolMessage(
-            content=f"Tool {tool_name!r} is unavailable in {mode} mode.",
+            content=content,
             tool_call_id=request.tool_call["id"],
             name=tool_name,
             status="error",

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Annotated, Literal
+from typing import Annotated
 
 from langchain.agents.middleware.types import AgentState, PrivateStateAttr
 from langchain_core.messages import HumanMessage
@@ -23,22 +23,16 @@ class PhoneSnapshot(TypedDict):
     activity: str | None
 
 
-class PhoneTodoStep(TypedDict):
-    index: int
-    progressKey: str
-    name: str
-    status: Literal["completed", "failed"]
-    summary: str
-
-
 class MobileAgentState(AgentState[object], total=False):
     device_id: NotRequired[str]
     deviceId: NotRequired[str]
     phone_snapshot: NotRequired[Annotated[PhoneSnapshot | None, PrivateStateAttr]]
     task_complexity_emitted: NotRequired[Annotated[bool, PrivateStateAttr]]
-    phone_todo_steps: NotRequired[
-        Annotated[tuple[PhoneTodoStep, ...], PrivateStateAttr]
-    ]
+    awaiting_user_action: NotRequired[Annotated[bool, PrivateStateAttr]]
+    awaiting_user_reason: NotRequired[Annotated[str, PrivateStateAttr]]
+    run_failure_reason: NotRequired[Annotated[str, PrivateStateAttr]]
+    trace_run_id: NotRequired[Annotated[str, PrivateStateAttr]]
+    trace_analysis_step_id: NotRequired[Annotated[str, PrivateStateAttr]]
 
 
 def device_id_from_mapping(value: object) -> str | None:

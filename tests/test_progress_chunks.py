@@ -5,8 +5,11 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from mobile_agent import progress
 from mobile_agent.gateways.phone import DeviceGatewayError
+from mobile_agent.trace import clear_request_context
 from mobile_agent.tools.external import create_external_tools
 from mobile_agent.tools.phone import create_phone_tools
 from mobile_agent.tools.system import create_system_tools
@@ -62,6 +65,13 @@ class _FakeSystemGateway:
         return self.client
 
 
+@pytest.fixture(autouse=True)
+def _clear_trace_context_between_tests() -> None:
+    clear_request_context()
+    yield
+    clear_request_context()
+
+
 def test_emit_task_progress_writes_custom_payload(monkeypatch: Any) -> None:
     emitted: list[dict[str, Any]] = []
 
@@ -115,13 +125,28 @@ def test_phone_tool_emits_started_and_completed_progress(monkeypatch: Any) -> No
 
     asyncio.run(tools["tap"].ainvoke({"x": 10, "y": 20}))
 
-    assert gateway.session.calls == [("tap", {"x": 10, "y": 20})]
+    _assert_controlled_call(gateway.session.calls, "tap", {"x": 10, "y": 20})
     assert emitted[0]["type"] == "task_progress"
     assert emitted[0]["label"] == "tap"
     assert emitted[0]["status"] == "running"
     assert emitted[0]["phase"] == "phone_tool"
     assert emitted[-1]["label"] == "tap"
     assert emitted[-1]["status"] == "completed"
+
+
+def _assert_controlled_call(
+    calls: list[tuple[str, dict[str, Any]]],
+    expected_command: str,
+    expected_payload: dict[str, Any],
+) -> None:
+    assert len(calls) == 1
+    command, payload = calls[0]
+    assert command == expected_command
+    assert {key: payload[key] for key in expected_payload} == expected_payload
+    assert isinstance(payload["runId"], str) and payload["runId"]
+    assert isinstance(payload["actionId"], str) and payload["actionId"]
+    assert payload["actionIndex"] == 1
+    assert isinstance(payload["deadlineEpochMs"], int)
 
 
 def test_phone_tool_routes_to_explicit_device_id() -> None:
@@ -139,17 +164,11 @@ def test_scroll_uses_device_relative_safe_area_coordinates() -> None:
 
     asyncio.run(tools["scroll"].ainvoke({"direction": "up", "distance": "medium"}))
 
-    assert gateway.session.calls == [
-        (
-            "swipe",
-            {
-                "startX": 540,
-                "startY": 1800,
-                "endX": 540,
-                "endY": 600,
-            },
-        )
-    ]
+    _assert_controlled_call(
+        gateway.session.calls,
+        "swipe",
+        {"startX": 540, "startY": 1800, "endX": 540, "endY": 600},
+    )
 
 
 def test_scroll_adapts_to_different_device_dimensions() -> None:
@@ -159,17 +178,11 @@ def test_scroll_adapts_to_different_device_dimensions() -> None:
 
     asyncio.run(tools["scroll"].ainvoke({"direction": "down", "distance": "short"}))
 
-    assert gateway.session.calls == [
-        (
-            "swipe",
-            {
-                "startX": 720,
-                "startY": 1120,
-                "endX": 720,
-                "endY": 2080,
-            },
-        )
-    ]
+    _assert_controlled_call(
+        gateway.session.calls,
+        "swipe",
+        {"startX": 720, "startY": 1120, "endX": 720, "endY": 2080},
+    )
 
 
 def test_bound_phone_tool_rejects_device_id_override() -> None:

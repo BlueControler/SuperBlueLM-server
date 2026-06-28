@@ -1,4 +1,4 @@
-from setup import deploy_actions
+from scripts.setup import deploy_actions
 
 
 def _actions(profile: str) -> list[str]:
