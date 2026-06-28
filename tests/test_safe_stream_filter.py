@@ -68,11 +68,86 @@ def test_filter_strips_think_across_chunks_and_keeps_safe_answer_text() -> None:
     third = stream.feed(
         SseFrame(event="messages-tuple", data=_assistant_payload("回答"))
     )
+    stream.feed(_terminal_trace(status="succeeded", seq=1))
     completed = stream.finish()
 
     chunks = [frame.data["chunk"] for frame in [*first, *second, *third, *completed] if frame.event == "assistant.delta"]
     assert "".join(chunks) == "最终回答"
     assert all("private" not in chunk and "abc" not in chunk for chunk in chunks)
+
+
+def test_filter_buffers_assistant_text_until_stream_finish() -> None:
+    stream = SafeStreamFilter()
+
+    frames = stream.feed(
+        SseFrame(event="messages-tuple", data=_assistant_payload("Final answer"))
+    )
+    stream.feed(_terminal_trace(status="succeeded", seq=1))
+    completed = stream.finish()
+
+    assert frames == []
+    assert [frame.event for frame in completed] == ["assistant.delta", "stream.eof"]
+    assert completed[0].data["chunk"] == "Final answer"
+
+
+def test_filter_discards_intermediate_assistant_text_when_tool_step_arrives() -> None:
+    stream = SafeStreamFilter()
+    frames = [
+        *stream.feed(
+            SseFrame(
+                event="messages-tuple",
+                data=_assistant_payload("I need to call the weather tool."),
+            )
+        ),
+        *stream.feed(_tool_step_trace(status="running", seq=1)),
+        *stream.feed(_tool_step_trace(status="succeeded", seq=2)),
+        *stream.feed(
+            SseFrame(
+                event="messages-tuple",
+                data=_assistant_payload("Weather result is ready."),
+            )
+        ),
+        *stream.feed(_terminal_trace(status="succeeded", seq=3)),
+        *stream.finish(),
+    ]
+
+    assistant_chunks = [
+        frame.data["chunk"]
+        for frame in frames
+        if frame.event == "assistant.delta"
+    ]
+    combined = json.dumps([frame.data for frame in frames], ensure_ascii=False)
+    assert assistant_chunks == ["Weather result is ready."]
+    assert "I need to call the weather tool" not in combined
+
+
+def test_filter_drops_structured_reasoning_blocks_and_keeps_public_text() -> None:
+    stream = SafeStreamFilter()
+    payload = [
+        {
+            "type": "ai",
+            "content": [
+                {"type": "reasoning", "text": "private chain token=secret"},
+                {"type": "thinking", "text": "private thought"},
+                {"type": "text", "text": "Final"},
+                {"type": "output_text", "text": " answer"},
+            ],
+            "additional_kwargs": {
+                "reasoning_content": "private additional reasoning",
+            },
+        },
+        {"langgraph_node": "model", "checkpoint_ns": "model:reasoning"},
+    ]
+
+    frames = stream.feed(SseFrame(event="messages-tuple", data=json.dumps(payload)))
+    stream.feed(_terminal_trace(status="succeeded", seq=1))
+    completed = stream.finish()
+
+    assert frames == []
+    assert completed[0].event == "assistant.delta"
+    assert completed[0].data["chunk"] == "Final answer"
+    assert "private" not in json.dumps(completed[0].data)
+    assert "secret" not in json.dumps(completed[0].data)
 
 
 def test_filter_forwards_only_safe_trace_fields_with_a_bounded_payload() -> None:
@@ -226,15 +301,41 @@ def test_filter_forwards_legacy_progress_without_unknown_fields() -> None:
     }
 
 
+def test_filter_forwards_task_complexity_without_unknown_fields() -> None:
+    stream = SafeStreamFilter()
+    payload = {
+        "type": "task_complexity",
+        "complexity": "simple",
+        "trackSteps": False,
+        "reason": "zero_or_one_tool_call",
+        "message": "Short task: skip step tracking",
+        "rawPrompt": "token=secret",
+    }
+
+    frames = stream.feed(SseFrame(event="custom", data=json.dumps(payload)))
+
+    assert len(frames) == 1
+    assert frames[0].event == "task_complexity"
+    assert frames[0].data == {
+        "type": "task_complexity",
+        "complexity": "simple",
+        "trackSteps": False,
+        "reason": "zero_or_one_tool_call",
+        "message": "Short task: skip step tracking",
+    }
+
+
 def test_filter_limits_each_assistant_event_below_four_kib() -> None:
     stream = SafeStreamFilter()
 
     frames = stream.feed(
         SseFrame(event="messages-tuple", data=_assistant_payload("中" * 10_000))
     )
+    stream.feed(_terminal_trace(status="succeeded", seq=1))
+    completed = stream.finish()
 
-    assert len(frames) == 1
-    assert len(json.dumps(frames[0].data, ensure_ascii=False).encode("utf-8")) <= MAX_TRACE_EVENT_BYTES
+    assert frames == []
+    assert len(json.dumps(completed[0].data, ensure_ascii=False).encode("utf-8")) <= MAX_TRACE_EVENT_BYTES
 
 
 def _assistant_payload(text: str) -> str:
@@ -242,6 +343,47 @@ def _assistant_payload(text: str) -> str:
         {"type": "ai", "content": text},
         {"langgraph_node": "model", "checkpoint_ns": "model:1"},
     ])
+
+
+def _tool_step_trace(*, status: str, seq: int) -> SseFrame:
+    return SseFrame(
+        event="custom",
+        data=json.dumps(
+            {
+                "type": "trace.v1",
+                "version": 1,
+                "runId": "run-1",
+                "eventId": f"event-{seq}",
+                "seq": seq,
+                "event": "step.upsert",
+                "step": {
+                    "stepId": "tool-1",
+                    "kind": "tool",
+                    "title": "Weather tool",
+                    "summary": "Tool status changed.",
+                    "status": status,
+                    "visibleToUser": True,
+                },
+            }
+        ),
+    )
+
+
+def _terminal_trace(*, status: str, seq: int) -> SseFrame:
+    return SseFrame(
+        event="custom",
+        data=json.dumps(
+            {
+                "type": "trace.v1",
+                "version": 1,
+                "runId": "run-1",
+                "eventId": f"event-{seq}",
+                "seq": seq,
+                "event": "run.terminal",
+                "status": status,
+            }
+        ),
+    )
 
 
 def _detail_payload(

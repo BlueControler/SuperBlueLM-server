@@ -244,7 +244,6 @@ def test_safe_stream_does_not_turn_a_missing_terminal_into_success(monkeypatch) 
     # 修复后：有 text 但无 terminal → 发 stream.error + run.terminal(interrupted)
     assert [event for event, _ in frames] == [
         "stream.started",
-        "assistant.delta",
         "stream.error",
         "trace.v1",
     ]

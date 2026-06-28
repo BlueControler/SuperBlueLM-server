@@ -36,6 +36,8 @@ _SENSITIVE_VALUE = re.compile(
 _IMAGE_DATA = re.compile(r"data:image/[^;\s]+;base64,[A-Za-z0-9+/=]+", re.IGNORECASE)
 _VERIFICATION_CODE = re.compile(r"验证码\s*[:=：]?\s*[A-Za-z0-9]{0,16}")
 _RUN_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+_PUBLIC_TEXT_BLOCK_TYPES = frozenset({"text", "output_text", "input_text"})
+_REASONING_BLOCK_TOKENS = ("reasoning", "thinking", "thought")
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,8 @@ class SafeStreamFilter:
         self.terminal_status: str | None = None
         self._has_any_text = False
         self._has_trace_event = False
+        self._pending_assistant_chunks: list[str] = []
+        self._pending_assistant_invocation_id: str | None = None
 
     @property
     def has_any_text(self) -> bool:
@@ -71,13 +75,17 @@ class SafeStreamFilter:
     def feed(self, upstream_event: SseFrame) -> list[SafeSseFrame]:
         event = upstream_event.event.lower()
         if "messages" in event:
+            if _assistant_has_tool_call_signal(upstream_event.data):
+                self._discard_pending_assistant_text()
+                return []
             text, invocation_id = _assistant_text(upstream_event.data)
             if text is None:
                 return []
             safe_text = _sanitize_assistant_text(self._think.feed(text))
             if safe_text:
                 self._has_any_text = True
-            return [_assistant_delta(safe_text, invocation_id)] if safe_text else []
+                self._append_pending_assistant_text(safe_text, invocation_id)
+            return []
         if "custom" not in event:
             return []
         payload = _json_object(upstream_event.data)
@@ -86,6 +94,8 @@ class SafeStreamFilter:
         payload_type = payload.get("type")
         if payload_type == "trace.v1":
             safe = _safe_trace_payload(payload)
+            if _starts_non_summary_step(safe):
+                self._discard_pending_assistant_text()
             if safe is not None and safe.get("event") == "run.terminal":
                 status = safe.get("status")
                 self.terminal_status = status if isinstance(status, str) else None
@@ -94,14 +104,50 @@ class SafeStreamFilter:
             return [SafeSseFrame("trace.v1", safe)] if safe is not None else []
         if payload_type == "task_progress":
             safe = _safe_progress_payload(payload)
+            if _starts_non_analysis_progress(safe):
+                self._discard_pending_assistant_text()
             return [SafeSseFrame("task_progress", safe)] if safe is not None else []
+        if payload_type == "task_complexity":
+            safe = _safe_task_complexity_payload(payload)
+            return [SafeSseFrame("task_complexity", safe)] if safe is not None else []
         return []
 
     def finish(self) -> list[SafeSseFrame]:
         pending = _sanitize_assistant_text(self._think.finish())
-        frames = [_assistant_delta(pending, None)] if pending else []
+        if pending:
+            self._append_pending_assistant_text(
+                pending,
+                self._pending_assistant_invocation_id,
+            )
+        final_text = "".join(self._pending_assistant_chunks)
+        frames = (
+            [_assistant_delta(final_text, self._pending_assistant_invocation_id)]
+            if final_text and self.terminal_status == "succeeded"
+            else []
+        )
+        self._discard_pending_assistant_text()
         frames.append(SafeSseFrame("stream.eof", {"type": "stream.eof"}))
         return frames
+
+    def _append_pending_assistant_text(
+        self,
+        text: str,
+        invocation_id: str | None,
+    ) -> None:
+        if (
+            invocation_id
+            and self._pending_assistant_invocation_id
+            and invocation_id != self._pending_assistant_invocation_id
+        ):
+            self._discard_pending_assistant_text()
+        if invocation_id:
+            self._pending_assistant_invocation_id = invocation_id
+        self._pending_assistant_chunks.append(text)
+
+    def _discard_pending_assistant_text(self) -> None:
+        self._think = _ThinkStripper()
+        self._pending_assistant_chunks = []
+        self._pending_assistant_invocation_id = None
 
 
 async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
@@ -592,6 +638,19 @@ def _assistant_text(raw: str) -> tuple[str | None, str | None]:
     return text, invocation_id
 
 
+def _assistant_has_tool_call_signal(raw: str) -> bool:
+    payload = _json_value(raw)
+    message: Mapping[str, Any] | None = None
+    if isinstance(payload, list) and payload:
+        message = payload[0] if isinstance(payload[0], Mapping) else None
+    elif isinstance(payload, Mapping):
+        message = payload
+    if message is None:
+        return False
+    kwargs = message.get("kwargs") if isinstance(message.get("kwargs"), Mapping) else {}
+    return _has_tool_call_signal(message, kwargs)
+
+
 def _has_tool_call_signal(message: Mapping[str, Any], kwargs: Mapping[str, Any]) -> bool:
     additional_kwargs = _mapping_value(message, "additional_kwargs")
     response_metadata = _mapping_value(message, "response_metadata")
@@ -626,17 +685,41 @@ def _content_to_text(value: object) -> str:
     if isinstance(value, list):
         parts: list[str] = []
         for item in value:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, Mapping):
-                text = item.get("text") or item.get("content")
-                if isinstance(text, str):
-                    parts.append(text)
+            text = _content_block_to_public_text(item)
+            if text:
+                parts.append(text)
         return "".join(parts)
-    if isinstance(value, Mapping):
-        text = value.get("text") or value.get("content")
-        return text if isinstance(text, str) else ""
+    return _content_block_to_public_text(value)
+
+
+def _content_block_to_public_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, Mapping):
+        return ""
+    block_type = _normalized_block_type(value)
+    if _is_reasoning_block_type(block_type):
+        return ""
+    if block_type and block_type not in _PUBLIC_TEXT_BLOCK_TYPES:
+        return ""
+    text = value.get("text")
+    if isinstance(text, str):
+        return text
+    content = value.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return _content_to_text(content)
     return ""
+
+
+def _normalized_block_type(value: Mapping[str, Any]) -> str:
+    raw_type = value.get("type") or value.get("kind")
+    return str(raw_type).strip().lower().replace("-", "_") if raw_type else ""
+
+
+def _is_reasoning_block_type(block_type: str) -> bool:
+    return any(token in block_type for token in _REASONING_BLOCK_TOKENS)
 
 
 def _safe_trace_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -750,6 +833,45 @@ def _safe_progress_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
         if isinstance(value, int) and value >= 0:
             safe[key] = value
     return _fit_payload(safe)
+
+
+def _safe_task_complexity_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    complexity = payload.get("complexity")
+    track_steps = payload.get("trackSteps")
+    reason = payload.get("reason")
+    if complexity not in {"simple", "complex"}:
+        return None
+    if not isinstance(track_steps, bool):
+        return None
+    if not isinstance(reason, str) or not reason:
+        return None
+    safe: dict[str, Any] = {
+        "type": "task_complexity",
+        "complexity": complexity,
+        "trackSteps": track_steps,
+        "reason": _bounded(reason, 64),
+    }
+    message = payload.get("message")
+    if isinstance(message, str) and message:
+        safe["message"] = _safe_description(message, MAX_TRACE_SUMMARY_CHARS)
+    return _fit_payload(safe)
+
+
+def _starts_non_summary_step(payload: Mapping[str, Any] | None) -> bool:
+    if payload is None or payload.get("event") != "step.upsert":
+        return False
+    step = payload.get("step")
+    return (
+        isinstance(step, Mapping)
+        and step.get("status") == "running"
+        and step.get("kind") != "summary"
+    )
+
+
+def _starts_non_analysis_progress(payload: Mapping[str, Any] | None) -> bool:
+    if payload is None:
+        return False
+    return payload.get("status") == "running" and payload.get("phase") != "analysis"
 
 
 def _assistant_delta(text: str, invocation_id: str | None) -> SafeSseFrame:
