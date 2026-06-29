@@ -14,6 +14,8 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
 from .action_control import phone_action_registry
+from .asr.config import DEFAULT_MAX_AUDIO_BYTES, AsrConfigError
+from .asr.provider import AliyunNlsProvider, AsrProviderError, AsrRequest
 from .gateways.phone import DeviceGatewayError
 from .gateways.system import SystemGatewayError
 from .local_model_runtime import LocalModelRuntimeError, model_runtime
@@ -97,11 +99,132 @@ async def network_status(request: Request) -> JSONResponse:
     return JSONResponse(model_runtime.status())
 
 
+def asr_provider_factory() -> AliyunNlsProvider:
+    """创建 ASR provider（配置由 load_aliyun_nls_config 缓存，无 I/O）。"""
+    return AliyunNlsProvider()
+
+
+async def transcribe_audio(request: Request) -> JSONResponse:
+    try:
+        form = await request.form()
+    except Exception:
+        return JSONResponse(
+            {"error": "invalid_multipart", "message": "请使用 multipart/form-data 上传音频。"},
+            status_code=400,
+        )
+
+    upload = form.get("audio")
+    if upload is None or not hasattr(upload, "read"):
+        return JSONResponse(
+            {"error": "missing_audio", "message": "缺少 audio 文件字段。"},
+            status_code=400,
+        )
+
+    audio = await upload.read()
+    if not audio:
+        return JSONResponse(
+            {"error": "empty_audio", "message": "音频内容为空。"},
+            status_code=400,
+        )
+    if len(audio) > DEFAULT_MAX_AUDIO_BYTES:
+        return JSONResponse(
+            {"error": "audio_too_large", "message": "音频文件过大。"},
+            status_code=413,
+        )
+
+    sample_rate = _parse_positive_int(form.get("sampleRate"), default=16000)
+    if sample_rate is None:
+        return JSONResponse(
+            {"error": "invalid_sample_rate", "message": "sampleRate 必须是正整数。"},
+            status_code=400,
+        )
+
+    asr_request = AsrRequest(
+        audio_format=_form_string(form.get("format"), default="pcm").lower(),
+        sample_rate=sample_rate,
+        language=_form_string(form.get("language"), default="zh-CN"),
+    )
+
+    try:
+        provider = asr_provider_factory()
+        max_audio_bytes = getattr(getattr(provider, "config", None), "max_audio_bytes", DEFAULT_MAX_AUDIO_BYTES)
+        if len(audio) > max_audio_bytes:
+            return JSONResponse(
+                {"error": "audio_too_large", "message": "音频文件过大。"},
+                status_code=413,
+            )
+        result = await provider.transcribe(audio, asr_request)
+    except AsrConfigError as exc:
+        return JSONResponse(
+            {"error": "asr_config_missing", "message": str(exc)},
+            status_code=503,
+        )
+    except AsrProviderError as exc:
+        logger.warning("asr_transcribe_failed message={}", str(exc))
+        return JSONResponse(
+            {"error": "asr_provider_failed", "message": str(exc)},
+            status_code=502,
+        )
+    except Exception:
+        logger.exception("asr_transcribe_unhandled_exception")
+        return JSONResponse(
+            {"error": "asr_internal_error", "message": "语音识别服务暂时不可用"},
+            status_code=500,
+        )
+
+    return JSONResponse(
+        {
+            "text": result.text,
+            "provider": result.provider,
+            "requestId": result.request_id,
+            "durationMs": result.duration_ms,
+        }
+    )
+
+
+def _form_string(value: object, *, default: str) -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else default
+
+
+def _parse_positive_int(value: object, *, default: int) -> int | None:
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(str(value))
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
 async def cancel_mobile_run(request: Request) -> JSONResponse:
     thread_id = request.path_params["thread_id"]
     run_id = request.path_params["run_id"]
     if phone_action_registry.thread_id_for(run_id) != thread_id:
-        return JSONResponse({"error": "run_not_found"}, status_code=404)
+        return JSONResponse(
+            {
+                "runId": run_id,
+                "threadId": thread_id,
+                "status": "not_found",
+                "backendRunId": None,
+                "backendStatus": "missing",
+                "cancelSource": None,
+                "terminalReason": "not_found",
+            }
+        )
+    cancel_source = await _cancel_source_from_request(request)
+    before_snapshot = phone_action_registry.snapshot(run_id)
+    if before_snapshot.get("status") in {"terminal", "cancelled"}:
+        return JSONResponse(
+            {
+                "runId": run_id,
+                "threadId": thread_id,
+                "status": "already_terminal",
+                "backendRunId": before_snapshot.get("backendRunId"),
+                "backendStatus": before_snapshot.get("backendStatus", "not_started"),
+                "cancelSource": before_snapshot.get("cancelSource"),
+                "terminalReason": before_snapshot.get("terminalReason"),
+            }
+        )
 
     # Fence device commands before doing network I/O, but do not cancel the
     # proxy task until the native LangGraph cancellation request has been sent.
@@ -109,13 +232,21 @@ async def cancel_mobile_run(request: Request) -> JSONResponse:
     # this explicit endpoint is the user-driven cancellation path.
     device_id = phone_action_registry.cancel_run(
         run_id,
-        reason="user_cancelled",
+        reason=cancel_source,
+        cancel_source=cancel_source,
+        terminal_reason=cancel_source,
         cancel_stream=False,
     )
     cancellation_headers = _forward_headers(request)
     cancellation_headers.pop("content-type", None)
     logger.info("mobile_run_cancel_requested run_id={} thread_id={}", run_id, thread_id)
     backend_status = await cancel_upstream_run(run_id, cancellation_headers)
+    after_snapshot = phone_action_registry.snapshot(run_id)
+    response_status = (
+        "not_bound_but_fenced"
+        if backend_status == "unknown_not_bound"
+        else "cancellation_requested"
+    )
     if device_id is not None:
         try:
             await phone_gateway.cancel_run(run_id, device_id)
@@ -134,8 +265,12 @@ async def cancel_mobile_run(request: Request) -> JSONResponse:
     return JSONResponse(
         {
             "runId": run_id,
-            "status": "cancellation_requested",
+            "threadId": thread_id,
+            "status": response_status,
+            "backendRunId": after_snapshot.get("backendRunId"),
             "backendStatus": backend_status,
+            "cancelSource": cancel_source,
+            "terminalReason": cancel_source,
         }
     )
 
@@ -150,15 +285,53 @@ async def mobile_run_status(request: Request) -> JSONResponse:
     status_headers.pop("content-type", None)
     backend_status = await upstream_run_status(run_id, status_headers)
     snapshot = phone_action_registry.snapshot(run_id)
-    terminal = backend_status in {"succeeded", "failed", "cancelled", "timeout"}
+    terminal = backend_status in _TERMINAL_BACKEND_STATUSES
     return JSONResponse(
         {
             "runId": run_id,
             "status": snapshot["status"],
             "backendStatus": backend_status,
             "terminal": terminal,
+            "cancelSource": snapshot.get("cancelSource"),
+            "terminalReason": snapshot.get("terminalReason"),
         }
     )
+
+
+_ALLOWED_CANCEL_SOURCES = {
+    "user",
+    "frontend_timeout",
+    "stream_error",
+    "client_disconnected",
+    "session_deleted",
+    "server_timeout",
+}
+
+_TERMINAL_BACKEND_STATUSES = {
+    "succeeded",
+    "failed",
+    "cancelled",
+    "timeout",
+    "server_timeout",
+    "stream_closed",
+    "thread_busy",
+    "unknown_not_bound",
+    "cancel_unavailable",
+    "cancel_request_failed",
+    "not_started",
+}
+
+
+async def _cancel_source_from_request(request: Request) -> str:
+    try:
+        payload = await request.json()
+    except ValueError:
+        payload = {}
+    value = payload.get("cancelSource") if isinstance(payload, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        value = request.headers.get("x-cancel-source")
+    source = str(value or "user").strip().lower()
+    return source if source in _ALLOWED_CANCEL_SOURCES else "user"
 
 
 async def update_network_status(request: Request) -> JSONResponse:
@@ -188,6 +361,7 @@ async def update_network_status(request: Request) -> JSONResponse:
 app = Starlette(
     lifespan=_lifespan,
     routes=[
+        Route("/mobile/asr/transcribe", transcribe_audio, methods=["POST"]),
         Route("/mobile/threads/{thread_id}/runs/stream", safe_run_stream, methods=["POST"]),
         Route(
             "/mobile/threads/{thread_id}/runs/{run_id}/cancel",
