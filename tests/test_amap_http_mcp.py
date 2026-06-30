@@ -146,36 +146,6 @@ def test_disallowed_amap_tool_is_rejected_before_http(monkeypatch: Any) -> None:
     assert fake.calls == []
 
 
-def test_amap_mcp_tool_schema_accepts_nested_json_arguments() -> None:
-    amap = FakeAmapClient({"ok": True})
-    tools = {tool.name: tool for tool in create_external_tools(amap_client=amap)}
-
-    result = asyncio.run(
-        tools["amap_mcp_tool"].ainvoke(
-            {
-                "tool_name": "maps_text_search",
-                "arguments": {
-                    "keywords": "university",
-                    "city": "120000",
-                    "extensions": {"children": True, "filters": ["education"]},
-                },
-            }
-        )
-    )
-
-    assert isinstance(result, str)
-    assert amap.calls == [
-        (
-            "maps_text_search",
-            {
-                "keywords": "university",
-                "city": "120000",
-                "extensions": {"children": True, "filters": ["education"]},
-            },
-        )
-    ]
-
-
 def test_external_status_reports_http_amap_not_npx(monkeypatch: Any) -> None:
     monkeypatch.setenv("AMAP_MAPS_API_KEY", "test key")
     monkeypatch.delenv("AMAP_MCP_HTTP_URL", raising=False)

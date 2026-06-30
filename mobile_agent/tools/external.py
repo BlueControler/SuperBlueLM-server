@@ -145,16 +145,6 @@ class RunCliCommandArgs(BaseModel):
     )
 
 
-class AmapMcpToolArgs(BaseModel):
-    tool_name: str = Field(
-        description="Whitelisted AMap MCP tool name, e.g. maps_weather, maps_geo, maps_text_search."
-    )
-    arguments: dict[str, Any] = Field(
-        default_factory=dict,
-        description="JSON object arguments passed to the AMap MCP tool.",
-    )
-
-
 @dataclass(frozen=True)
 class CliSpec:
     name: str
@@ -355,14 +345,13 @@ def create_external_tools(
 
     @tool(
         "amap_mcp_tool",
-        args_schema=AmapMcpToolArgs,
         description=(
             "Call a whitelisted AMap MCP tool. Allowed tools include geocode, "
             "reverse geocode, IP location, weather, place search, route, and distance."
         ),
     )
-    async def amap_mcp_tool(tool_name: str, arguments: dict[str, Any]) -> str:
-        safe_arguments = to_json_object(arguments)
+    async def amap_mcp_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> str:
+        safe_arguments = to_json_object(arguments or {})
         return await run_external_tool(
             "amap_mcp_tool",
             lambda: call_amap_mcp_tool(amap, tool_name, safe_arguments),
