@@ -15,14 +15,12 @@ from ..tools.phone import create_phone_tools
 from ..tools.scenario_system import create_scenario_system_tools
 from ..tools.system import create_system_tools
 from .middleware import (
-    DirectPhoneIntentMiddleware,
     ModeToolAccessMiddleware,
     ResetAgentRunStateMiddleware,
     RouteModelMiddleware,
     RoutedSystemPromptMiddleware,
     SyncPhoneStateMiddleware,
     TaskComplexityMiddleware,
-    WeatherInfoIntentMiddleware,
 )
 from .risk_gate import HighRiskActionGateMiddleware
 from .trace_middleware import TraceMiddleware
@@ -43,8 +41,6 @@ def build_middleware_stack(
             HighRiskActionGateMiddleware(),
             ModeToolAccessMiddleware(phone_tool_names, device_scoped_tool_names),
             TaskComplexityMiddleware(),
-            WeatherInfoIntentMiddleware(),
-            DirectPhoneIntentMiddleware(),
             RouteModelMiddleware(),
             RoutedSystemPromptMiddleware(),
             SyncPhoneStateMiddleware(phone_gateway),

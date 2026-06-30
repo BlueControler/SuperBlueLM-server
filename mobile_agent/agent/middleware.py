@@ -5,7 +5,6 @@ from datetime import datetime, timedelta, timezone, tzinfo
 import os
 import re
 from typing import Any, TypeAlias, cast
-from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
@@ -66,41 +65,6 @@ LOCAL_ALLOWED_PHONE_TOOLS = frozenset(
         "take_over",
     }
 )
-_DIRECT_APP_LAUNCHES = {
-    "微信": "com.tencent.mm",
-    "wechat": "com.tencent.mm",
-    "飞书": "com.ss.android.lark",
-    "lark": "com.ss.android.lark",
-}
-_LAUNCH_TRAILING_PUNCTUATION = " \t\r\n，。,.、:：;；!！?？）)]}】'\"”’"
-_KNOWN_WEATHER_LOCATIONS = {
-    "北京",
-    "上海",
-    "天津",
-    "重庆",
-    "深圳",
-    "广州",
-    "杭州",
-    "南京",
-    "成都",
-    "武汉",
-    "西安",
-    "苏州",
-    "东莞",
-    "佛山",
-    "长沙",
-    "郑州",
-    "青岛",
-    "厦门",
-    "福州",
-    "合肥",
-    "昆明",
-    "沈阳",
-    "大连",
-    "济南",
-    "宁波",
-    "无锡",
-}
 _PHONE_INTENT_MARKERS = (
     "手机",
     "屏幕",
@@ -256,93 +220,6 @@ class TaskComplexityMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         return self.before_model(state, runtime)
 
 
-class DirectPhoneIntentMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
-    """Routes a pure known-app launch directly to the launch phone tool."""
-
-    state_schema = MobileAgentState
-
-    def wrap_model_call(
-        self,
-        request: ModelRequest[Any],
-        handler: ModelHandler,
-    ) -> ModelResponse[Any]:
-        return self._direct_response(request) or handler(request)
-
-    async def awrap_model_call(
-        self,
-        request: ModelRequest[Any],
-        handler: AsyncModelHandler,
-    ) -> ModelResponse[Any]:
-        response = self._direct_response(request)
-        return response if response is not None else await handler(request)
-
-    def _direct_response(self, request: ModelRequest[Any]) -> ModelResponse[Any] | None:
-        launch = _simple_known_app_launch(_latest_human_text(request.messages))
-        if launch is None:
-            return None
-        final_response = _completed_direct_launch_response(
-            request.state,
-            request.messages,
-            app_name=launch[0],
-        )
-        if final_response is not None:
-            return final_response
-        _, package = launch
-        return ModelResponse(
-            result=[
-                AIMessage(
-                    content="",
-                    tool_calls=[
-                        {
-                            "name": "launch",
-                            "args": {"package": package},
-                            "id": f"direct_launch_{uuid4().hex}",
-                            "type": "tool_call",
-                        }
-                    ],
-                )
-            ]
-        )
-
-
-def _completed_direct_launch_response(
-    state: Mapping[str, Any],
-    request_messages: list[BaseMessage],
-    *,
-    app_name: str,
-) -> ModelResponse[Any] | None:
-    state_messages = state.get("messages", ())
-    candidates: list[Any] = []
-    if isinstance(state_messages, (list, tuple)):
-        candidates.extend(state_messages)
-    candidates.extend(request_messages)
-    if not any(
-        isinstance(message, ToolMessage)
-        and message.name == "launch"
-        and getattr(message, "status", "success") != "error"
-        for message in candidates
-    ):
-        return None
-    return ModelResponse(result=[AIMessage(content=f"已发起打开{app_name}。")])
-
-
-def _simple_known_app_launch(text: str) -> tuple[str, str] | None:
-    action = re.search(r"(?:打开|启动|launch|open)", text, re.IGNORECASE)
-    if action is None:
-        return None
-    after_action = text[action.end() :].strip()
-    for app_name, package in _DIRECT_APP_LAUNCHES.items():
-        match = re.search(re.escape(app_name), after_action, re.IGNORECASE)
-        if match is None:
-            continue
-        trailing = after_action[match.end() :]
-        trailing = re.sub(r"^(?:应用|app)", "", trailing, flags=re.IGNORECASE)
-        if trailing.strip(_LAUNCH_TRAILING_PUNCTUATION):
-            continue
-        return app_name, package
-    return None
-
-
 def _is_phone_state_relevant_request(text: str) -> bool:
     normalized = text.strip()
     if not normalized:
@@ -373,58 +250,6 @@ def _has_phone_tool_message(messages: object) -> bool:
         }
         for message in messages
     )
-
-
-class WeatherInfoIntentMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
-    """Short-circuits weather requests that lack a city/default location."""
-
-    state_schema = MobileAgentState
-
-    def wrap_model_call(
-        self,
-        request: ModelRequest[Any],
-        handler: ModelHandler,
-    ) -> ModelResponse[Any]:
-        return self._direct_response(request) or handler(request)
-
-    async def awrap_model_call(
-        self,
-        request: ModelRequest[Any],
-        handler: AsyncModelHandler,
-    ) -> ModelResponse[Any]:
-        response = self._direct_response(request)
-        return response if response is not None else await handler(request)
-
-    def _direct_response(self, request: ModelRequest[Any]) -> ModelResponse[Any] | None:
-        text = _latest_human_text(request.messages)
-        if not _weather_query_needs_city(text):
-            return None
-        return ModelResponse(
-            result=[
-                AIMessage(
-                    content=(
-                        "我可以帮你分析天气和出行建议，但当前请求里没有城市，"
-                        "也没有配置默认天气城市。请告诉我所在城市后，我再查询实时天气；"
-                        "如果你只是想要通用建议，也可以直接说明。"
-                    )
-                )
-            ]
-        )
-
-
-def _weather_query_needs_city(text: str) -> bool:
-    normalized = text.strip()
-    if "天气" not in normalized:
-        return False
-    if re.search(r"(?:打开|启动|launch|open).*(?:天气|weather)", normalized, re.IGNORECASE):
-        return False
-    if os.getenv("DEFAULT_AMAP_CITY_ADCODE", "").strip() or os.getenv(
-        "DEFAULT_AMAP_CITY_NAME", ""
-    ).strip():
-        return False
-    if re.search(r"[\u4e00-\u9fa5]{2,12}(?:市|省|自治区|特别行政区)", normalized):
-        return False
-    return not any(location in normalized for location in _KNOWN_WEATHER_LOCATIONS)
 
 
 class SyncPhoneStateMiddleware(AgentMiddleware[MobileAgentState, None, Any]):

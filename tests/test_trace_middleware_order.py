@@ -25,8 +25,6 @@ def test_trace_stack_order_is_locked() -> None:
         "HighRiskActionGateMiddleware",
         "ModeToolAccessMiddleware",
         "TaskComplexityMiddleware",
-        "WeatherInfoIntentMiddleware",
-        "DirectPhoneIntentMiddleware",
         "RouteModelMiddleware",
         "RoutedSystemPromptMiddleware",
         "SyncPhoneStateMiddleware",
