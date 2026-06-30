@@ -224,7 +224,7 @@ def _is_phone_state_relevant_request(text: str) -> bool:
     normalized = text.strip()
     if not normalized:
         return False
-    if re.search(r"(?:打开|启动|launch|open)\s*(?:微信|wechat|飞书|lark)", normalized, re.IGNORECASE):
+    if re.search(r"(?:打开|启动|launch|open)\s", normalized, re.IGNORECASE):
         return True
     return any(marker in normalized for marker in _PHONE_INTENT_MARKERS)
 
