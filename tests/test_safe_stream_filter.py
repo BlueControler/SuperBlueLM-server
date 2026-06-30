@@ -73,30 +73,37 @@ def test_filter_strips_think_across_chunks_and_keeps_safe_answer_text() -> None:
 
     chunks = [frame.data["chunk"] for frame in [*first, *second, *third, *completed] if frame.event == "assistant.delta"]
     assert "".join(chunks) == "最终回答"
+    assert [frame.data["chunk"] for frame in second if frame.event == "assistant.delta"] == ["最终"]
+    assert [frame.data["chunk"] for frame in third if frame.event == "assistant.delta"] == ["回答"]
     assert all("private" not in chunk and "abc" not in chunk for chunk in chunks)
 
 
-def test_filter_buffers_assistant_text_until_stream_finish() -> None:
+def test_filter_emits_assistant_text_incrementally_before_stream_finish() -> None:
     stream = SafeStreamFilter()
 
-    frames = stream.feed(
-        SseFrame(event="messages-tuple", data=_assistant_payload("Final answer"))
+    first = stream.feed(
+        SseFrame(event="messages-tuple", data=_assistant_payload("Final "))
+    )
+    second = stream.feed(
+        SseFrame(event="messages-tuple", data=_assistant_payload("answer"))
     )
     stream.feed(_terminal_trace(status="succeeded", seq=1))
     completed = stream.finish()
 
-    assert frames == []
-    assert [frame.event for frame in completed] == ["assistant.delta", "stream.eof"]
-    assert completed[0].data["chunk"] == "Final answer"
+    assert [frame.data["chunk"] for frame in first + second if frame.event == "assistant.delta"] == [
+        "Final ",
+        "answer",
+    ]
+    assert [frame.event for frame in completed] == ["stream.eof"]
 
 
-def test_filter_discards_intermediate_assistant_text_when_tool_step_arrives() -> None:
+def test_filter_keeps_safe_incremental_text_when_tool_step_arrives() -> None:
     stream = SafeStreamFilter()
     frames = [
         *stream.feed(
             SseFrame(
                 event="messages-tuple",
-                data=_assistant_payload("I need to call the weather tool."),
+                data=_assistant_payload("I need to call the weather tool.", message_id="model-1"),
             )
         ),
         *stream.feed(_tool_step_trace(status="running", seq=1)),
@@ -104,7 +111,7 @@ def test_filter_discards_intermediate_assistant_text_when_tool_step_arrives() ->
         *stream.feed(
             SseFrame(
                 event="messages-tuple",
-                data=_assistant_payload("Weather result is ready."),
+                data=_assistant_payload("Weather result is ready.", message_id="model-2"),
             )
         ),
         *stream.feed(_terminal_trace(status="succeeded", seq=3)),
@@ -117,8 +124,15 @@ def test_filter_discards_intermediate_assistant_text_when_tool_step_arrives() ->
         if frame.event == "assistant.delta"
     ]
     combined = json.dumps([frame.data for frame in frames], ensure_ascii=False)
-    assert assistant_chunks == ["Weather result is ready."]
-    assert "I need to call the weather tool" not in combined
+    assert assistant_chunks == [
+        "I need to call the weather tool.",
+        "Weather result is ready.",
+    ]
+    assert [frame.data.get("invocationId") for frame in frames if frame.event == "assistant.delta"] == [
+        "model-1",
+        "model-2",
+    ]
+    assert "password" not in combined
 
 
 def test_filter_drops_structured_reasoning_blocks_and_keeps_public_text() -> None:
@@ -143,11 +157,12 @@ def test_filter_drops_structured_reasoning_blocks_and_keeps_public_text() -> Non
     stream.feed(_terminal_trace(status="succeeded", seq=1))
     completed = stream.finish()
 
-    assert frames == []
-    assert completed[0].event == "assistant.delta"
-    assert completed[0].data["chunk"] == "Final answer"
-    assert "private" not in json.dumps(completed[0].data)
-    assert "secret" not in json.dumps(completed[0].data)
+    assert len(frames) == 1
+    assert frames[0].event == "assistant.delta"
+    assert frames[0].data["chunk"] == "Final answer"
+    assert [frame.event for frame in completed] == ["stream.eof"]
+    assert "private" not in json.dumps(frames[0].data)
+    assert "secret" not in json.dumps(frames[0].data)
 
 
 def test_filter_forwards_only_safe_trace_fields_with_a_bounded_payload() -> None:
@@ -334,14 +349,16 @@ def test_filter_limits_each_assistant_event_below_four_kib() -> None:
     stream.feed(_terminal_trace(status="succeeded", seq=1))
     completed = stream.finish()
 
-    assert frames == []
-    assert len(json.dumps(completed[0].data, ensure_ascii=False).encode("utf-8")) <= MAX_TRACE_EVENT_BYTES
+    assert len(frames) == 1
+    assert frames[0].event == "assistant.delta"
+    assert len(json.dumps(frames[0].data, ensure_ascii=False).encode("utf-8")) <= MAX_TRACE_EVENT_BYTES
+    assert [frame.event for frame in completed] == ["stream.eof"]
 
 
-def _assistant_payload(text: str) -> str:
+def _assistant_payload(text: str, *, message_id: str = "model:1") -> str:
     return json.dumps([
-        {"type": "ai", "content": text},
-        {"langgraph_node": "model", "checkpoint_ns": "model:1"},
+        {"type": "ai", "content": text, "id": message_id},
+        {"langgraph_node": "model", "checkpoint_ns": message_id},
     ])
 
 

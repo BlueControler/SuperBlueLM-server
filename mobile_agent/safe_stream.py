@@ -62,8 +62,6 @@ class SafeStreamFilter:
         self.terminal_status: str | None = None
         self._has_any_text = False
         self._has_trace_event = False
-        self._pending_assistant_chunks: list[str] = []
-        self._pending_assistant_invocation_id: str | None = None
         self._last_trace_seq = 0
 
     @property
@@ -90,7 +88,7 @@ class SafeStreamFilter:
             safe_text = _sanitize_assistant_text(self._think.feed(text))
             if safe_text:
                 self._has_any_text = True
-                self._append_pending_assistant_text(safe_text, invocation_id)
+                return [_assistant_delta(safe_text, invocation_id)]
             return []
         if "custom" not in event:
             return []
@@ -122,42 +120,19 @@ class SafeStreamFilter:
             return [SafeSseFrame("task_complexity", safe)] if safe is not None else []
         return []
 
-    def finish(self) -> list[SafeSseFrame]:
+    def finish(self, *, allow_pending_text: bool = False) -> list[SafeSseFrame]:
         pending = _sanitize_assistant_text(self._think.finish())
-        if pending:
-            self._append_pending_assistant_text(
-                pending,
-                self._pending_assistant_invocation_id,
-            )
-        final_text = "".join(self._pending_assistant_chunks)
         frames = (
-            [_assistant_delta(final_text, self._pending_assistant_invocation_id)]
-            if final_text and self.terminal_status == "succeeded"
+            [_assistant_delta(pending, None)]
+            if pending and (self.terminal_status == "succeeded" or allow_pending_text)
             else []
         )
         self._discard_pending_assistant_text()
         frames.append(SafeSseFrame("stream.eof", {"type": "stream.eof"}))
         return frames
 
-    def _append_pending_assistant_text(
-        self,
-        text: str,
-        invocation_id: str | None,
-    ) -> None:
-        if (
-            invocation_id
-            and self._pending_assistant_invocation_id
-            and invocation_id != self._pending_assistant_invocation_id
-        ):
-            self._discard_pending_assistant_text()
-        if invocation_id:
-            self._pending_assistant_invocation_id = invocation_id
-        self._pending_assistant_chunks.append(text)
-
     def _discard_pending_assistant_text(self) -> None:
         self._think = _ThinkStripper()
-        self._pending_assistant_chunks = []
-        self._pending_assistant_invocation_id = None
 
 
 async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
@@ -175,16 +150,14 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
         phone_action_registry.start_run(run_id, thread_id)
         body = _with_mobile_run_config(await request.body(), run_id=run_id, thread_id=thread_id)
         headers = _forward_headers(request)
-    except Exception as exc:
-        logger.exception(
-            "mobile_safe_run_stream_setup_failed thread_id={}",
+    except Exception:
+        logger.warning(
+            "mobile_safe_run_stream_setup_failed thread_id={} error_category=setup_failed",
             request.path_params.get("thread_id", "unknown"),
         )
         return JSONResponse(
             {
                 "error": "stream_setup_failed",
-                "exception": type(exc).__name__,
-                "detail": str(exc)[:500],
                 "message": "请求处理失败，请检查服务配置或稍后重试。",
             },
             status_code=500,
@@ -227,10 +200,11 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
                 ) as response:
                     _bind_backend_run_from_response(run_id, thread_id, response)
                     if response.status_code < 200 or response.status_code >= 300:
-                        error_body = (await response.aread()).decode("utf-8", errors="ignore")[:500]
+                        await response.aread()
+                        error_category = _upstream_error_category(response.status_code)
                         logger.warning(
-                            "mobile_upstream_stream_error run_id={} thread_id={} upstream_status={} upstream_body={}",
-                            run_id, thread_id, response.status_code, error_body,
+                            "mobile_upstream_stream_error run_id={} thread_id={} upstream_status={} error_category={}",
+                            run_id, thread_id, response.status_code, error_category,
                         )
                         # 区分 409（线程忙）和其他错误，统一发业务终态
                         if response.status_code == 409:
@@ -241,7 +215,7 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
                         else:
                             terminal_status = "failed"
                             terminal_reason = f"upstream_http_{response.status_code}"
-                            error_message = f"上游服务返回 {response.status_code}"
+                            error_message = "上游服务返回错误，请稍后重试。"
                             retryable = response.status_code in {408, 429} or response.status_code >= 500
                         yield encode(
                             synthetic_terminal(terminal_status, terminal_reason)
@@ -250,7 +224,6 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
                             _stream_error(
                                 error_message,
                                 retryable=retryable,
-                                detail=error_body,
                                 terminal_status=terminal_status,
                                 terminal_reason=terminal_reason,
                             )
@@ -273,7 +246,21 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
                         for safe_frame in filter_.feed(frame):
                             yield encode(safe_frame)
                     if filter_.terminal_status is None:
-                        # 无论有没有 trace/text，缺少 terminal 就是异常终态
+                        if filter_.has_any_text and not filter_.has_trace_event:
+                            for safe_frame in filter_.finish(allow_pending_text=True):
+                                yield encode(safe_frame)
+                            logger.info(
+                                "mobile_run_plain_text_finished_without_trace_terminal run_id={} thread_id={}",
+                                run_id, thread_id,
+                            )
+                            phone_action_registry.mark_terminal(run_id)
+                            phone_action_registry.mark_backend_status(
+                                run_id,
+                                "plain_text_completed",
+                            )
+                            terminal_emitted = True
+                            return
+                        # 有 trace/progress 但缺少 terminal 是异常终态，不能伪造成成功。
                         reason = "upstream_ended_without_terminal"
                         await _cancel_backend_and_device_run(
                             run_id,
@@ -471,7 +458,6 @@ def _stream_error(
     terminal_status: str | None = None,
     terminal_reason: str | None = None,
     cancel_source: str | None = None,
-    detail: str | None = None,
 ) -> SafeSseFrame:
     data: dict[str, Any] = {
         "type": "stream.error",
@@ -484,9 +470,21 @@ def _stream_error(
         data["terminalReason"] = _bounded(terminal_reason, 128)
     if cancel_source:
         data["cancelSource"] = _bounded(cancel_source, 64)
-    if detail:
-        data["detail"] = detail
     return SafeSseFrame("stream.error", data)
+
+
+def _upstream_error_category(status_code: int) -> str:
+    if status_code == 409:
+        return "thread_busy"
+    if status_code == 408:
+        return "timeout"
+    if status_code == 429:
+        return "rate_limited"
+    if status_code >= 500:
+        return "server_error"
+    if status_code >= 400:
+        return "client_error"
+    return "unexpected_status"
 
 
 def _stream_heartbeat(run_id: str) -> SafeSseFrame:

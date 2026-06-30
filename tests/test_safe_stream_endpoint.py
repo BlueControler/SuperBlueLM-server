@@ -172,6 +172,30 @@ def test_unexpected_upstream_failure_is_converted_to_a_safe_sse_error(
     }
 
 
+def test_upstream_http_error_body_is_not_exposed_in_stream_error(monkeypatch) -> None:
+    monkeypatch.setenv("LANGGRAPH_INTERNAL_BASE_URL", "http://internal.example")
+    monkeypatch.setattr("mobile_agent.safe_stream.httpx.AsyncClient", _HttpErrorAsyncClient)
+
+    response = TestClient(app).post(
+        "/mobile/threads/thread-1/runs/stream",
+        json={"input": {"messages": []}},
+        headers={"Authorization": "Bearer client-token"},
+    )
+
+    assert response.status_code == 200
+    frames = _parse_sse(response.text)
+    assert [event for event, _ in frames] == ["stream.started", "trace.v1", "stream.error"]
+    error_payload = frames[-1][1]
+    assert error_payload["type"] == "stream.error"
+    assert error_payload["message"] == "上游服务返回错误，请稍后重试。"
+    assert "detail" not in error_payload
+    assert "server-secret-token" not in response.text
+    assert "Authorization" not in response.text
+    assert "Bearer" not in response.text
+    assert "/internal/admin" not in response.text
+    assert "client-token" not in response.text
+
+
 def test_safe_stream_route_encodes_only_safe_sse_frames(monkeypatch) -> None:
     monkeypatch.setenv("LANGGRAPH_INTERNAL_BASE_URL", "http://internal.example")
     _StreamingAsyncClient.lines = [
@@ -232,7 +256,83 @@ def test_safe_stream_route_encodes_only_safe_sse_frames(monkeypatch) -> None:
     assert "internal" not in response.text
 
 
-def test_safe_stream_does_not_turn_a_missing_terminal_into_success(monkeypatch) -> None:
+def test_safe_stream_forwards_assistant_deltas_before_terminal(monkeypatch) -> None:
+    monkeypatch.setenv("LANGGRAPH_INTERNAL_BASE_URL", "http://internal.example")
+    _StreamingAsyncClient.lines = [
+        "event: messages-tuple",
+        "data: " + json.dumps([{"type": "ai", "content": "第一段", "id": "model-final"}, {}], ensure_ascii=False),
+        "",
+        "event: messages-tuple",
+        "data: " + json.dumps([{"type": "ai", "content": "第二段", "id": "model-final"}, {}], ensure_ascii=False),
+        "",
+        "event: custom",
+        "data: "
+        + json.dumps(
+            {
+                "type": "trace.v1",
+                "version": 1,
+                "runId": "run-1",
+                "eventId": "event-1",
+                "seq": 1,
+                "event": "run.terminal",
+                "status": "succeeded",
+            },
+            ensure_ascii=False,
+        ),
+        "",
+    ]
+    monkeypatch.setattr("mobile_agent.safe_stream.httpx.AsyncClient", _StreamingAsyncClient)
+
+    response = TestClient(app).post(
+        "/mobile/threads/thread-1/runs/stream",
+        json={"input": {"messages": []}},
+    )
+
+    frames = _parse_sse(response.text)
+    assert [event for event, _ in frames] == [
+        "stream.started",
+        "assistant.delta",
+        "assistant.delta",
+        "trace.v1",
+        "stream.eof",
+    ]
+    assert [payload["streamSeq"] for _, payload in frames] == [1, 2, 3, 4, 5]
+    assert frames[1][1]["chunk"] == "第一段"
+    assert frames[2][1]["chunk"] == "第二段"
+    assert frames[3][1]["event"] == "run.terminal"
+
+
+def test_safe_stream_normal_terminal_path_does_not_call_fixed_sleep(monkeypatch) -> None:
+    monkeypatch.setenv("LANGGRAPH_INTERNAL_BASE_URL", "http://internal.example")
+    _StreamingAsyncClient.lines = [
+        "event: custom",
+        "data: "
+        + json.dumps(
+            {
+                "type": "trace.v1",
+                "version": 1,
+                "runId": "run-1",
+                "eventId": "event-1",
+                "seq": 1,
+                "event": "run.terminal",
+                "status": "succeeded",
+            },
+            ensure_ascii=False,
+        ),
+        "",
+    ]
+    monkeypatch.setattr("mobile_agent.safe_stream.httpx.AsyncClient", _StreamingAsyncClient)
+
+    response = TestClient(app).post(
+        "/mobile/threads/thread-1/runs/stream",
+        json={"input": {"messages": []}},
+    )
+
+    frames = _parse_sse(response.text)
+    assert [event for event, _ in frames] == ["stream.started", "trace.v1", "stream.eof"]
+
+
+def test_plain_text_without_trace_terminal_completes_as_simple_reply(monkeypatch) -> None:
     monkeypatch.setenv("LANGGRAPH_INTERNAL_BASE_URL", "http://internal.example")
     _StreamingAsyncClient.lines = [
         "event: messages-tuple",
@@ -247,20 +347,16 @@ def test_safe_stream_does_not_turn_a_missing_terminal_into_success(monkeypatch) 
     )
 
     frames = _parse_sse(response.text)
-    # 有 text 但无 terminal 仍是失败终态；terminal 必须先于 stream.error，避免前端吞掉终态。
     assert [event for event, _ in frames] == [
         "stream.started",
-        "trace.v1",
-        "stream.error",
+        "assistant.delta",
+        "stream.eof",
     ]
-    assert frames[-2][1]["event"] == "run.terminal"
-    assert frames[-2][1]["status"] == "failed"
-    assert frames[-2][1]["reason"] == "upstream_ended_without_terminal"
-    assert frames[-2][1]["seq"] > 0
-    assert frames[-1][1]["terminalReason"] == "upstream_ended_without_terminal"
+    assert frames[1][1]["chunk"] == "处理中"
+    assert not any(payload.get("event") == "run.terminal" for _, payload in frames)
 
 
-def test_trace_step_without_terminal_emits_transport_eof_only(monkeypatch) -> None:
+def test_trace_step_without_terminal_fails_without_success_terminal(monkeypatch) -> None:
     monkeypatch.setenv("LANGGRAPH_INTERNAL_BASE_URL", "http://internal.example")
     _StreamingAsyncClient.lines = [
         "event: custom",
@@ -435,6 +531,26 @@ class _StreamingResponse:
     async def aiter_lines(self) -> AsyncIterator[str]:
         for line in self._lines:
             yield line
+
+
+class _HttpErrorAsyncClient(_StreamingAsyncClient):
+    def stream(self, *_: object, **__: object) -> "_HttpErrorResponse":
+        return _HttpErrorResponse()
+
+
+class _HttpErrorResponse(_StreamingResponse):
+    status_code = 502
+
+    def __init__(self) -> None:
+        super().__init__([])
+
+    async def aread(self) -> bytes:
+        return (
+            b'{"error":"upstream exploded",'
+            b'"token":"server-secret-token",'
+            b'"Authorization":"Bearer server-secret-token",'
+            b'"path":"/internal/admin"}'
+        )
 
 
 class _DelayedStreamingAsyncClient(_StreamingAsyncClient):
