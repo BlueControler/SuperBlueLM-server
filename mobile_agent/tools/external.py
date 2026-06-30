@@ -8,14 +8,14 @@ import shlex
 import shutil
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.parse import urlencode
 
 import httpx
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, Field
 
-from ..json_types import JsonObject, JsonValue
+from ..json_types import JsonObject, JsonValue, to_json_object
 from ..progress import emit_task_progress
 
 MAX_OUTPUT_BYTES = 256 * 1024
@@ -142,6 +142,16 @@ class RunCliCommandArgs(BaseModel):
             "Full CLI command to execute. The first token must be lark-cli, "
             "lark-cli.cmd, wecom-cli, or wecom-cli.cmd."
         )
+    )
+
+
+class AmapMcpToolArgs(BaseModel):
+    tool_name: str = Field(
+        description="Whitelisted AMap MCP tool name, e.g. maps_weather, maps_geo, maps_text_search."
+    )
+    arguments: dict[str, Any] = Field(
+        default_factory=dict,
+        description="JSON object arguments passed to the AMap MCP tool.",
     )
 
 
@@ -345,15 +355,17 @@ def create_external_tools(
 
     @tool(
         "amap_mcp_tool",
+        args_schema=AmapMcpToolArgs,
         description=(
             "Call a whitelisted AMap MCP tool. Allowed tools include geocode, "
             "reverse geocode, IP location, weather, place search, route, and distance."
         ),
     )
-    async def amap_mcp_tool(tool_name: str, arguments: JsonObject) -> str:
+    async def amap_mcp_tool(tool_name: str, arguments: dict[str, Any]) -> str:
+        safe_arguments = to_json_object(arguments)
         return await run_external_tool(
             "amap_mcp_tool",
-            lambda: call_amap_mcp_tool(amap, tool_name, arguments),
+            lambda: call_amap_mcp_tool(amap, tool_name, safe_arguments),
         )
 
     @tool(
