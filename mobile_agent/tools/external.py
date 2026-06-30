@@ -15,7 +15,7 @@ import httpx
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, Field
 
-from ..json_types import JsonObject, JsonValue, to_json_object
+from ..json_types import JsonObject, JsonValue, to_json_object, to_json_value
 from ..progress import emit_task_progress
 
 MAX_OUTPUT_BYTES = 256 * 1024
@@ -862,16 +862,18 @@ def _redact_args(args: Sequence[str]) -> list[str]:
 def _to_jsonable(value: object) -> JsonValue:
     if hasattr(value, "model_dump"):
         return _to_jsonable(value.model_dump(mode="json"))
+    return _redact_sensitive_values(to_json_value(value))
+
+
+def _redact_sensitive_values(value: JsonValue) -> JsonValue:
     if isinstance(value, Mapping):
         return {
-            str(key): ("***" if SENSITIVE_KEY_PATTERN.search(str(key)) else _to_jsonable(item))
+            key: ("***" if SENSITIVE_KEY_PATTERN.search(key) else _redact_sensitive_values(item))
             for key, item in value.items()
         }
-    if isinstance(value, list | tuple):
-        return [_to_jsonable(item) for item in value]
-    if isinstance(value, str | int | float | bool) or value is None:
-        return value
-    return str(value)
+    if isinstance(value, list):
+        return [_redact_sensitive_values(item) for item in value]
+    return value
 
 
 def _dump(data: JsonValue) -> str:
