@@ -251,7 +251,6 @@ def test_safe_stream_does_not_turn_a_missing_terminal_into_success(monkeypatch) 
     assert [event for event, _ in frames] == [
         "stream.started",
         "trace.v1",
-        "assistant.delta",
         "stream.error",
     ]
     assert frames[-2][1]["event"] == "run.terminal"

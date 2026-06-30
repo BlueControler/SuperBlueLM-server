@@ -101,6 +101,28 @@ _KNOWN_WEATHER_LOCATIONS = {
     "宁波",
     "无锡",
 }
+_PHONE_INTENT_MARKERS = (
+    "手机",
+    "屏幕",
+    "页面",
+    "界面",
+    "点击",
+    "轻触",
+    "输入",
+    "滑动",
+    "滚动",
+    "返回",
+    "桌面",
+    "打开应用",
+    "启动应用",
+    "读取屏幕",
+    "观察屏幕",
+    "observe",
+    "tap",
+    "swipe",
+    "scroll",
+    "launch",
+)
 
 
 def _agent_timezone() -> tzinfo:
@@ -321,6 +343,38 @@ def _simple_known_app_launch(text: str) -> tuple[str, str] | None:
     return None
 
 
+def _is_phone_state_relevant_request(text: str) -> bool:
+    normalized = text.strip()
+    if not normalized:
+        return False
+    if re.search(r"(?:打开|启动|launch|open)\s*(?:微信|wechat|飞书|lark)", normalized, re.IGNORECASE):
+        return True
+    return any(marker in normalized for marker in _PHONE_INTENT_MARKERS)
+
+
+def _has_phone_tool_message(messages: object) -> bool:
+    if not isinstance(messages, (list, tuple)):
+        return False
+    return any(
+        isinstance(message, ToolMessage)
+        and isinstance(message.name, str)
+        and message.name in {
+            "observe",
+            "launch",
+            "tap",
+            "type",
+            "swipe",
+            "scroll",
+            "back",
+            "home",
+            "wait",
+            "interact",
+            "take_over",
+        }
+        for message in messages
+    )
+
+
 class WeatherInfoIntentMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
     """Short-circuits weather requests that lack a city/default location."""
 
@@ -385,6 +439,8 @@ class SyncPhoneStateMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         state: MobileAgentState,
         runtime: Runtime[None],
     ) -> dict[str, PhoneSnapshot | None] | None:
+        if not self._should_sync_phone_state(state):
+            return None
         snapshot = self._current_snapshot(state)
         if state.get("phone_snapshot") == snapshot:
             return None
@@ -415,6 +471,8 @@ class SyncPhoneStateMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         self,
         request: ModelRequest[Any],
     ) -> ModelRequest[Any]:
+        if not self._should_sync_phone_state(request.state, request.messages):
+            return request
         snapshot = cast(PhoneSnapshot | None, request.state.get("phone_snapshot"))
         if snapshot is None:
             snapshot = self._current_snapshot(request.state)
@@ -444,6 +502,23 @@ class SyncPhoneStateMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
         if session.device_info is None:
             return None
         return build_phone_snapshot(session, device_id=device_id)
+
+    def _should_sync_phone_state(
+        self,
+        state: Mapping[str, Any],
+        messages: list[BaseMessage] | None = None,
+    ) -> bool:
+        if self.device_id is not None or device_id_from_mapping(state) is not None:
+            return True
+        if state.get("phone_snapshot") is not None:
+            return True
+        state_messages = state.get("messages", ())
+        if _has_phone_tool_message(state_messages):
+            return True
+        if messages is not None and _has_phone_tool_message(messages):
+            return True
+        text = _latest_human_text(cast(list[BaseMessage], messages or state_messages or []))
+        return _is_phone_state_relevant_request(text)
 
 
 class ModeToolAccessMiddleware(AgentMiddleware[MobileAgentState, None, Any]):

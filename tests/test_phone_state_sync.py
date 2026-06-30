@@ -49,10 +49,11 @@ class _ModelRequest:
 def test_sync_phone_state_refreshes_snapshot_when_ui_changes() -> None:
     gateway = _Gateway()
     middleware = SyncPhoneStateMiddleware(gateway)
+    state = {"messages": [HumanMessage(content="观察当前手机页面")]}
 
-    first = middleware.before_model({}, runtime=None)
+    first = middleware.before_model(state, runtime=None)
     gateway.session.device_info.ui = "<node text='Results' />"
-    second = middleware.before_model(first or {}, runtime=None)
+    second = middleware.before_model({**state, **(first or {})}, runtime=None)
 
     assert first is not None
     assert first["phone_snapshot"]["ui"] == "<node text='Search' />"
@@ -66,7 +67,7 @@ def test_sync_phone_state_injects_latest_ui_tree_and_screenshot_into_model() -> 
     captured: list[Any] = []
 
     middleware.wrap_model_call(
-        _ModelRequest(messages=[HumanMessage(content="next")], state={}),
+        _ModelRequest(messages=[HumanMessage(content="观察当前手机页面")], state={}),
         lambda request: captured.extend(request.messages),
     )
 
@@ -78,6 +79,20 @@ def test_sync_phone_state_injects_latest_ui_tree_and_screenshot_into_model() -> 
         "type": "image_url",
         "image_url": {"url": "data:image/webp;base64,base64-screenshot"},
     }
+
+
+def test_sync_phone_state_skips_non_phone_weather_request() -> None:
+    gateway = _Gateway()
+    middleware = SyncPhoneStateMiddleware(gateway)
+    captured: list[Any] = []
+
+    middleware.wrap_model_call(
+        _ModelRequest(messages=[HumanMessage(content="查询北京天气")], state={}),
+        lambda request: captured.extend(request.messages),
+    )
+
+    assert captured == [HumanMessage(content="查询北京天气")]
+    assert gateway.requested_device_ids == []
 
 
 def test_sync_phone_state_selects_device_from_agent_state() -> None:
