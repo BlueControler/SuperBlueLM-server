@@ -212,9 +212,6 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
             )
 
         timeout = httpx.Timeout(connect=10.0, read=None, write=60.0, pool=10.0)
-        execution_timeout_seconds = _positive_env(
-            "MOBILE_AGENT_MAX_EXECUTION_SECONDS", 120
-        )
         current_task = asyncio.current_task()
         if current_task is not None:
             loop = asyncio.get_running_loop()
@@ -224,122 +221,104 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
             )
         yield encode(_stream_started(run_id=run_id, thread_id=thread_id))
         try:
-            async with asyncio.timeout(execution_timeout_seconds):
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    async with client.stream(
-                        "POST", upstream_url, content=body, headers=headers
-                    ) as response:
-                        _bind_backend_run_from_response(run_id, thread_id, response)
-                        if response.status_code < 200 or response.status_code >= 300:
-                            error_body = (await response.aread()).decode("utf-8", errors="ignore")[:500]
-                            logger.warning(
-                                "mobile_upstream_stream_error run_id={} thread_id={} upstream_status={} upstream_body={}",
-                                run_id, thread_id, response.status_code, error_body,
-                            )
-                            # 区分 409（线程忙）和其他错误，统一发业务终态
-                            if response.status_code == 409:
-                                terminal_status = "failed"
-                                terminal_reason = "thread_busy"
-                                error_message = "当前会话有任务正在执行，请等待完成后再试。"
-                                retryable = True
-                            else:
-                                terminal_status = "failed"
-                                terminal_reason = f"upstream_http_{response.status_code}"
-                                error_message = f"上游服务返回 {response.status_code}"
-                                retryable = response.status_code in {408, 429} or response.status_code >= 500
-                            yield encode(
-                                synthetic_terminal(terminal_status, terminal_reason)
-                            )
-                            yield encode(
-                                _stream_error(
-                                    error_message,
-                                    retryable=retryable,
-                                    detail=error_body,
-                                    terminal_status=terminal_status,
-                                    terminal_reason=terminal_reason,
-                                )
-                            )
-                            phone_action_registry.mark_terminal(run_id, terminal_reason=terminal_reason)
-                            phone_action_registry.mark_backend_status(run_id, terminal_reason)
-                            return
-                        heartbeat_seconds = _positive_float_env(
-                            "MOBILE_AGENT_STREAM_HEARTBEAT_SECONDS",
-                            15.0,
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream(
+                    "POST", upstream_url, content=body, headers=headers
+                ) as response:
+                    _bind_backend_run_from_response(run_id, thread_id, response)
+                    if response.status_code < 200 or response.status_code >= 300:
+                        error_body = (await response.aread()).decode("utf-8", errors="ignore")[:500]
+                        logger.warning(
+                            "mobile_upstream_stream_error run_id={} thread_id={} upstream_status={} upstream_body={}",
+                            run_id, thread_id, response.status_code, error_body,
                         )
-                        async for frame in _stream_with_heartbeats(
-                            response.aiter_lines(),
-                            heartbeat_seconds=heartbeat_seconds,
-                            run_id=run_id,
-                        ):
-                            if isinstance(frame, SafeSseFrame):
-                                yield encode(frame)
-                                continue
-                            for safe_frame in filter_.feed(frame):
-                                yield encode(safe_frame)
-                        if filter_.terminal_status is None:
-                            # 无论有没有 trace/text，缺少 terminal 就是异常终态
-                            reason = "upstream_ended_without_terminal"
-                            await _cancel_backend_and_device_run(
-                                run_id,
-                                headers=headers,
-                                reason=reason,
-                            )
+                        # 区分 409（线程忙）和其他错误，统一发业务终态
+                        if response.status_code == 409:
                             terminal_status = "failed"
-                            error_message = (
-                                "任务连接中断，部分结果可能未完成。"
-                                if filter_.has_any_text or filter_.has_trace_event
-                                else "任务未返回结束状态，已停止后续操作。"
+                            terminal_reason = "thread_busy"
+                            error_message = "当前会话有任务正在执行，请等待完成后再试。"
+                            retryable = True
+                        else:
+                            terminal_status = "failed"
+                            terminal_reason = f"upstream_http_{response.status_code}"
+                            error_message = f"上游服务返回 {response.status_code}"
+                            retryable = response.status_code in {408, 429} or response.status_code >= 500
+                        yield encode(
+                            synthetic_terminal(terminal_status, terminal_reason)
+                        )
+                        yield encode(
+                            _stream_error(
+                                error_message,
+                                retryable=retryable,
+                                detail=error_body,
+                                terminal_status=terminal_status,
+                                terminal_reason=terminal_reason,
                             )
-                            yield encode(
-                                synthetic_terminal(terminal_status, reason)
-                            )
-                            yield encode(
-                                _stream_error(
-                                    error_message,
-                                    retryable=True,
-                                    terminal_status=terminal_status,
-                                    terminal_reason=reason,
-                                )
-                            )
-                            phone_action_registry.mark_terminal(run_id, terminal_reason=reason)
-                            phone_action_registry.mark_backend_status(run_id, terminal_status)
-                            return
-                        # ✅ 只有 filter_.terminal_status is not None 才走正常终态路径
-                        # 内部 LangGraph 流关闭后，等待 500ms 让 trace terminal 等异步事件 flush 到 SSE 通道
-                        await asyncio.sleep(0.5)
-                        for safe_frame in filter_.finish():
+                        )
+                        phone_action_registry.mark_terminal(run_id, terminal_reason=terminal_reason)
+                        phone_action_registry.mark_backend_status(run_id, terminal_reason)
+                        return
+                    heartbeat_seconds = _positive_float_env(
+                        "MOBILE_AGENT_STREAM_HEARTBEAT_SECONDS",
+                        15.0,
+                    )
+                    async for frame in _stream_with_heartbeats(
+                        response.aiter_lines(),
+                        heartbeat_seconds=heartbeat_seconds,
+                        run_id=run_id,
+                    ):
+                        if isinstance(frame, SafeSseFrame):
+                            yield encode(frame)
+                            continue
+                        for safe_frame in filter_.feed(frame):
                             yield encode(safe_frame)
-                        logger.info(
-                            "mobile_run_stream_finished run_id={} thread_id={} terminal_status={}",
-                            run_id, thread_id, filter_.terminal_status,
-                        )
-                        phone_action_registry.mark_terminal(run_id)
-                        phone_action_registry.mark_backend_status(
+                    if filter_.terminal_status is None:
+                        # 无论有没有 trace/text，缺少 terminal 就是异常终态
+                        reason = "upstream_ended_without_terminal"
+                        await _cancel_backend_and_device_run(
                             run_id,
-                            filter_.terminal_status or "missing_terminal",
+                            headers=headers,
+                            reason=reason,
                         )
-        except TimeoutError:
-            logger_message = "任务执行超过服务端时限，已请求停止。"
-            logger.warning("mobile_run_execution_timeout run_id={} thread_id={}", run_id, thread_id)
-            reason = "server_timeout"
-            await _cancel_backend_and_device_run(run_id, headers=headers, reason=reason)
-            yield encode(
-                synthetic_terminal("failed", reason)
-            )
-            yield encode(
-                _stream_error(
-                    logger_message,
-                    retryable=False,
-                    terminal_status="failed",
-                    terminal_reason=reason,
-                    cancel_source=reason,
-                )
-            )
+                        terminal_status = "failed"
+                        error_message = (
+                            "任务连接中断，部分结果可能未完成。"
+                            if filter_.has_any_text or filter_.has_trace_event
+                            else "任务未返回结束状态，已停止后续操作。"
+                        )
+                        yield encode(
+                            synthetic_terminal(terminal_status, reason)
+                        )
+                        yield encode(
+                            _stream_error(
+                                error_message,
+                                retryable=True,
+                                terminal_status=terminal_status,
+                                terminal_reason=reason,
+                            )
+                        )
+                        phone_action_registry.mark_terminal(run_id, terminal_reason=reason)
+                        phone_action_registry.mark_backend_status(run_id, terminal_status)
+                        return
+                    # ✅ 只有 filter_.terminal_status is not None 才走正常终态路径
+                    # 内部 LangGraph 流关闭后，等待 500ms 让 trace terminal 等异步事件 flush 到 SSE 通道
+                    await asyncio.sleep(0.5)
+                    for safe_frame in filter_.finish():
+                        yield encode(safe_frame)
+                    logger.info(
+                        "mobile_run_stream_finished run_id={} thread_id={} terminal_status={}",
+                        run_id, thread_id, filter_.terminal_status,
+                    )
+                    phone_action_registry.mark_terminal(run_id)
+                    phone_action_registry.mark_backend_status(
+                        run_id,
+                        filter_.terminal_status or "missing_terminal",
+                    )
         except asyncio.CancelledError:
             logger.info("mobile_run_stream_cancelled run_id={} thread_id={}", run_id, thread_id)
             # A cancelled proxy task can be caused by Android recreating the SSE
-            # connection. Explicit /cancel and server timeout paths are the only
-            # places that should interrupt the native LangGraph run.
+            # connection. Only explicit /cancel should interrupt the native
+            # LangGraph run.
             raise
         # 代理边界不允许把内部异常变成半截 SSE 响应；取消信号继承自
         # BaseException，不会被此处捕获，仍可正常终止请求。
@@ -404,23 +383,15 @@ def _with_mobile_run_config(raw: bytes, *, run_id: str, thread_id: str) -> bytes
     configurable.update({"mobile_run_id": run_id, "thread_id": thread_id})
     config["configurable"] = configurable
     # deep_agent (create_deep_agent) 已内置 recursion_limit=9,999，
-    # 不再用 MOBILE_AGENT_MAX_RECURSION 覆盖它——移动端代理的超时安全网
-    # 由 MOBILE_AGENT_MAX_EXECUTION_SECONDS 保证。
+    # 不再用 MOBILE_AGENT_MAX_RECURSION 覆盖它。
     payload["config"] = config
     # Keep the native LangGraph run alive if the mobile SSE proxy disconnects.
-    # Explicit /cancel and execution timeout remain the authoritative cancel paths.
+    # Explicit /cancel remains the authoritative cancel path.
     payload["on_disconnect"] = "continue"
     # No task may silently sit behind a stale run on the same LangGraph
     # thread. The client must receive a deterministic rejection instead.
     payload["multitask_strategy"] = "reject"
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-
-
-def _positive_env(name: str, default: int) -> int:
-    try:
-        return max(int(os.getenv(name, str(default))), 1)
-    except ValueError:
-        return default
 
 
 def _positive_float_env(name: str, default: float) -> float:
