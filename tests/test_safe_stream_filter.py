@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from mobile_agent.safe_stream import SafeStreamFilter, SseFrame
+from mobile_agent.safe_stream import SafeStreamFilter, SseFrame, _encode_frame, _stream_error
 from mobile_agent.trace import MAX_TRACE_EVENT_BYTES
 
 
@@ -76,6 +76,26 @@ def test_filter_strips_think_across_chunks_and_keeps_safe_answer_text() -> None:
     assert [frame.data["chunk"] for frame in second if frame.event == "assistant.delta"] == ["最终"]
     assert [frame.data["chunk"] for frame in third if frame.event == "assistant.delta"] == ["回答"]
     assert all("private" not in chunk and "abc" not in chunk for chunk in chunks)
+
+
+def test_filter_strips_standalone_closing_think_tags_and_variants() -> None:
+    stream = SafeStreamFilter()
+
+    frames = [
+        *stream.feed(SseFrame(event="messages-tuple", data=_assistant_payload("</"))),
+        *stream.feed(SseFrame(event="messages-tuple", data=_assistant_payload("think>最终"))),
+        *stream.feed(SseFrame(event="messages-tuple", data=_assistant_payload("abc</think>def"))),
+        *stream.feed(SseFrame(event="messages-tuple", data=_assistant_payload("abc </THINK> def"))),
+        *stream.feed(SseFrame(event="messages-tuple", data=_assistant_payload("< think >secret< / think >safe"))),
+    ]
+
+    chunks = [frame.data["chunk"] for frame in frames if frame.event == "assistant.delta"]
+
+    assert chunks == ["最终", "abcdef", "abc  def", "safe"]
+    encoded = json.dumps([frame.data for frame in frames], ensure_ascii=False)
+    assert "<think" not in encoded.lower()
+    assert "</think" not in encoded.lower()
+    assert "secret" not in encoded
 
 
 def test_filter_emits_assistant_text_incrementally_before_stream_finish() -> None:
@@ -338,6 +358,53 @@ def test_filter_forwards_task_complexity_without_unknown_fields() -> None:
         "reason": "zero_or_one_tool_call",
         "message": "Short task: skip step tracking",
     }
+
+
+def test_stream_error_sanitizes_traceback_and_secret_like_values() -> None:
+    frame = _stream_error(
+        "Traceback (most recent call last):\n"
+        "  File \"/srv/app.py\", line 1\n"
+        "RuntimeError: token=secret Cookie: session=raw AppKey=app-1 </think> "
+        "data:image/png;base64,AAAA 验证码:123456",
+        retryable=True,
+        terminal_status="failed",
+        terminal_reason="stream_error",
+    )
+
+    encoded = _encode_frame(frame, stream_seq=1)
+
+    assert "Traceback" not in encoded
+    assert "/srv/app.py" not in encoded
+    assert "secret" not in encoded
+    assert "session=raw" not in encoded
+    assert "app-1" not in encoded
+    assert "base64" not in encoded
+    assert "123456" not in encoded
+    assert "</think>" not in encoded
+    assert "terminalStatus" in encoded
+
+
+def test_stream_error_sanitizes_bearer_cookie_base64_and_ui_tree() -> None:
+    raw_base64 = "QUJD" * 80
+    frame = _stream_error(
+        "Authorization: Bearer server-secret-token "
+        "Cookie: session=raw; theme=dark "
+        f"screenshot={raw_base64} "
+        "raw tool result: {\"uiTree\":\"<hierarchy><node text='验证码123456'/></hierarchy>\"}",
+        retryable=True,
+        terminal_status="failed",
+        terminal_reason="stream_error",
+    )
+
+    encoded = _encode_frame(frame, stream_seq=1)
+
+    assert "server-secret-token" not in encoded
+    assert "session=raw" not in encoded
+    assert "theme=dark" not in encoded
+    assert raw_base64[:64] not in encoded
+    assert "<hierarchy" not in encoded
+    assert "uiTree" not in encoded
+    assert "验证码123456" not in encoded
 
 
 def test_filter_limits_each_assistant_event_below_four_kib() -> None:

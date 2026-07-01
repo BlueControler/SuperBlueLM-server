@@ -162,14 +162,16 @@ def test_unexpected_upstream_failure_is_converted_to_a_safe_sse_error(
     assert frames[1][1]["status"] == "failed"
     assert frames[1][1]["reason"] == "stream_error"
     assert frames[1][1]["seq"] > 0
-    assert frames[2][1] == {
-        "type": "stream.error",
-        "message": "服务连接中断，请稍后重试。",
-        "retryable": True,
-        "terminalStatus": "failed",
-        "terminalReason": "stream_error",
-        "streamSeq": 3,
-    }
+    assert frames[2][1]["type"] == "stream.error"
+    assert frames[2][1]["message"] == "服务连接中断，请稍后重试。"
+    assert frames[2][1]["retryable"] is True
+    assert frames[2][1]["terminalStatus"] == "failed"
+    assert frames[2][1]["terminalReason"] == "stream_error"
+    assert frames[2][1]["streamSeq"] == 3
+    assert frames[2][1]["threadId"] == "thread-1"
+    assert frames[2][1]["mobileRunId"] == frames[0][1]["runId"]
+    assert frames[2][1]["runId"] == frames[0][1]["runId"]
+    assert isinstance(frames[2][1]["timestamp"], int)
 
 
 def test_upstream_http_error_body_is_not_exposed_in_stream_error(monkeypatch) -> None:
@@ -250,10 +252,119 @@ def test_safe_stream_route_encodes_only_safe_sse_frames(monkeypatch) -> None:
     assert "must-not-leak" not in json.dumps(payloads[0], ensure_ascii=False)
     assert payloads[1]["event"] == "run.terminal"
     assert payloads[1]["status"] == "succeeded"
-    assert payloads[2] == {"type": "assistant.delta", "chunk": "微信已打开", "streamSeq": 3}
-    assert payloads[3] == {"type": "stream.eof", "streamSeq": 4}
+    assert payloads[2]["type"] == "assistant.delta"
+    assert payloads[2]["chunk"] == "微信已打开"
+    assert payloads[2]["streamSeq"] == 3
+    assert payloads[2]["runId"] == "run-client-1"
+    assert payloads[2]["mobileRunId"] == "run-client-1"
+    assert payloads[2]["threadId"] == "thread-1"
+    assert isinstance(payloads[2]["timestamp"], int)
+    assert payloads[3]["type"] == "stream.eof"
+    assert payloads[3]["streamSeq"] == 4
+    assert payloads[3]["runId"] == "run-client-1"
+    assert payloads[3]["mobileRunId"] == "run-client-1"
+    assert payloads[3]["threadId"] == "thread-1"
+    assert isinstance(payloads[3]["timestamp"], int)
     assert "<think>" not in response.text
     assert "internal" not in response.text
+
+
+def test_safe_stream_normalizes_trace_run_id_to_client_owned_mobile_run_id(monkeypatch) -> None:
+    monkeypatch.setenv("LANGGRAPH_INTERNAL_BASE_URL", "http://internal.example")
+    _StreamingAsyncClient.lines = [
+        "event: custom",
+        "data: "
+        + json.dumps(
+            {
+                "type": "trace.v1",
+                "version": 1,
+                "runId": "trace-upstream-run-1",
+                "eventId": "event-1",
+                "seq": 1,
+                "event": "run.started",
+                "threadId": "thread-1",
+                "summary": "已接收请求，正在连接 Agent。",
+            },
+            ensure_ascii=False,
+        ),
+        "",
+        "event: custom",
+        "data: "
+        + json.dumps(
+            {
+                "type": "trace.v1",
+                "version": 1,
+                "runId": "trace-upstream-run-1",
+                "eventId": "event-2",
+                "seq": 2,
+                "event": "run.terminal",
+                "status": "succeeded",
+            },
+            ensure_ascii=False,
+        ),
+        "",
+    ]
+    monkeypatch.setattr("mobile_agent.safe_stream.httpx.AsyncClient", _StreamingAsyncClient)
+
+    response = TestClient(app).post(
+        "/mobile/threads/thread-1/runs/stream",
+        json={"input": {"messages": []}},
+        headers={"X-Mobile-Run-Id": "run-client-1"},
+    )
+
+    frames = _parse_sse(response.text)
+    assert [event for event, _ in frames] == [
+        "stream.started",
+        "trace.v1",
+        "trace.v1",
+        "stream.eof",
+    ]
+    assert frames[0][1]["runId"] == "run-client-1"
+    assert frames[1][1]["runId"] == "run-client-1"
+    assert frames[1][1]["threadId"] == "thread-1"
+    assert frames[2][1]["runId"] == "run-client-1"
+    assert frames[2][1]["event"] == "run.terminal"
+    assert frames[2][1]["status"] == "succeeded"
+
+
+def test_safe_stream_adds_lifecycle_identity_to_safe_events(monkeypatch) -> None:
+    monkeypatch.setenv("LANGGRAPH_INTERNAL_BASE_URL", "http://internal.example")
+    _StreamingAsyncClient.lines = [
+        "event: messages-tuple",
+        "data: " + json.dumps([{"type": "ai", "content": "ok", "id": "model-final"}, {}], ensure_ascii=False),
+        "",
+        "event: custom",
+        "data: "
+        + json.dumps(
+            {
+                "type": "trace.v1",
+                "version": 1,
+                "runId": "upstream-run-1",
+                "eventId": "event-terminal",
+                "seq": 1,
+                "event": "run.terminal",
+                "status": "succeeded",
+            },
+            ensure_ascii=False,
+        ),
+        "",
+    ]
+    monkeypatch.setattr("mobile_agent.safe_stream.httpx.AsyncClient", _StreamingAsyncClient)
+
+    response = TestClient(app).post(
+        "/mobile/threads/thread-identity/runs/stream",
+        json={"input": {"messages": []}},
+        headers={"X-Mobile-Run-Id": "run-client-identity"},
+    )
+
+    frames = _parse_sse(response.text)
+    for event_name, payload in frames:
+        assert payload["threadId"] == "thread-identity"
+        assert payload["mobileRunId"] == "run-client-identity"
+        assert payload["streamSeq"] > 0
+        assert isinstance(payload["timestamp"], int)
+        if event_name in {"assistant.delta", "stream.eof", "stream.error"}:
+            assert payload["runId"] == "run-client-identity"
 
 
 def test_safe_stream_forwards_assistant_deltas_before_terminal(monkeypatch) -> None:
@@ -323,6 +434,11 @@ def test_safe_stream_normal_terminal_path_does_not_call_fixed_sleep(monkeypatch)
     ]
     monkeypatch.setattr("mobile_agent.safe_stream.httpx.AsyncClient", _StreamingAsyncClient)
 
+    async def fail_sleep(_: float) -> None:
+        raise AssertionError("normal terminal path must not call fixed sleep")
+
+    monkeypatch.setattr("mobile_agent.safe_stream.asyncio.sleep", fail_sleep)
+
     response = TestClient(app).post(
         "/mobile/threads/thread-1/runs/stream",
         json={"input": {"messages": []}},
@@ -332,11 +448,11 @@ def test_safe_stream_normal_terminal_path_does_not_call_fixed_sleep(monkeypatch)
     assert [event for event, _ in frames] == ["stream.started", "trace.v1", "stream.eof"]
 
 
-def test_plain_text_without_trace_terminal_completes_as_simple_reply(monkeypatch) -> None:
+def test_plain_text_without_trace_terminal_gets_synthetic_success_terminal(monkeypatch) -> None:
     monkeypatch.setenv("LANGGRAPH_INTERNAL_BASE_URL", "http://internal.example")
     _StreamingAsyncClient.lines = [
         "event: messages-tuple",
-        "data: " + json.dumps([{"type": "ai", "content": "处理中"}, {}], ensure_ascii=False),
+        "data: " + json.dumps([{"type": "ai", "content": "ok"}, {}], ensure_ascii=False),
         "",
     ]
     monkeypatch.setattr("mobile_agent.safe_stream.httpx.AsyncClient", _StreamingAsyncClient)
@@ -350,10 +466,40 @@ def test_plain_text_without_trace_terminal_completes_as_simple_reply(monkeypatch
     assert [event for event, _ in frames] == [
         "stream.started",
         "assistant.delta",
+        "trace.v1",
         "stream.eof",
     ]
-    assert frames[1][1]["chunk"] == "处理中"
-    assert not any(payload.get("event") == "run.terminal" for _, payload in frames)
+    assert frames[1][1]["chunk"] == "ok"
+    assert frames[2][1]["event"] == "run.terminal"
+    assert frames[2][1]["status"] == "succeeded"
+    assert frames[2][1]["reason"] == "upstream_completed_without_terminal"
+    assert frames[3][1]["type"] == "stream.eof"
+
+
+def test_heartbeat_only_then_eof_is_interrupted_not_success(monkeypatch) -> None:
+    monkeypatch.setenv("LANGGRAPH_INTERNAL_BASE_URL", "http://internal.example")
+    monkeypatch.setenv("MOBILE_AGENT_STREAM_HEARTBEAT_SECONDS", "1")
+    _DelayedStreamingAsyncClient.delays = [1.2]
+    _DelayedStreamingAsyncClient.lines = [""]
+    monkeypatch.setattr("mobile_agent.safe_stream.httpx.AsyncClient", _DelayedStreamingAsyncClient)
+
+    response = TestClient(app).post(
+        "/mobile/threads/thread-1/runs/stream",
+        json={"input": {"messages": []}},
+        headers={"X-Mobile-Run-Id": "run-client-1"},
+    )
+
+    frames = _parse_sse(response.text)
+    assert [event for event, _ in frames] == [
+        "stream.started",
+        "stream.heartbeat",
+        "trace.v1",
+        "stream.error",
+    ]
+    assert frames[1][1]["type"] == "stream.heartbeat"
+    assert frames[2][1]["event"] == "run.terminal"
+    assert frames[2][1]["status"] == "failed"
+    assert frames[3][1]["terminalReason"] == "upstream_ended_without_terminal"
 
 
 def test_trace_step_without_terminal_fails_without_success_terminal(monkeypatch) -> None:
@@ -402,6 +548,70 @@ def test_trace_step_without_terminal_fails_without_success_terminal(monkeypatch)
     assert frames[-2][1]["reason"] == "upstream_ended_without_terminal"
     assert frames[-2][1]["seq"] == 2
     assert frames[-1][1]["terminalStatus"] == "failed"
+
+
+def test_succeeded_tool_step_without_terminal_gets_synthetic_success_terminal(monkeypatch) -> None:
+    monkeypatch.setenv("LANGGRAPH_INTERNAL_BASE_URL", "http://internal.example")
+    _StreamingAsyncClient.lines = [
+        "event: custom",
+        "data: "
+        + json.dumps(
+            {
+                "type": "task_progress",
+                "label": "打开微信",
+                "status": "running",
+                "phase": "phone_tool",
+                "message": "正在打开微信",
+            },
+            ensure_ascii=False,
+        ),
+        "",
+        "event: custom",
+        "data: "
+        + json.dumps(
+            {
+                "type": "trace.v1",
+                "version": 1,
+                "runId": "run-1",
+                "eventId": "event-1",
+                "seq": 1,
+                "event": "step.upsert",
+                "step": {
+                    "stepId": "tool-1",
+                    "kind": "tool",
+                    "title": "打开微信",
+                    "summary": "微信已打开。",
+                    "status": "succeeded",
+                    "visibleToUser": True,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        "",
+    ]
+    monkeypatch.setattr("mobile_agent.safe_stream.httpx.AsyncClient", _StreamingAsyncClient)
+
+    response = TestClient(app).post(
+        "/mobile/threads/thread-1/runs/stream",
+        json={"input": {"messages": []}},
+    )
+
+    frames = _parse_sse(response.text)
+    assert [event for event, _ in frames] == [
+        "stream.started",
+        "task_progress",
+        "trace.v1",
+        "trace.v1",
+        "stream.eof",
+    ]
+    assert frames[1][1]["type"] == "task_progress"
+    assert frames[2][1]["event"] == "step.upsert"
+    assert frames[2][1]["step"]["status"] == "succeeded"
+    assert frames[3][1]["event"] == "run.terminal"
+    assert frames[3][1]["status"] == "succeeded"
+    assert frames[3][1]["reason"] == "upstream_completed_without_terminal"
+    assert frames[3][1]["seq"] == 2
+    assert frames[4][1]["type"] == "stream.eof"
 
 
 def test_safe_stream_still_errors_on_empty_stream_without_terminal(monkeypatch) -> None:

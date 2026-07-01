@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 
 from loguru import logger
@@ -203,26 +204,33 @@ async def cancel_mobile_run(request: Request) -> JSONResponse:
         return JSONResponse(
             {
                 "runId": run_id,
+                "mobileRunId": run_id,
                 "threadId": thread_id,
                 "status": "not_found",
                 "backendRunId": None,
                 "backendStatus": "missing",
                 "cancelSource": None,
                 "terminalReason": "not_found",
+                "timestamp": int(time.time() * 1000),
             }
         )
     cancel_source = await _cancel_source_from_request(request)
     before_snapshot = phone_action_registry.snapshot(run_id)
-    if before_snapshot.get("status") in {"terminal", "cancelled"}:
+    if _snapshot_has_confirmed_backend_terminal(before_snapshot):
         return JSONResponse(
             {
                 "runId": run_id,
+                "mobileRunId": run_id,
                 "threadId": thread_id,
                 "status": "already_terminal",
                 "backendRunId": before_snapshot.get("backendRunId"),
                 "backendStatus": before_snapshot.get("backendStatus", "not_started"),
+                "deviceStatus": "already_terminal",
+                "localFenced": True,
+                "retryable": False,
                 "cancelSource": before_snapshot.get("cancelSource"),
                 "terminalReason": before_snapshot.get("terminalReason"),
+                "timestamp": int(time.time() * 1000),
             }
         )
 
@@ -242,19 +250,26 @@ async def cancel_mobile_run(request: Request) -> JSONResponse:
     logger.info("mobile_run_cancel_requested run_id={} thread_id={}", run_id, thread_id)
     backend_status = await cancel_upstream_run(run_id, cancellation_headers)
     after_snapshot = phone_action_registry.snapshot(run_id)
-    response_status = (
-        "not_bound_but_fenced"
-        if backend_status == "unknown_not_bound"
-        else "cancellation_requested"
-    )
+    backend_run_id = after_snapshot.get("backendRunId")
+    if backend_status == "cancel_requested" and backend_run_id is not None:
+        backend_status = await upstream_run_status(run_id, cancellation_headers)
+        after_snapshot = phone_action_registry.snapshot(run_id)
+        backend_run_id = after_snapshot.get("backendRunId")
+    device_status = "not_bound"
     if device_id is not None:
         try:
             await phone_gateway.cancel_run(run_id, device_id)
+            device_status = "canceled"
         except DeviceGatewayError:
             # The ledger is already cancelled.  A disconnected device cannot
             # receive a later command because every incoming command is also
             # rejected by its persisted run cancellation state.
-            pass
+            device_status = "cancel_failed"
+    response_status, retryable = _cancel_response_status(
+        backend_status,
+        device_status=device_status,
+        backend_run_id=backend_run_id,
+    )
     phone_action_registry.trigger_stream_cancellation(run_id)
     logger.info(
         "mobile_run_cancel_dispatched run_id={} thread_id={} backend_status={}",
@@ -265,12 +280,17 @@ async def cancel_mobile_run(request: Request) -> JSONResponse:
     return JSONResponse(
         {
             "runId": run_id,
+            "mobileRunId": run_id,
             "threadId": thread_id,
             "status": response_status,
-            "backendRunId": after_snapshot.get("backendRunId"),
+            "backendRunId": backend_run_id,
             "backendStatus": backend_status,
+            "deviceStatus": device_status,
+            "localFenced": True,
+            "retryable": retryable,
             "cancelSource": cancel_source,
             "terminalReason": cancel_source,
+            "timestamp": int(time.time() * 1000),
         }
     )
 
@@ -315,11 +335,54 @@ _TERMINAL_BACKEND_STATUSES = {
     "server_timeout",
     "stream_closed",
     "thread_busy",
-    "unknown_not_bound",
-    "cancel_unavailable",
-    "cancel_request_failed",
     "not_started",
 }
+
+_CONFIRMED_ALREADY_TERMINAL_BACKEND_STATUSES = _TERMINAL_BACKEND_STATUSES - {
+    # 本地 SSE proxy 关闭不代表 LangGraph/backend run 已停止。
+    "stream_closed",
+}
+
+_CONFIRMED_CANCEL_BACKEND_STATUSES = {
+    "cancelled",
+    "not_started",
+}
+
+_UNCONFIRMED_CANCEL_BACKEND_STATUSES = {
+    "running",
+    "pending",
+    "cancel_requested",
+    "unavailable",
+}
+
+
+def _snapshot_has_confirmed_backend_terminal(snapshot: Mapping[str, object]) -> bool:
+    if snapshot.get("status") not in {"terminal", "cancelled"}:
+        return False
+    backend_status = str(snapshot.get("backendStatus", "not_started"))
+    return backend_status in _CONFIRMED_ALREADY_TERMINAL_BACKEND_STATUSES
+
+
+def _cancel_response_status(
+    backend_status: str,
+    *,
+    device_status: str,
+    backend_run_id: object,
+) -> tuple[str, bool]:
+    if device_status == "cancel_failed":
+        return "device_cancel_failed", True
+    if backend_status == "unknown_not_bound":
+        return "backend_run_not_bound", True
+    if backend_status in {"cancel_unavailable", "cancel_request_failed"}:
+        return backend_status, True
+    if backend_status in _CONFIRMED_CANCEL_BACKEND_STATUSES:
+        return (
+            "canceled_confirmed" if backend_run_id is not None else "local_fenced_only",
+            False,
+        )
+    if backend_status in _UNCONFIRMED_CANCEL_BACKEND_STATUSES:
+        return "backend_still_running", True
+    return "local_fenced_only", False
 
 
 async def _cancel_source_from_request(request: Request) -> str:

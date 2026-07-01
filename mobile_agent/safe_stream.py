@@ -32,13 +32,28 @@ from .trace import (
 # SafeSseFrame 会额外带上 type/chunk JSON 外壳，预留空间后仍严格小于 4 KiB。
 MAX_SAFE_ASSISTANT_DELTA_BYTES = 3_800
 _SENSITIVE_VALUE = re.compile(
-    r"(?i)\b(api[_-]?key|token|password|secret|authorization)\s*[:=]\s*[^\s,;，。]+"
+    r"(?i)\b(api[_-]?key|app[_-]?key|appkey|x-api-key|token|password|secret|authorization|cookie)\s*[:=]\s*[^\s,;，。]+"
 )
+_AUTHORIZATION_VALUE = re.compile(
+    r"(?i)\bauthorization\s*[:=]\s*(?:[A-Za-z]+\s+)?[^\s,;，。\r\n]+"
+)
+_COOKIE_VALUE = re.compile(r"(?i)\bcookie\s*[:=]\s*[^\r\n]+")
 _IMAGE_DATA = re.compile(r"data:image/[^;\s]+;base64,[A-Za-z0-9+/=]+", re.IGNORECASE)
+_LONG_BASE64 = re.compile(r"\b[A-Za-z0-9+/]{120,}={0,2}\b")
 _VERIFICATION_CODE = re.compile(r"验证码\s*[:=：]?\s*[A-Za-z0-9]{0,16}")
+_TRACEBACK_TEXT = re.compile(r"(?is)Traceback\s*\(most recent call last\):.*")
+_UI_TREE_TEXT = re.compile(r"(?is)<hierarchy\b.*?</hierarchy>|<node\b[^>]*(?:/>|>.*?</node>)")
+_RAW_TOOL_TEXT = re.compile(
+    r"(?is)\b(?:raw\s+tool\s+(?:args?|result)|raw[_-]?(?:args?|result)|tool[_\s-]+(?:args?|result))\s*[:=]\s*(?:\{.*?\}|\[.*?\]|[^\r\n]+)"
+)
 _RUN_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _PUBLIC_TEXT_BLOCK_TYPES = frozenset({"text", "output_text", "input_text"})
 _REASONING_BLOCK_TOKENS = ("reasoning", "thinking", "thought")
+_COMPLETED_WORK_STATUSES = frozenset({"succeeded", "completed", "done"})
+_INCOMPLETE_WORK_STATUSES = frozenset({"queued", "running", "waiting_for_user"})
+_FAILED_WORK_STATUSES = frozenset({"failed", "cancelled", "error", "timeout"})
+_THINK_BLOCK_TEXT = re.compile(r"(?is)<\s*think\s*>.*?<\s*/\s*think\s*>")
+_THINK_TAG_TEXT = re.compile(r"(?is)<\s*/?\s*think\s*>")
 
 
 @dataclass(frozen=True)
@@ -57,11 +72,20 @@ class SafeSseFrame:
 class SafeStreamFilter:
     """Whitelist-only transformation from LangGraph events to mobile events."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        run_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> None:
         self._think = _ThinkStripper()
+        self._run_id = run_id
+        self._thread_id = thread_id
         self.terminal_status: str | None = None
         self._has_any_text = False
         self._has_trace_event = False
+        self._step_statuses: dict[str, str] = {}
+        self._progress_statuses: dict[str, str] = {}
         self._last_trace_seq = 0
 
     @property
@@ -75,6 +99,14 @@ class SafeStreamFilter:
     @property
     def next_trace_seq(self) -> int:
         return self._last_trace_seq + 1
+
+    @property
+    def can_synthesize_success_terminal(self) -> bool:
+        if self.terminal_status is not None:
+            return False
+        if self._has_failed_visible_work or self._has_incomplete_visible_work:
+            return False
+        return self._has_any_text or self._has_completed_visible_work
 
     def feed(self, upstream_event: SseFrame) -> list[SafeSseFrame]:
         event = upstream_event.event.lower()
@@ -97,7 +129,11 @@ class SafeStreamFilter:
             return []
         payload_type = payload.get("type")
         if payload_type == "trace.v1":
-            safe = _safe_trace_payload(payload)
+            safe = _safe_trace_payload(
+                payload,
+                mobile_run_id=self._run_id,
+                thread_id=self._thread_id,
+            )
             if _starts_non_summary_step(safe):
                 self._discard_pending_assistant_text()
             if safe is not None:
@@ -108,12 +144,15 @@ class SafeStreamFilter:
                 status = safe.get("status")
                 self.terminal_status = status if isinstance(status, str) else None
             if safe is not None:
+                self._record_trace_status(safe)
                 self._has_trace_event = True
             return [SafeSseFrame("trace.v1", safe)] if safe is not None else []
         if payload_type == "task_progress":
             safe = _safe_progress_payload(payload)
             if _starts_non_analysis_progress(safe):
                 self._discard_pending_assistant_text()
+            if safe is not None:
+                self._record_progress_status(safe)
             return [SafeSseFrame("task_progress", safe)] if safe is not None else []
         if payload_type == "task_complexity":
             safe = _safe_task_complexity_payload(payload)
@@ -133,6 +172,45 @@ class SafeStreamFilter:
 
     def _discard_pending_assistant_text(self) -> None:
         self._think = _ThinkStripper()
+
+    @property
+    def _has_completed_visible_work(self) -> bool:
+        if self._step_statuses:
+            return any(status in _COMPLETED_WORK_STATUSES for status in self._step_statuses.values())
+        return any(status in _COMPLETED_WORK_STATUSES for status in self._progress_statuses.values())
+
+    @property
+    def _has_incomplete_visible_work(self) -> bool:
+        if self._step_statuses:
+            return any(status in _INCOMPLETE_WORK_STATUSES for status in self._step_statuses.values())
+        return any(status in _INCOMPLETE_WORK_STATUSES for status in self._progress_statuses.values())
+
+    @property
+    def _has_failed_visible_work(self) -> bool:
+        if self._step_statuses:
+            return any(status in _FAILED_WORK_STATUSES for status in self._step_statuses.values())
+        return any(status in _FAILED_WORK_STATUSES for status in self._progress_statuses.values())
+
+    def _record_trace_status(self, payload: Mapping[str, Any]) -> None:
+        if payload.get("event") != "step.upsert":
+            return
+        step = payload.get("step")
+        if not isinstance(step, Mapping):
+            return
+        step_id = step.get("stepId")
+        status = step.get("status")
+        if isinstance(step_id, str) and isinstance(status, str):
+            self._step_statuses[step_id] = status
+
+    def _record_progress_status(self, payload: Mapping[str, Any]) -> None:
+        status = payload.get("status")
+        if not isinstance(status, str):
+            return
+        label = payload.get("label")
+        phase = payload.get("phase")
+        progress_key = payload.get("progressKey")
+        key = progress_key if isinstance(progress_key, str) and progress_key else f"{phase}:{label}"
+        self._progress_statuses[str(key)] = status
 
 
 async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
@@ -164,14 +242,31 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
         )
 
     async def generate() -> AsyncIterator[str]:
-        filter_ = SafeStreamFilter()
+        filter_ = SafeStreamFilter(run_id=run_id, thread_id=thread_id)
         stream_seq = 0
         terminal_emitted = False
 
         def encode(frame: SafeSseFrame) -> str:
             nonlocal stream_seq
             stream_seq += 1
-            return _encode_frame(frame, stream_seq=stream_seq)
+            backend_run_id: str | None = None
+            run_info = phone_action_registry.backend_run_info(run_id)
+            if run_info is not None:
+                backend_run_id = run_info[1]
+            _log_safe_frame_emit(
+                frame,
+                run_id=run_id,
+                thread_id=thread_id,
+                stream_seq=stream_seq,
+            )
+            return _encode_frame(
+                frame,
+                stream_seq=stream_seq,
+                run_id=run_id,
+                thread_id=thread_id,
+                backend_run_id=backend_run_id,
+                timestamp=_timestamp_ms(),
+            )
 
         def synthetic_terminal(status: str, reason: str) -> SafeSseFrame:
             nonlocal terminal_emitted
@@ -246,21 +341,21 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
                         for safe_frame in filter_.feed(frame):
                             yield encode(safe_frame)
                     if filter_.terminal_status is None:
-                        if filter_.has_any_text and not filter_.has_trace_event:
+                        if filter_.can_synthesize_success_terminal:
+                            reason = "upstream_completed_without_terminal"
+                            yield encode(
+                                synthetic_terminal("succeeded", reason)
+                            )
                             for safe_frame in filter_.finish(allow_pending_text=True):
                                 yield encode(safe_frame)
                             logger.info(
-                                "mobile_run_plain_text_finished_without_trace_terminal run_id={} thread_id={}",
-                                run_id, thread_id,
+                                "mobile_run_stream_synthesized_success_terminal run_id={} thread_id={} reason={}",
+                                run_id, thread_id, reason,
                             )
                             phone_action_registry.mark_terminal(run_id)
-                            phone_action_registry.mark_backend_status(
-                                run_id,
-                                "plain_text_completed",
-                            )
-                            terminal_emitted = True
+                            phone_action_registry.mark_backend_status(run_id, "succeeded")
                             return
-                        # 有 trace/progress 但缺少 terminal 是异常终态，不能伪造成成功。
+                        # 没有任何可确认完成信号的 EOF 不能伪造成成功。
                         reason = "upstream_ended_without_terminal"
                         await _cancel_backend_and_device_run(
                             run_id,
@@ -287,9 +382,6 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
                         phone_action_registry.mark_terminal(run_id, terminal_reason=reason)
                         phone_action_registry.mark_backend_status(run_id, terminal_status)
                         return
-                    # ✅ 只有 filter_.terminal_status is not None 才走正常终态路径
-                    # 内部 LangGraph 流关闭后，等待 500ms 让 trace terminal 等异步事件 flush 到 SSE 通道
-                    await asyncio.sleep(0.5)
                     for safe_frame in filter_.finish():
                         yield encode(safe_frame)
                     logger.info(
@@ -461,7 +553,7 @@ def _stream_error(
 ) -> SafeSseFrame:
     data: dict[str, Any] = {
         "type": "stream.error",
-        "message": message,
+        "message": _safe_error_message(message),
         "retryable": retryable,
     }
     if terminal_status:
@@ -816,7 +908,12 @@ def _is_reasoning_block_type(block_type: str) -> bool:
     return any(token in block_type for token in _REASONING_BLOCK_TOKENS)
 
 
-def _safe_trace_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+def _safe_trace_payload(
+    payload: Mapping[str, Any],
+    *,
+    mobile_run_id: str | None = None,
+    thread_id: str | None = None,
+) -> dict[str, Any] | None:
     event_name = payload.get("event")
     run_id = payload.get("runId")
     event_id = payload.get("eventId")
@@ -828,14 +925,14 @@ def _safe_trace_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     safe: dict[str, Any] = {
         "type": "trace.v1",
         "version": 1,
-        "runId": _bounded(str(run_id), 128),
+        "runId": _bounded(str(mobile_run_id or run_id), 128),
         "eventId": _bounded(str(event_id), 128),
         "seq": sequence,
         "event": _bounded(str(event_name), 64),
     }
-    thread_id = payload.get("threadId")
-    if isinstance(thread_id, str) and thread_id:
-        safe["threadId"] = _bounded(thread_id, 128)
+    safe_thread_id = thread_id if isinstance(thread_id, str) and thread_id else payload.get("threadId")
+    if isinstance(safe_thread_id, str) and safe_thread_id:
+        safe["threadId"] = _bounded(safe_thread_id, 128)
     if event_name == "run.terminal":
         status = payload.get("status")
         if status in {"succeeded", "failed", "cancelled", "waiting_for_user"}:
@@ -996,15 +1093,30 @@ def _stream_started(*, run_id: str, thread_id: str) -> SafeSseFrame:
 def _sanitize_assistant_text(text: str) -> str:
     if not text:
         return ""
-    redacted = _SENSITIVE_VALUE.sub(lambda match: f"{match.group(1)}=***", text)
+    redacted = _strip_think_markup(text)
+    redacted = _AUTHORIZATION_VALUE.sub("Authorization=***", redacted)
+    redacted = _COOKIE_VALUE.sub("Cookie=***", redacted)
+    redacted = _RAW_TOOL_TEXT.sub("[已隐藏工具原始数据]", redacted)
+    redacted = _UI_TREE_TEXT.sub("[已隐藏UI树]", redacted)
+    redacted = _SENSITIVE_VALUE.sub(lambda match: f"{match.group(1)}=***", redacted)
     redacted = _IMAGE_DATA.sub("[已隐藏图片数据]", redacted)
+    redacted = _LONG_BASE64.sub("[已隐藏base64数据]", redacted)
     redacted = _VERIFICATION_CODE.sub("[已隐藏敏感内容]", redacted)
     return _limit_bytes(redacted, MAX_SAFE_ASSISTANT_DELTA_BYTES)
 
 
+def _safe_error_message(text: str) -> str:
+    without_traceback = _TRACEBACK_TEXT.sub("错误详情已隐藏。", text)
+    return _safe_description(without_traceback, MAX_TRACE_SUMMARY_CHARS) or "服务连接中断，请稍后重试。"
+
+
 def _safe_description(text: str, limit: int) -> str:
-    without_think = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
-    return _bounded(_sanitize_assistant_text(without_think), limit)
+    return _bounded(_sanitize_assistant_text(text), limit)
+
+
+def _strip_think_markup(text: str) -> str:
+    without_blocks = _THINK_BLOCK_TEXT.sub("", text)
+    return _THINK_TAG_TEXT.sub("", without_blocks)
 
 
 def _fit_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1079,12 +1191,60 @@ def _forward_headers(request: Request) -> dict[str, str]:
     return headers
 
 
-def _encode_frame(frame: SafeSseFrame, *, stream_seq: int | None = None) -> str:
+def _log_safe_frame_emit(
+    frame: SafeSseFrame,
+    *,
+    run_id: str,
+    thread_id: str,
+    stream_seq: int,
+) -> None:
+    trace_event = frame.data.get("event") if frame.event == "trace.v1" else None
+    terminal_status = frame.data.get("status") if trace_event == "run.terminal" else None
+    logger.debug(
+        "mobile_safe_stream_emit run_id={} thread_id={} stream_seq={} event={} trace_event={} terminal_status={}",
+        run_id,
+        _short_log_id(thread_id),
+        stream_seq,
+        frame.event,
+        trace_event,
+        terminal_status,
+    )
+
+
+def _encode_frame(
+    frame: SafeSseFrame,
+    *,
+    stream_seq: int | None = None,
+    run_id: str | None = None,
+    thread_id: str | None = None,
+    backend_run_id: str | None = None,
+    timestamp: int | None = None,
+) -> str:
     data = dict(frame.data)
     if stream_seq is not None:
         data["streamSeq"] = stream_seq
+    if run_id:
+        data.setdefault("mobileRunId", _bounded(run_id, 128))
+        if frame.event != "trace.v1":
+            data.setdefault("runId", _bounded(run_id, 128))
+    if thread_id:
+        data.setdefault("threadId", _bounded(thread_id, 128))
+    if backend_run_id:
+        data.setdefault("backendRunId", _bounded(backend_run_id, 128))
+    if timestamp is not None:
+        data.setdefault("timestamp", timestamp)
     data = _fit_safe_frame_payload(data)
     return f"event: {frame.event}\ndata: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
+
+def _timestamp_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _short_log_id(value: str | None) -> str:
+    if not value:
+        return "none"
+    return value if len(value) <= 12 else f"{value[:6]}…{value[-4:]}"
 
 
 def _fit_safe_frame_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1116,6 +1276,7 @@ def _fit_safe_frame_payload(payload: dict[str, Any]) -> dict[str, Any]:
 class _ThinkStripper:
     _OPEN = "<think>"
     _CLOSE = "</think>"
+    _MARKERS = (_OPEN, _CLOSE)
 
     def __init__(self) -> None:
         self._buffer = ""
@@ -1125,10 +1286,10 @@ class _ThinkStripper:
         self._buffer += text
         output: list[str] = []
         while self._buffer:
-            marker = self._CLOSE if self._inside else self._OPEN
-            index = self._buffer.lower().find(marker)
+            markers = (self._CLOSE,) if self._inside else self._MARKERS
+            marker, index = _find_first_marker(self._buffer, markers)
             if index < 0:
-                suffix_length = _partial_suffix_length(self._buffer, marker)
+                suffix_length = _partial_suffix_length(self._buffer, markers)
                 stable = self._buffer[:-suffix_length] if suffix_length else self._buffer
                 if not self._inside:
                     output.append(stable)
@@ -1136,7 +1297,7 @@ class _ThinkStripper:
                 break
             if not self._inside:
                 output.append(self._buffer[:index])
-                self._inside = True
+                self._inside = marker == self._OPEN
             else:
                 self._inside = False
             self._buffer = self._buffer[index + len(marker):]
@@ -1151,13 +1312,28 @@ class _ThinkStripper:
         return pending
 
 
-def _partial_suffix_length(value: str, marker: str) -> int:
+def _find_first_marker(value: str, markers: tuple[str, ...]) -> tuple[str, int]:
     lower_value = value.lower()
-    lower_marker = marker.lower()
-    for size in range(min(len(value), len(marker) - 1), 0, -1):
-        if lower_marker.startswith(lower_value[-size:]):
-            return size
-    return 0
+    first_marker = markers[0]
+    first_index = -1
+    for marker in markers:
+        index = lower_value.find(marker.lower())
+        if index >= 0 and (first_index < 0 or index < first_index):
+            first_marker = marker
+            first_index = index
+    return first_marker, first_index
+
+
+def _partial_suffix_length(value: str, markers: tuple[str, ...]) -> int:
+    lower_value = value.lower()
+    longest = 0
+    for marker in markers:
+        lower_marker = marker.lower()
+        for size in range(min(len(value), len(marker) - 1), 0, -1):
+            if lower_marker.startswith(lower_value[-size:]):
+                longest = max(longest, size)
+                break
+    return longest
 
 
 __all__ = ["SafeSseFrame", "SafeStreamFilter", "SseFrame", "safe_run_stream"]
