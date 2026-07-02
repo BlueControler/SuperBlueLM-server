@@ -7,6 +7,7 @@ from mobile_agent.agent.middleware import (
     ModeToolAccessMiddleware,
     SyncPhoneStateMiddleware,
 )
+from mobile_agent.agent.medical_travel_sop import MedicalTravelSopMiddleware
 from mobile_agent.agent.meeting_minutes_sop import MeetingMinutesSopMiddleware
 
 
@@ -45,6 +46,10 @@ def test_factory_wires_main_agent_to_raw_phone_tools(
     )
     assert any(
         isinstance(item, MeetingMinutesSopMiddleware)
+        for item in captured["middleware"]
+    )
+    assert any(
+        isinstance(item, MedicalTravelSopMiddleware)
         for item in captured["middleware"]
     )
     assert any(

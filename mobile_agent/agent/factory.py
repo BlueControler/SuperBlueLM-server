@@ -22,6 +22,11 @@ from .middleware import (
     SyncPhoneStateMiddleware,
     TaskComplexityMiddleware,
 )
+from .medical_travel_sop import (
+    MedicalTravelSopMiddleware,
+    MedicalTravelSopRunner,
+    build_medical_travel_sop_runner,
+)
 from .meeting_minutes_sop import MeetingMinutesSopMiddleware
 from .risk_gate import HighRiskActionGateMiddleware
 from .scenario3_demo import Scenario3DemoMiddleware
@@ -33,6 +38,7 @@ def build_middleware_stack(
     phone_gateway: DeviceGateway,
     phone_tool_names: set[str],
     device_scoped_tool_names: set[str],
+    medical_travel_runner: MedicalTravelSopRunner | None = None,
 ) -> list[AgentMiddleware[AgentState[Any], None, Any]]:
     """Returns the security-sensitive middleware order used by the main agent."""
     return cast(
@@ -42,6 +48,7 @@ def build_middleware_stack(
             TraceMiddleware(),
             MeetingMinutesSopMiddleware(),
             Scenario3DemoMiddleware(),
+            MedicalTravelSopMiddleware(medical_travel_runner),
             HighRiskActionGateMiddleware(),
             ModeToolAccessMiddleware(phone_tool_names, device_scoped_tool_names),
             TaskComplexityMiddleware(),
@@ -58,6 +65,7 @@ def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway)
     phone_tool_names = {tool.name for tool in phone_tools}
     system_tools = create_system_tools(system_gateway)
     scenario_system_tools = create_scenario_system_tools(system_gateway)
+    external_tools = create_external_tools()
     device_scoped_tool_names = (
         phone_tool_names
         | {tool.name for tool in system_tools}
@@ -67,6 +75,10 @@ def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway)
         phone_gateway=phone_gateway,
         phone_tool_names=phone_tool_names,
         device_scoped_tool_names=device_scoped_tool_names,
+        medical_travel_runner=build_medical_travel_sop_runner(
+            external_tools=external_tools,
+            system_tools=system_tools,
+        ),
     )
     return create_deep_agent(
         model=main_cloud_model,
@@ -74,7 +86,7 @@ def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway)
             *phone_tools,
             *system_tools,
             *scenario_system_tools,
-            *create_external_tools(),
+            *external_tools,
             *create_memory_tools(),
             *create_completion_tools(),
         ],

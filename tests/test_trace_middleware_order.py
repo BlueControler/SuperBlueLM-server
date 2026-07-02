@@ -23,6 +23,8 @@ def test_trace_stack_order_is_locked() -> None:
         "ResetAgentRunStateMiddleware",
         "TraceMiddleware",
         "MeetingMinutesSopMiddleware",
+        "Scenario3DemoMiddleware",
+        "MedicalTravelSopMiddleware",
         "HighRiskActionGateMiddleware",
         "ModeToolAccessMiddleware",
         "TaskComplexityMiddleware",
