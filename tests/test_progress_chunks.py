@@ -103,6 +103,49 @@ def test_emit_task_progress_writes_custom_payload(monkeypatch: Any) -> None:
     ]
 
 
+def test_emit_task_progress_writes_task_card_payload(monkeypatch: Any) -> None:
+    emitted: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(progress, "get_stream_writer", lambda: emitted.append)
+
+    progress.emit_task_progress(
+        label="会议通知",
+        task_title="为会议通知创建提醒",
+        status="waiting_confirmation",
+        phase="confirmation",
+        step_title="等待确认是否创建会议提醒",
+        message="检测到会议通知，是否创建提醒？",
+        tool_name="needs_confirmation",
+        progress_key="scenario3-demo",
+        current_step=2,
+        total_steps=3,
+        requires_confirmation=True,
+        confirmation_id="confirm-123",
+        can_cancel=True,
+        can_take_over=True,
+    )
+
+    assert emitted == [
+        {
+            "type": "task_progress",
+            "label": "会议通知",
+            "taskTitle": "为会议通知创建提醒",
+            "status": "waiting_confirmation",
+            "phase": "confirmation",
+            "stepTitle": "等待确认是否创建会议提醒",
+            "message": "检测到会议通知，是否创建提醒？",
+            "toolName": "needs_confirmation",
+            "progressKey": "scenario3-demo",
+            "currentStep": 2,
+            "totalSteps": 3,
+            "requiresConfirmation": True,
+            "confirmationId": "confirm-123",
+            "canCancel": True,
+            "canTakeOver": True,
+        }
+    ]
+
+
 def test_emit_task_progress_ignores_missing_stream_context(monkeypatch: Any) -> None:
     def raise_no_stream() -> Any:
         raise RuntimeError("no active stream")

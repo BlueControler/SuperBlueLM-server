@@ -310,16 +310,28 @@ def test_filter_drops_hidden_or_unknown_detail_events() -> None:
     assert stream.feed(SseFrame(event="custom", data=json.dumps(unknown_kind))) == []
 
 
-def test_filter_forwards_legacy_progress_without_unknown_fields() -> None:
+def test_filter_forwards_progress_task_card_fields_without_unknown_fields() -> None:
     stream = SafeStreamFilter()
     payload = {
         "type": "task_progress",
         "label": "observe",
+        "taskTitle": "为会议通知创建提醒",
         "status": "running",
         "phase": "phone_tool",
+        "stepTitle": "检测到会议通知",
         "message": "Running phone tool",
         "error": "raw result token=secret",
-        "toolName": "internal_tool_with_args",
+        "toolName": "list_notifications",
+        "requiresConfirmation": False,
+        "confirmationId": "confirm-123",
+        "canCancel": True,
+        "canTakeOver": True,
+        "currentStep": 1,
+        "totalSteps": 3,
+        "completedSteps": [
+            {"index": 1, "name": "检测到会议通知", "status": "completed", "raw": "token=secret"},
+        ],
+        "dryRun": True,
         "secret": "must not escape",
     }
 
@@ -330,9 +342,22 @@ def test_filter_forwards_legacy_progress_without_unknown_fields() -> None:
     assert frames[0].data == {
         "type": "task_progress",
         "label": "observe",
+        "taskTitle": "为会议通知创建提醒",
         "status": "running",
         "phase": "phone_tool",
+        "stepTitle": "检测到会议通知",
         "message": "Running phone tool",
+        "toolName": "list_notifications",
+        "requiresConfirmation": False,
+        "confirmationId": "confirm-123",
+        "canCancel": True,
+        "canTakeOver": True,
+        "currentStep": 1,
+        "totalSteps": 3,
+        "completedSteps": [
+            {"index": 1, "name": "检测到会议通知", "status": "completed"},
+        ],
+        "dryRun": True,
     }
 
 

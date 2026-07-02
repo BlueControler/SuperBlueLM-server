@@ -7,7 +7,16 @@ from langgraph.config import get_stream_writer
 
 from .json_types import JsonObject, JsonValue, to_json_value
 
-ProgressStatus = Literal["started", "running", "completed", "failed"]
+ProgressStatus = Literal[
+    "started",
+    "pending",
+    "running",
+    "waiting_confirmation",
+    "completed",
+    "failed",
+    "cancelled",
+    "taken_over",
+]
 TaskComplexity = Literal["simple", "complex"]
 
 TASK_PROGRESS_TYPE = "task_progress"
@@ -19,12 +28,21 @@ def emit_task_progress(
     label: str,
     status: ProgressStatus,
     phase: str,
+    run_id: str | None = None,
+    thread_id: str | None = None,
+    task_title: str | None = None,
+    step_title: str | None = None,
     message: str | None = None,
     tool_name: str | None = None,
     progress_key: str | None = None,
     current_step: int | None = None,
     total_steps: int | None = None,
     completed_steps: Sequence[JsonObject] | None = None,
+    requires_confirmation: bool | None = None,
+    confirmation_id: str | None = None,
+    can_cancel: bool | None = None,
+    can_take_over: bool | None = None,
+    dry_run: bool | None = None,
     error: str | None = None,
 ) -> None:
     payload: JsonObject = {
@@ -33,6 +51,10 @@ def emit_task_progress(
         "status": status,
         "phase": phase,
     }
+    _put_if_present(payload, "runId", run_id)
+    _put_if_present(payload, "threadId", thread_id)
+    _put_if_present(payload, "taskTitle", task_title)
+    _put_if_present(payload, "stepTitle", step_title)
     _put_if_present(payload, "message", message)
     _put_if_present(payload, "toolName", tool_name)
     _put_if_present(payload, "progressKey", progress_key)
@@ -43,6 +65,11 @@ def emit_task_progress(
         "completedSteps",
         list(completed_steps) if completed_steps is not None else None,
     )
+    _put_if_present(payload, "requiresConfirmation", requires_confirmation)
+    _put_if_present(payload, "confirmationId", confirmation_id)
+    _put_if_present(payload, "canCancel", can_cancel)
+    _put_if_present(payload, "canTakeOver", can_take_over)
+    _put_if_present(payload, "dryRun", dry_run)
     _put_if_present(payload, "error", error)
 
     try:

@@ -24,6 +24,7 @@ from .middleware import (
 )
 from .meeting_minutes_sop import MeetingMinutesSopMiddleware
 from .risk_gate import HighRiskActionGateMiddleware
+from .scenario3_demo import Scenario3DemoMiddleware
 from .trace_middleware import TraceMiddleware
 
 
@@ -40,6 +41,7 @@ def build_middleware_stack(
             ResetAgentRunStateMiddleware(),
             TraceMiddleware(),
             MeetingMinutesSopMiddleware(),
+            Scenario3DemoMiddleware(),
             HighRiskActionGateMiddleware(),
             ModeToolAccessMiddleware(phone_tool_names, device_scoped_tool_names),
             TaskComplexityMiddleware(),

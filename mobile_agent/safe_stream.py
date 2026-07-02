@@ -50,8 +50,10 @@ _RUN_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _PUBLIC_TEXT_BLOCK_TYPES = frozenset({"text", "output_text", "input_text"})
 _REASONING_BLOCK_TOKENS = ("reasoning", "thinking", "thought")
 _COMPLETED_WORK_STATUSES = frozenset({"succeeded", "completed", "done"})
-_INCOMPLETE_WORK_STATUSES = frozenset({"queued", "running", "waiting_for_user"})
-_FAILED_WORK_STATUSES = frozenset({"failed", "cancelled", "error", "timeout"})
+_INCOMPLETE_WORK_STATUSES = frozenset(
+    {"queued", "pending", "running", "waiting_for_user", "waiting_confirmation"}
+)
+_FAILED_WORK_STATUSES = frozenset({"failed", "cancelled", "taken_over", "error", "timeout"})
 _THINK_BLOCK_TEXT = re.compile(r"(?is)<\s*think\s*>.*?<\s*/\s*think\s*>")
 _THINK_TAG_TEXT = re.compile(r"(?is)<\s*/?\s*think\s*>")
 
@@ -1011,6 +1013,8 @@ def _safe_trace_payload(
 
 def _safe_progress_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     label = payload.get("label")
+    if not isinstance(label, str) or not label:
+        label = payload.get("stepTitle") or payload.get("taskTitle")
     status = payload.get("status")
     phase = payload.get("phase")
     if not all(isinstance(value, str) and value for value in (label, status, phase)):
@@ -1021,7 +1025,16 @@ def _safe_progress_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
         "status": _bounded(status, 32),
         "phase": _bounded(phase, 64),
     }
-    for key, limit in (("message", MAX_TRACE_SUMMARY_CHARS), ("progressKey", 128)):
+    for key, limit in (
+        ("runId", 128),
+        ("threadId", 128),
+        ("taskTitle", MAX_TRACE_TITLE_CHARS),
+        ("stepTitle", MAX_TRACE_TITLE_CHARS),
+        ("message", MAX_TRACE_SUMMARY_CHARS),
+        ("toolName", 128),
+        ("progressKey", 128),
+        ("confirmationId", 128),
+    ):
         value = payload.get(key)
         if isinstance(value, str) and value:
             safe[key] = _safe_description(value, limit)
@@ -1029,7 +1042,41 @@ def _safe_progress_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
         value = payload.get(key)
         if isinstance(value, int) and value >= 0:
             safe[key] = value
+    for key in ("requiresConfirmation", "canCancel", "canTakeOver", "dryRun"):
+        value = payload.get(key)
+        if isinstance(value, bool):
+            safe[key] = value
+    completed_steps = _safe_completed_steps(payload.get("completedSteps"))
+    if completed_steps:
+        safe["completedSteps"] = completed_steps
     return _fit_payload(safe)
+
+
+def _safe_completed_steps(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    safe_steps: list[dict[str, Any]] = []
+    for item in value[:20]:
+        if not isinstance(item, Mapping):
+            continue
+        name = item.get("name")
+        status = item.get("status")
+        if not isinstance(name, str) or not name:
+            continue
+        if not isinstance(status, str) or not status:
+            continue
+        step: dict[str, Any] = {
+            "name": _safe_description(name, MAX_TRACE_TITLE_CHARS),
+            "status": _bounded(status, 32),
+        }
+        index = item.get("index")
+        if isinstance(index, int) and index >= 0:
+            step["index"] = index
+        tool_name = item.get("toolName")
+        if isinstance(tool_name, str) and tool_name:
+            step["toolName"] = _safe_description(tool_name, 128)
+        safe_steps.append(step)
+    return safe_steps
 
 
 def _safe_task_complexity_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:

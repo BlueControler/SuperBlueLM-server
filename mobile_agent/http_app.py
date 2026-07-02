@@ -15,6 +15,12 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
 from .action_control import phone_action_registry
+from .agent.scenario3_demo import (
+    confirm_scenario3_demo,
+    reject_scenario3_demo,
+    start_scenario3_demo,
+    take_over_scenario3_demo,
+)
 from .asr.config import DEFAULT_MAX_AUDIO_BYTES, AsrConfigError
 from .asr.provider import AliyunNlsProvider, AsrProviderError, AsrRequest
 from .gateways.phone import DeviceGatewayError
@@ -98,6 +104,65 @@ async def system_status(request: Request) -> JSONResponse:
 
 async def network_status(request: Request) -> JSONResponse:
     return JSONResponse(model_runtime.status())
+
+
+async def scenario3_notification_demo(request: Request) -> JSONResponse:
+    payload = await _json_body_or_empty(request)
+    return JSONResponse(
+        start_scenario3_demo(
+            thread_id=_optional_payload_str(payload, "threadId"),
+            run_id=_optional_payload_str(payload, "runId"),
+            emit=False,
+        )
+    )
+
+
+async def scenario3_confirm_demo(request: Request) -> JSONResponse:
+    confirmation_id = await _confirmation_id_from_request(request)
+    if confirmation_id is None:
+        return JSONResponse({"error": "missing_confirmation_id"}, status_code=400)
+    result = confirm_scenario3_demo(confirmation_id)
+    if result is None:
+        return JSONResponse({"error": "confirmation_not_found"}, status_code=404)
+    return JSONResponse(result)
+
+
+async def scenario3_reject_demo(request: Request) -> JSONResponse:
+    confirmation_id = await _confirmation_id_from_request(request)
+    if confirmation_id is None:
+        return JSONResponse({"error": "missing_confirmation_id"}, status_code=400)
+    result = reject_scenario3_demo(confirmation_id)
+    if result is None:
+        return JSONResponse({"error": "confirmation_not_found"}, status_code=404)
+    return JSONResponse(result)
+
+
+async def scenario3_take_over_demo(request: Request) -> JSONResponse:
+    confirmation_id = await _confirmation_id_from_request(request)
+    if confirmation_id is None:
+        return JSONResponse({"error": "missing_confirmation_id"}, status_code=400)
+    result = take_over_scenario3_demo(confirmation_id)
+    if result is None:
+        return JSONResponse({"error": "confirmation_not_found"}, status_code=404)
+    return JSONResponse(result)
+
+
+async def _confirmation_id_from_request(request: Request) -> str | None:
+    payload = await _json_body_or_empty(request)
+    return _optional_payload_str(payload, "confirmationId")
+
+
+async def _json_body_or_empty(request: Request) -> dict[str, object]:
+    try:
+        payload = await request.json()
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _optional_payload_str(payload: Mapping[str, object], key: str) -> str | None:
+    value = payload.get(key)
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def asr_provider_factory() -> AliyunNlsProvider:
@@ -425,6 +490,10 @@ app = Starlette(
     lifespan=_lifespan,
     routes=[
         Route("/mobile/asr/transcribe", transcribe_audio, methods=["POST"]),
+        Route("/mobile/demo/scenario3/notification", scenario3_notification_demo, methods=["POST"]),
+        Route("/mobile/demo/scenario3/confirm", scenario3_confirm_demo, methods=["POST"]),
+        Route("/mobile/demo/scenario3/reject", scenario3_reject_demo, methods=["POST"]),
+        Route("/mobile/demo/scenario3/take-over", scenario3_take_over_demo, methods=["POST"]),
         Route("/mobile/threads/{thread_id}/runs/stream", safe_run_stream, methods=["POST"]),
         Route(
             "/mobile/threads/{thread_id}/runs/{run_id}/cancel",
