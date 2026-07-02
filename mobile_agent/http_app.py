@@ -25,10 +25,10 @@ from .asr.config import DEFAULT_MAX_AUDIO_BYTES, AsrConfigError
 from .asr.provider import AliyunNlsProvider, AsrProviderError, AsrRequest
 from .confirmations import (
     ConfirmationResolveResult,
-    confirm_confirmation,
+    confirm_confirmation_async,
     get_confirmation,
-    reject_confirmation,
-    take_over_confirmation,
+    reject_confirmation_async,
+    take_over_confirmation_async,
 )
 from .gateways.phone import DeviceGatewayError
 from .gateways.system import SystemGatewayError
@@ -169,17 +169,17 @@ async def confirmation_detail(request: Request) -> JSONResponse:
 
 async def confirmation_confirm(request: Request) -> JSONResponse:
     confirmation_id = request.path_params["confirmation_id"]
-    return _confirmation_response(confirm_confirmation(confirmation_id))
+    return _confirmation_response(await confirm_confirmation_async(confirmation_id))
 
 
 async def confirmation_reject(request: Request) -> JSONResponse:
     confirmation_id = request.path_params["confirmation_id"]
-    return _confirmation_response(reject_confirmation(confirmation_id))
+    return _confirmation_response(await reject_confirmation_async(confirmation_id))
 
 
 async def confirmation_take_over(request: Request) -> JSONResponse:
     confirmation_id = request.path_params["confirmation_id"]
-    return _confirmation_response(take_over_confirmation(confirmation_id))
+    return _confirmation_response(await take_over_confirmation_async(confirmation_id))
 
 
 def _confirmation_response(result: ConfirmationResolveResult) -> JSONResponse:

@@ -8,8 +8,11 @@ from typing import Any
 from langchain.agents.middleware.types import ModelResponse
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
+from starlette.testclient import TestClient
 
 from mobile_agent import progress
+from mobile_agent.confirmations import confirmation_store
+from mobile_agent.http_app import app
 
 
 class _FakeMedicalTravelTools:
@@ -134,7 +137,7 @@ def test_medical_travel_middleware_short_circuits_fixed_demo_request(
     ]
     assert needs_confirmation_events[-1]["confirmationId"] == confirmation_id
     assert needs_confirmation_events[-1]["toolName"] == "create_event"
-    assert needs_confirmation_events[-1]["dryRun"] is True
+    assert needs_confirmation_events[-1]["dryRun"] is False
     waiting_events = [
         event
         for event in _progress_steps(emitted)
@@ -206,3 +209,41 @@ def test_medical_travel_runner_adapters_call_real_tool_interfaces() -> None:
     ]
     assert calls[0][1] == {"city": "南京"}
     assert calls[1][1]["tool_name"] == "maps_direction_transit_integrated"
+
+
+def test_medical_travel_confirmation_confirm_writes_reminder_once() -> None:
+    module = _medical_module()
+    confirmation_store.clear()
+    calls: list[tuple[str, dict[str, Any]]] = []
+    tools = _FakeMedicalTravelTools()
+
+    async def write_reminder(arguments: dict[str, Any]) -> dict[str, Any]:
+        calls.append(("create_event / update_reminders", arguments))
+        return {"ok": True, "eventId": "event-1", "reminderId": "reminder-1"}
+
+    runner = module.MedicalTravelSopRunner(
+        weather_query=tools.weather_query,
+        route_query=tools.amap_mcp_tool,
+        reminder_writer=write_reminder,
+    )
+
+    result = asyncio.run(runner.run(device_id="device-1"))
+    confirmation_id = result["confirmation"]["confirmationId"]
+
+    assert calls == []
+    response = TestClient(app).post(f"/mobile/confirmations/{confirmation_id}/confirm")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "confirmed"
+    assert [name for name, _args in calls] == ["create_event / update_reminders"]
+    assert calls[0][1]["device_id"] == "device-1"
+    assert calls[0][1]["title"] == "医院复诊出行提醒"
+    assert [event["status"] for event in payload["events"]] == ["running", "completed"]
+    assert payload["events"][0]["toolName"] == "create_event / update_reminders"
+    assert payload["events"][0]["requiresConfirmation"] is False
+    assert payload["events"][1]["message"] == "已整理明日出行信息，并创建复诊提醒。"
+
+    second = TestClient(app).post(f"/mobile/confirmations/{confirmation_id}/confirm")
+    assert second.status_code == 409
+    assert [name for name, _args in calls] == ["create_event / update_reminders"]

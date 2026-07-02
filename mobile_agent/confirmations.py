@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+from collections.abc import Awaitable
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from threading import RLock
@@ -11,7 +13,8 @@ from .json_types import JsonObject, JsonValue, to_json_value
 
 ConfirmationDecision = Literal["confirm", "reject", "take_over"]
 ConfirmationStatus = Literal["pending", "confirmed", "rejected", "taken_over"]
-ConfirmationHandler = Callable[["ConfirmationTransaction"], list[JsonObject]]
+ConfirmationEvents = list[JsonObject] | Awaitable[list[JsonObject]]
+ConfirmationHandler = Callable[["ConfirmationTransaction"], ConfirmationEvents]
 
 
 @dataclass
@@ -148,6 +151,42 @@ class ConfirmationStore:
             },
         )
 
+    async def resolve_async(
+        self,
+        confirmation_id: str,
+        decision: ConfirmationDecision,
+    ) -> ConfirmationResolveResult:
+        with self._lock:
+            transaction = self._transactions.get(confirmation_id)
+            if transaction is None:
+                return ConfirmationResolveResult(
+                    404,
+                    {"error": "confirmation_not_found", "confirmationId": confirmation_id},
+                )
+            if transaction.status != "pending":
+                return ConfirmationResolveResult(
+                    409,
+                    {
+                        "error": "confirmation_already_resolved",
+                        "confirmationId": confirmation_id,
+                        "status": transaction.status,
+                    },
+                )
+            transaction.status = _status_for_decision(decision)
+            handler = _handler_for_decision(transaction, decision)
+
+        events_result = handler(transaction) if handler is not None else _default_events(transaction, decision)
+        events = await events_result if inspect.isawaitable(events_result) else events_result
+        return ConfirmationResolveResult(
+            200,
+            {
+                "confirmationId": confirmation_id,
+                "status": transaction.status,
+                "dryRun": transaction.dry_run,
+                "events": events,
+            },
+        )
+
     def clear(self) -> None:
         with self._lock:
             self._transactions.clear()
@@ -170,12 +209,24 @@ def confirm_confirmation(confirmation_id: str) -> ConfirmationResolveResult:
     return confirmation_store.resolve(confirmation_id, "confirm")
 
 
+async def confirm_confirmation_async(confirmation_id: str) -> ConfirmationResolveResult:
+    return await confirmation_store.resolve_async(confirmation_id, "confirm")
+
+
 def reject_confirmation(confirmation_id: str) -> ConfirmationResolveResult:
     return confirmation_store.resolve(confirmation_id, "reject")
 
 
+async def reject_confirmation_async(confirmation_id: str) -> ConfirmationResolveResult:
+    return await confirmation_store.resolve_async(confirmation_id, "reject")
+
+
 def take_over_confirmation(confirmation_id: str) -> ConfirmationResolveResult:
     return confirmation_store.resolve(confirmation_id, "take_over")
+
+
+async def take_over_confirmation_async(confirmation_id: str) -> ConfirmationResolveResult:
+    return await confirmation_store.resolve_async(confirmation_id, "take_over")
 
 
 def create_high_risk_confirmation(
@@ -436,10 +487,13 @@ __all__ = [
     "ConfirmationResolveResult",
     "ConfirmationTransaction",
     "confirm_confirmation",
+    "confirm_confirmation_async",
     "confirmation_store",
     "create_confirmation",
     "create_high_risk_confirmation",
     "get_confirmation",
     "reject_confirmation",
+    "reject_confirmation_async",
     "take_over_confirmation",
+    "take_over_confirmation_async",
 ]
