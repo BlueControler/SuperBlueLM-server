@@ -137,7 +137,7 @@ def test_medical_travel_middleware_short_circuits_fixed_demo_request(
     ]
     assert needs_confirmation_events[-1]["confirmationId"] == confirmation_id
     assert needs_confirmation_events[-1]["toolName"] == "create_event"
-    assert needs_confirmation_events[-1]["dryRun"] is False
+    assert needs_confirmation_events[-1]["dryRun"] is True
     waiting_events = [
         event
         for event in _progress_steps(emitted)
@@ -211,7 +211,7 @@ def test_medical_travel_runner_adapters_call_real_tool_interfaces() -> None:
     assert calls[1][1]["tool_name"] == "maps_direction_transit_integrated"
 
 
-def test_medical_travel_confirmation_confirm_writes_reminder_once() -> None:
+def test_medical_travel_confirmation_confirm_completes_dry_run_without_writing() -> None:
     module = _medical_module()
     confirmation_store.clear()
     calls: list[tuple[str, dict[str, Any]]] = []
@@ -236,14 +236,17 @@ def test_medical_travel_confirmation_confirm_writes_reminder_once() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "confirmed"
-    assert [name for name, _args in calls] == ["create_event / update_reminders"]
-    assert calls[0][1]["device_id"] == "device-1"
-    assert calls[0][1]["title"] == "医院复诊出行提醒"
+    assert payload["dryRun"] is True
+    assert calls == []
     assert [event["status"] for event in payload["events"]] == ["running", "completed"]
+    assert all(event["dryRun"] is True for event in payload["events"])
+    assert all(event["currentStep"] == 5 for event in payload["events"])
+    assert all(event["totalSteps"] == 5 for event in payload["events"])
     assert payload["events"][0]["toolName"] == "create_event / update_reminders"
     assert payload["events"][0]["requiresConfirmation"] is False
-    assert payload["events"][1]["message"] == "已整理明日出行信息，并创建复诊提醒。"
+    assert payload["events"][0]["message"] == "第 5/5 步：正在创建复诊提醒（演示模式）"
+    assert payload["events"][1]["message"] == "第 5/5 步：创建提醒 dry-run 已完成"
 
     second = TestClient(app).post(f"/mobile/confirmations/{confirmation_id}/confirm")
     assert second.status_code == 409
-    assert [name for name, _args in calls] == ["create_event / update_reminders"]
+    assert calls == []

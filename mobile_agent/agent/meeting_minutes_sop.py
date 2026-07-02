@@ -400,7 +400,70 @@ def _create_meeting_minutes_confirmation(
         confirm_text="确认发送",
         cancel_text="取消",
         dry_run=True,
+        confirm_handler=_meeting_minutes_confirm_handler(tool_name=tool_name),
     )
+
+
+def _meeting_minutes_confirm_handler(
+    *,
+    tool_name: str,
+) -> Callable[[ConfirmationTransaction], list[JsonObject]]:
+    def handle(transaction: ConfirmationTransaction) -> list[JsonObject]:
+        return [
+            _meeting_minutes_confirmation_task_progress_event(
+                transaction,
+                status="running",
+                step_title="正在发送到项目群（演示模式）",
+                message="第 5/5 步：正在发送到项目群（演示模式）",
+                tool_name=tool_name,
+                confirmation_id=transaction.confirmation_id,
+            ),
+            _meeting_minutes_confirmation_task_progress_event(
+                transaction,
+                status="completed",
+                step_title="会议纪要已发送到项目群（演示模式）",
+                message="第 5/5 步：会议纪要已发送到项目群（演示模式）",
+                tool_name=tool_name,
+                confirmation_id=None,
+            ),
+        ]
+
+    return handle
+
+
+def _meeting_minutes_confirmation_task_progress_event(
+    transaction: ConfirmationTransaction,
+    *,
+    status: str,
+    step_title: str,
+    message: str,
+    tool_name: str,
+    confirmation_id: str | None,
+) -> JsonObject:
+    event: JsonObject = {
+        "type": "task_progress",
+        "label": tool_name,
+        "taskTitle": transaction.task_title,
+        "status": status,
+        "phase": MEETING_MINUTES_PHASE,
+        "currentStep": 5,
+        "totalSteps": 5,
+        "stepTitle": step_title,
+        "message": message,
+        "toolName": tool_name,
+        "requiresConfirmation": False,
+        "canCancel": False,
+        "canTakeOver": False,
+        "progressKey": f"meeting-minutes-sop-confirm-{transaction.confirmation_id}",
+        "dryRun": transaction.dry_run,
+    }
+    if confirmation_id:
+        event["confirmationId"] = confirmation_id
+    if transaction.run_id:
+        event["runId"] = transaction.run_id
+    if transaction.thread_id:
+        event["threadId"] = transaction.thread_id
+    return event
 
 
 def _emit_needs_confirmation_event(transaction: ConfirmationTransaction) -> None:

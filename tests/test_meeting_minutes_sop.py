@@ -7,6 +7,7 @@ from typing import Any, Sequence
 
 from langchain.agents.middleware.types import ModelResponse
 from langchain_core.messages import AIMessage, HumanMessage
+from starlette.testclient import TestClient
 
 from mobile_agent import progress
 from mobile_agent.agent.meeting_minutes_sop import (
@@ -15,6 +16,8 @@ from mobile_agent.agent.meeting_minutes_sop import (
     MeetingMinutesSopRunner,
     is_meeting_minutes_sop_request,
 )
+from mobile_agent.confirmations import confirmation_store
+from mobile_agent.http_app import app
 from mobile_agent.tools.external import CommandRunner
 
 
@@ -190,3 +193,39 @@ def test_meeting_minutes_default_waits_for_confirmation_without_sending(
         "llm_summary",
         "needs_confirmation",
     ]
+
+
+def test_meeting_minutes_confirmation_confirm_completes_step_5_dry_run_without_sending(
+    tmp_path: Path,
+) -> None:
+    confirmation_store.clear()
+    (tmp_path / "2026-07-02-会议记录.txt").write_text(
+        "赵六：今天完成 SOP 接入。\n",
+        encoding="utf-8",
+    )
+    sender = _FakeCommandRunner()
+    runner = MeetingMinutesSopRunner(
+        search_roots=(tmp_path,),
+        now=lambda: "2026-07-02",
+        command_runner=sender,
+    )
+
+    result = asyncio.run(runner.run())
+    confirmation_id = result["confirmation"]["confirmationId"]
+
+    assert sender.calls == []
+    response = TestClient(app).post(f"/mobile/confirmations/{confirmation_id}/confirm")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "confirmed"
+    assert payload["dryRun"] is True
+    assert sender.calls == []
+    assert [event["status"] for event in payload["events"]] == ["running", "completed"]
+    assert all(event["dryRun"] is True for event in payload["events"])
+    assert all(event["currentStep"] == 5 for event in payload["events"])
+    assert all(event["totalSteps"] == 5 for event in payload["events"])
+    assert all(event["phase"] == "meeting_minutes_sop" for event in payload["events"])
+    assert payload["events"][0]["toolName"] == "wecom_cli"
+    assert payload["events"][0]["message"] == "第 5/5 步：正在发送到项目群（演示模式）"
+    assert payload["events"][1]["message"] == "第 5/5 步：会议纪要已发送到项目群（演示模式）"

@@ -126,7 +126,6 @@ class MedicalTravelSopRunner:
             travel_advice=self.travel_advice,
             reminder_time=self.reminder_time,
             device_id=device_id,
-            reminder_writer=self.reminder_writer or _demo_reminder_writer,
         )
         if not self.auto_confirm:
             _emit_needs_confirmation_event(confirmation_transaction)
@@ -451,7 +450,6 @@ def _create_medical_travel_confirmation(
     travel_advice: str,
     reminder_time: str,
     device_id: str | None,
-    reminder_writer: AsyncToolCall,
 ) -> ConfirmationTransaction:
     preview = "\n".join(
         [
@@ -472,14 +470,13 @@ def _create_medical_travel_confirmation(
         payload_preview=preview,
         confirm_text="确认创建",
         cancel_text="取消",
-        dry_run=False,
+        dry_run=True,
         confirm_handler=_medical_travel_confirm_handler(
             weather_result=weather_result,
             route_result=route_result,
             travel_advice=travel_advice,
             reminder_time=reminder_time,
             device_id=device_id,
-            reminder_writer=reminder_writer,
         ),
     )
 
@@ -491,39 +488,24 @@ def _medical_travel_confirm_handler(
     travel_advice: str,
     reminder_time: str,
     device_id: str | None,
-    reminder_writer: AsyncToolCall,
 ) -> Callable[[ConfirmationTransaction], Awaitable[list[JsonObject]]]:
     async def handle(transaction: ConfirmationTransaction) -> list[JsonObject]:
         write_tool = "create_event / update_reminders"
         running = _confirmation_task_progress_event(
             transaction,
             status="running",
-            step_title="正在写入日程提醒",
-            message="已确认，正在创建复诊日程和提醒。",
+            step_title="正在创建复诊提醒（演示模式）",
+            message="第 5/5 步：正在创建复诊提醒（演示模式）",
             tool_name=write_tool,
             confirmation_id=transaction.confirmation_id,
         )
-        reminder_result = await _call_tool(
-            reminder_writer,
-            {
-                "title": "医院复诊出行提醒",
-                "time": reminder_time,
-                "weather": weather_result,
-                "route": route_result,
-                "advice": travel_advice,
-                "tool": write_tool,
-                "device_id": device_id,
-            },
-        )
-        ok = _tool_result_ok(reminder_result)
         completed = _confirmation_task_progress_event(
             transaction,
-            status="completed" if ok else "failed",
-            step_title="复诊提醒已创建" if ok else "复诊提醒创建失败",
-            message=FINAL_MESSAGE if ok else "复诊提醒创建失败，请稍后重试。",
+            status="completed",
+            step_title="创建提醒 dry-run 已完成",
+            message="第 5/5 步：创建提醒 dry-run 已完成",
             tool_name=write_tool,
             confirmation_id=None,
-            error=None if ok else _safe_error_text(reminder_result),
         )
         return [running, completed]
 
@@ -597,7 +579,7 @@ def _confirmation_task_progress_event(
         "canCancel": False,
         "canTakeOver": False,
         "progressKey": f"medical-travel-sop-confirm-{transaction.confirmation_id}",
-        "dryRun": False,
+        "dryRun": transaction.dry_run,
     }
     if confirmation_id:
         event["confirmationId"] = confirmation_id
