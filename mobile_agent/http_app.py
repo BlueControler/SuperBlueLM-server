@@ -23,6 +23,13 @@ from .agent.scenario3_demo import (
 )
 from .asr.config import DEFAULT_MAX_AUDIO_BYTES, AsrConfigError
 from .asr.provider import AliyunNlsProvider, AsrProviderError, AsrRequest
+from .confirmations import (
+    ConfirmationResolveResult,
+    confirm_confirmation,
+    get_confirmation,
+    reject_confirmation,
+    take_over_confirmation,
+)
 from .gateways.phone import DeviceGatewayError
 from .gateways.system import SystemGatewayError
 from .local_model_runtime import LocalModelRuntimeError, model_runtime
@@ -145,6 +152,38 @@ async def scenario3_take_over_demo(request: Request) -> JSONResponse:
     if result is None:
         return JSONResponse({"error": "confirmation_not_found"}, status_code=404)
     return JSONResponse(result)
+
+
+async def confirmation_detail(request: Request) -> JSONResponse:
+    confirmation_id = request.path_params["confirmation_id"]
+    transaction = get_confirmation(confirmation_id)
+    if transaction is None:
+        return JSONResponse(
+            {"error": "confirmation_not_found", "confirmationId": confirmation_id},
+            status_code=404,
+        )
+    payload = transaction.needs_confirmation_event()
+    payload["status"] = transaction.status
+    return JSONResponse(payload)
+
+
+async def confirmation_confirm(request: Request) -> JSONResponse:
+    confirmation_id = request.path_params["confirmation_id"]
+    return _confirmation_response(confirm_confirmation(confirmation_id))
+
+
+async def confirmation_reject(request: Request) -> JSONResponse:
+    confirmation_id = request.path_params["confirmation_id"]
+    return _confirmation_response(reject_confirmation(confirmation_id))
+
+
+async def confirmation_take_over(request: Request) -> JSONResponse:
+    confirmation_id = request.path_params["confirmation_id"]
+    return _confirmation_response(take_over_confirmation(confirmation_id))
+
+
+def _confirmation_response(result: ConfirmationResolveResult) -> JSONResponse:
+    return JSONResponse(result.payload, status_code=result.status_code)
 
 
 async def _confirmation_id_from_request(request: Request) -> str | None:
@@ -494,6 +533,10 @@ app = Starlette(
         Route("/mobile/demo/scenario3/confirm", scenario3_confirm_demo, methods=["POST"]),
         Route("/mobile/demo/scenario3/reject", scenario3_reject_demo, methods=["POST"]),
         Route("/mobile/demo/scenario3/take-over", scenario3_take_over_demo, methods=["POST"]),
+        Route("/mobile/confirmations/{confirmation_id}", confirmation_detail, methods=["GET"]),
+        Route("/mobile/confirmations/{confirmation_id}/confirm", confirmation_confirm, methods=["POST"]),
+        Route("/mobile/confirmations/{confirmation_id}/reject", confirmation_reject, methods=["POST"]),
+        Route("/mobile/confirmations/{confirmation_id}/take-over", confirmation_take_over, methods=["POST"]),
         Route("/mobile/threads/{thread_id}/runs/stream", safe_run_stream, methods=["POST"]),
         Route(
             "/mobile/threads/{thread_id}/runs/{run_id}/cancel",

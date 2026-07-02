@@ -35,6 +35,8 @@ def create_phone_tools(
             phase="phone_tool",
             message=f"Running phone tool: {tool_name}",
             tool_name=tool_name,
+            can_cancel=True,
+            can_take_over=True,
         )
         try:
             selected_device_id = _select_device_id(device_id, default_device_id)
@@ -54,6 +56,8 @@ def create_phone_tools(
                 phase="phone_tool",
                 message=f"Phone tool failed: {tool_name}",
                 tool_name=tool_name,
+                can_cancel=False,
+                can_take_over=False,
                 error=str(exc),
             )
             return _device_not_connected_result()
@@ -64,6 +68,8 @@ def create_phone_tools(
                 phase="phone_tool",
                 message=f"Phone tool failed: {tool_name}",
                 tool_name=tool_name,
+                can_cancel=False,
+                can_take_over=False,
                 error=str(exc),
             )
             if _is_device_not_connected_error(exc):
@@ -76,6 +82,8 @@ def create_phone_tools(
                 phase="phone_tool",
                 message=f"Phone tool rejected: {tool_name}",
                 tool_name=tool_name,
+                can_cancel=False,
+                can_take_over=False,
                 error=str(exc),
             )
             return {
@@ -89,6 +97,8 @@ def create_phone_tools(
             phase="phone_tool",
             message=f"Completed phone tool: {tool_name}",
             tool_name=tool_name,
+            can_cancel=False,
+            can_take_over=False,
         )
         return result
 

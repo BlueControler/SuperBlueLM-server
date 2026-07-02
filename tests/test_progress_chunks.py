@@ -177,6 +177,23 @@ def test_phone_tool_emits_started_and_completed_progress(monkeypatch: Any) -> No
     assert emitted[-1]["status"] == "completed"
 
 
+def test_phone_tool_running_progress_exposes_task_controls(monkeypatch: Any) -> None:
+    emitted: list[dict[str, Any]] = []
+    gateway = _FakePhoneGateway()
+    tools = {tool.name: tool for tool in create_phone_tools(gateway)}
+
+    monkeypatch.setattr(progress, "get_stream_writer", lambda: emitted.append)
+
+    asyncio.run(tools["launch"].ainvoke({"package": "com.ss.android.lark"}))
+
+    assert emitted[0]["status"] == "running"
+    assert emitted[0]["canCancel"] is True
+    assert emitted[0]["canTakeOver"] is True
+    assert emitted[-1]["status"] == "completed"
+    assert emitted[-1]["canCancel"] is False
+    assert emitted[-1]["canTakeOver"] is False
+
+
 def _assert_controlled_call(
     calls: list[tuple[str, dict[str, Any]]],
     expected_command: str,

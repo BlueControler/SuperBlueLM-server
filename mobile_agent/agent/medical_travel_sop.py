@@ -15,8 +15,9 @@ from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, Mod
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.tools import BaseTool
 
+from ..confirmations import ConfirmationTransaction, create_confirmation
 from ..json_types import JsonObject
-from ..progress import emit_task_complexity, emit_task_progress
+from ..progress import emit_needs_confirmation, emit_task_complexity, emit_task_progress
 from .middleware import _message_content_to_text
 from .state import MobileAgentState, device_id_from_mapping
 
@@ -31,6 +32,7 @@ DEFAULT_REMINDER_TIME = "明天上午出发前 30 分钟"
 DEFAULT_CITY = "南京"
 DEFAULT_ROUTE_DESTINATION = "医院"
 FINAL_MESSAGE = "已整理明日出行信息，并创建复诊提醒。"
+WAITING_CONFIRMATION_MESSAGE = "已整理明日出行信息，等待你确认是否创建复诊提醒。"
 
 
 class DateProvider(Protocol):
@@ -51,7 +53,7 @@ class MedicalTravelSopRunner:
     travel_advice: str = DEFAULT_TRAVEL_ADVICE
     reminder_time: str = DEFAULT_REMINDER_TIME
     now: DateProvider | None = None
-    auto_confirm: bool = True
+    auto_confirm: bool = False
     weather_query: AsyncToolCall | None = None
     route_query: AsyncToolCall | None = None
     confirmation_request: AsyncToolCall | None = None
@@ -118,6 +120,28 @@ class MedicalTravelSopRunner:
             "amap_mcp_tool",
         )
 
+        confirmation_transaction = _create_medical_travel_confirmation(
+            weather_result=weather_result,
+            route_result=route_result,
+            travel_advice=self.travel_advice,
+            reminder_time=self.reminder_time,
+            device_id=device_id,
+        )
+        if not self.auto_confirm:
+            _emit_needs_confirmation_event(confirmation_transaction)
+            _emit_waiting_confirmation_progress(
+                confirmation_transaction,
+                completed_steps=completed_steps,
+            )
+            return _waiting_confirmation_result(
+                weather_result=weather_result,
+                route_result=route_result,
+                travel_advice=self.travel_advice,
+                reminder_time=self.reminder_time,
+                completed_steps=completed_steps,
+                transaction=confirmation_transaction,
+            )
+
         self._emit_step(
             step=4,
             message="第 4/5 步：等待确认是否创建提醒",
@@ -130,6 +154,7 @@ class MedicalTravelSopRunner:
                 "message": "是否创建明天上午复诊出行提醒？",
                 "action": "create_medical_travel_reminder",
                 "auto_confirm": self.auto_confirm,
+                "confirmation_id": confirmation_transaction.confirmation_id,
             },
         )
         completed_steps = _append_completed_step(
@@ -138,6 +163,20 @@ class MedicalTravelSopRunner:
             "等待确认是否创建提醒",
             "needs_confirmation",
         )
+        if not _confirmation_confirmed(confirmation):
+            _emit_needs_confirmation_event(confirmation_transaction)
+            _emit_waiting_confirmation_progress(
+                confirmation_transaction,
+                completed_steps=completed_steps,
+            )
+            return _waiting_confirmation_result(
+                weather_result=weather_result,
+                route_result=route_result,
+                travel_advice=self.travel_advice,
+                reminder_time=self.reminder_time,
+                completed_steps=completed_steps,
+                transaction=confirmation_transaction,
+            )
 
         write_tool = "create_event / update_reminders"
         self._emit_step(
@@ -372,10 +411,11 @@ async def _demo_route_query(_arguments: JsonObject) -> str:
 
 
 async def _demo_confirmation_request(arguments: JsonObject) -> JsonObject:
-    auto_confirm = bool(arguments.get("auto_confirm", True))
+    auto_confirm = bool(arguments.get("auto_confirm", False))
     return {
         "status": "confirmed" if auto_confirm else "needs_confirmation",
         "confirmed": auto_confirm,
+        "confirmationId": str(arguments.get("confirmation_id") or ""),
         "message": str(arguments.get("message") or "是否继续？"),
     }
 
@@ -394,6 +434,120 @@ def _tool_result_ok(result: Any) -> bool:
     if isinstance(result, Mapping):
         return bool(cast(Mapping[str, Any], result).get("ok", False))
     return False
+
+
+def _confirmation_confirmed(result: Any) -> bool:
+    if isinstance(result, Mapping):
+        payload = cast(Mapping[str, Any], result)
+        return payload.get("status") == "confirmed" or payload.get("confirmed") is True
+    return False
+
+
+def _create_medical_travel_confirmation(
+    *,
+    weather_result: Any,
+    route_result: Any,
+    travel_advice: str,
+    reminder_time: str,
+    device_id: str | None,
+) -> ConfirmationTransaction:
+    preview = "\n".join(
+        [
+            f"提醒：医院复诊出行提醒（{reminder_time}）",
+            f"天气：{weather_result}",
+            f"路线：{route_result}",
+            f"建议：{travel_advice}",
+        ]
+    )
+    if device_id:
+        preview = f"{preview}\n设备：{device_id}"
+    return create_confirmation(
+        task_title="就医出行提醒",
+        operation="创建复诊出行日程提醒",
+        target_app="系统日历",
+        tool_name="create_event",
+        risk_level="high",
+        payload_preview=preview,
+        confirm_text="确认创建",
+        cancel_text="取消",
+        dry_run=True,
+    )
+
+
+def _emit_needs_confirmation_event(transaction: ConfirmationTransaction) -> None:
+    emit_needs_confirmation(
+        confirmation_id=transaction.confirmation_id,
+        run_id=transaction.run_id,
+        thread_id=transaction.thread_id,
+        task_title=transaction.task_title,
+        operation=transaction.operation,
+        target_app=transaction.target_app,
+        tool_name=transaction.tool_name,
+        risk_level=transaction.risk_level,
+        payload_preview=transaction.payload_preview,
+        confirm_text=transaction.confirm_text,
+        cancel_text=transaction.cancel_text,
+        dry_run=transaction.dry_run,
+    )
+
+
+def _emit_waiting_confirmation_progress(
+    transaction: ConfirmationTransaction,
+    *,
+    completed_steps: Sequence[JsonObject],
+) -> None:
+    emit_task_progress(
+        label="needs_confirmation",
+        status="waiting_confirmation",
+        phase=MEDICAL_TRAVEL_PHASE,
+        task_title=transaction.task_title,
+        step_title="等待确认是否创建提醒",
+        message="已整理天气和路线信息，等待确认后才会创建日程提醒。",
+        tool_name="needs_confirmation",
+        progress_key=f"medical-travel-sop-confirmation-{transaction.confirmation_id}",
+        current_step=4,
+        total_steps=5,
+        completed_steps=completed_steps,
+        requires_confirmation=True,
+        confirmation_id=transaction.confirmation_id,
+        can_cancel=True,
+        can_take_over=True,
+        dry_run=transaction.dry_run,
+    )
+
+
+def _waiting_confirmation_result(
+    *,
+    weather_result: Any,
+    route_result: Any,
+    travel_advice: str,
+    reminder_time: str,
+    completed_steps: Sequence[JsonObject],
+    transaction: ConfirmationTransaction,
+) -> JsonObject:
+    return {
+        "task_type": MEDICAL_TRAVEL_TASK_TYPE,
+        "recognized_type": "就医出行准备",
+        "weather_result": weather_result,
+        "route_result": route_result,
+        "travel_advice": travel_advice,
+        "confirmation": {
+            "status": "needs_confirmation",
+            "confirmed": False,
+            "confirmationId": transaction.confirmation_id,
+            "needsConfirmation": transaction.needs_confirmation_event(),
+        },
+        "reminder_time": reminder_time,
+        "reminder_result": {
+            "skipped": True,
+            "reason": "needs_confirmation",
+            "confirmationId": transaction.confirmation_id,
+            "dryRun": transaction.dry_run,
+        },
+        "reminder_created": False,
+        "completed_steps": list(completed_steps),
+        "final_message": WAITING_CONFIRMATION_MESSAGE,
+    }
 
 
 def _calendar_event(arguments: JsonObject) -> JsonObject:

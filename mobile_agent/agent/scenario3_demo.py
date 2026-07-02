@@ -9,8 +9,16 @@ from uuid import uuid4
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
+from ..confirmations import (
+    ConfirmationResolveResult,
+    ConfirmationTransaction,
+    confirm_confirmation,
+    create_confirmation,
+    reject_confirmation,
+    take_over_confirmation,
+)
 from ..json_types import JsonObject
-from ..progress import emit_task_complexity, emit_task_progress
+from ..progress import emit_needs_confirmation, emit_task_complexity, emit_task_progress
 from ..trace import current_context
 from .middleware import _message_content_to_text
 from .state import MobileAgentState
@@ -51,6 +59,23 @@ def start_scenario3_demo(
         run_id=run_id,
         thread_id=thread_id,
     )
+    confirmation = create_confirmation(
+        confirmation_id=confirmation_id,
+        run_id=run_id,
+        thread_id=thread_id,
+        task_title=SCENARIO3_TASK_TITLE,
+        operation="创建会议提醒",
+        target_app="系统日历",
+        tool_name="create_event",
+        risk_level="medium",
+        payload_preview="检测到会议通知，是否创建会议提醒？",
+        confirm_text="确认创建",
+        cancel_text="取消",
+        dry_run=SCENARIO3_DRY_RUN,
+        confirm_handler=_confirm_scenario3_transaction,
+        reject_handler=_reject_scenario3_transaction,
+        take_over_handler=_take_over_scenario3_transaction,
+    )
     events = [
         _progress_event(
             run_id=run_id,
@@ -88,20 +113,29 @@ def start_scenario3_demo(
             reason="scenario3_notification_demo",
             message="识别任务类型：通知感知与主动介入",
         )
+        _emit_needs_confirmation_event(confirmation)
         for event in events:
             _emit_progress_event(event)
     return {
         "dryRun": SCENARIO3_DRY_RUN,
         "confirmationId": confirmation_id,
+        "needsConfirmation": confirmation.needs_confirmation_event(),
         "events": events,
     }
 
 
 def confirm_scenario3_demo(confirmation_id: str) -> JsonObject | None:
-    task = _TASKS.get(confirmation_id)
+    result = confirm_confirmation(confirmation_id)
+    return _scenario3_resolution_payload(result)
+
+
+def _confirm_scenario3_transaction(
+    transaction: ConfirmationTransaction,
+) -> list[JsonObject]:
+    task = _TASKS.pop(transaction.confirmation_id, None)
     if task is None:
-        return None
-    events = [
+        return []
+    return [
         _progress_event(
             run_id=task.run_id,
             thread_id=task.thread_id,
@@ -112,7 +146,7 @@ def confirm_scenario3_demo(confirmation_id: str) -> JsonObject | None:
             tool_name="create_event",
             message="正在创建会议提醒",
             requires_confirmation=False,
-            confirmation_id=confirmation_id,
+            confirmation_id=transaction.confirmation_id,
             can_cancel=True,
             can_take_over=True,
         ),
@@ -131,15 +165,20 @@ def confirm_scenario3_demo(confirmation_id: str) -> JsonObject | None:
             can_take_over=False,
         ),
     ]
-    _TASKS.pop(confirmation_id, None)
-    return {"dryRun": SCENARIO3_DRY_RUN, "events": events}
 
 
 def reject_scenario3_demo(confirmation_id: str) -> JsonObject | None:
-    task = _TASKS.get(confirmation_id)
+    result = reject_confirmation(confirmation_id)
+    return _scenario3_resolution_payload(result)
+
+
+def _reject_scenario3_transaction(
+    transaction: ConfirmationTransaction,
+) -> list[JsonObject]:
+    task = _TASKS.pop(transaction.confirmation_id, None)
     if task is None:
-        return None
-    events = [
+        return []
+    return [
         _progress_event(
             run_id=task.run_id,
             thread_id=task.thread_id,
@@ -155,15 +194,20 @@ def reject_scenario3_demo(confirmation_id: str) -> JsonObject | None:
             can_take_over=False,
         )
     ]
-    _TASKS.pop(confirmation_id, None)
-    return {"dryRun": SCENARIO3_DRY_RUN, "events": events}
 
 
 def take_over_scenario3_demo(confirmation_id: str) -> JsonObject | None:
-    task = _TASKS.get(confirmation_id)
+    result = take_over_confirmation(confirmation_id)
+    return _scenario3_resolution_payload(result)
+
+
+def _take_over_scenario3_transaction(
+    transaction: ConfirmationTransaction,
+) -> list[JsonObject]:
+    task = _TASKS.pop(transaction.confirmation_id, None)
     if task is None:
-        return None
-    events = [
+        return []
+    return [
         _progress_event(
             run_id=task.run_id,
             thread_id=task.thread_id,
@@ -179,8 +223,14 @@ def take_over_scenario3_demo(confirmation_id: str) -> JsonObject | None:
             can_take_over=False,
         )
     ]
-    _TASKS.pop(confirmation_id, None)
-    return {"dryRun": SCENARIO3_DRY_RUN, "events": events}
+
+
+def _scenario3_resolution_payload(
+    result: ConfirmationResolveResult,
+) -> JsonObject | None:
+    if result.status_code == 404:
+        return None
+    return result.payload
 
 
 class Scenario3DemoMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
@@ -294,6 +344,23 @@ def _emit_progress_event(event: Mapping[str, object]) -> None:
         message=str(event["message"]),
         progress_key=str(event["progressKey"]),
         dry_run=bool(event["dryRun"]),
+    )
+
+
+def _emit_needs_confirmation_event(transaction: ConfirmationTransaction) -> None:
+    emit_needs_confirmation(
+        confirmation_id=transaction.confirmation_id,
+        run_id=transaction.run_id,
+        thread_id=transaction.thread_id,
+        task_title=transaction.task_title,
+        operation=transaction.operation,
+        target_app=transaction.target_app,
+        tool_name=transaction.tool_name,
+        risk_level=transaction.risk_level,
+        payload_preview=transaction.payload_preview,
+        confirm_text=transaction.confirm_text,
+        cancel_text=transaction.cancel_text,
+        dry_run=transaction.dry_run,
     )
 
 

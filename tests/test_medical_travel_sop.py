@@ -63,6 +63,7 @@ def test_medical_travel_sop_runs_fixed_confirmed_demo_flow(monkeypatch: Any) -> 
         route_query=tools.amap_mcp_tool,
         confirmation_request=tools.needs_confirmation,
         reminder_writer=tools.write_reminder,
+        auto_confirm=True,
         now=lambda: "2026-07-02",
     )
     monkeypatch.setattr(progress, "get_stream_writer", lambda: emitted.append)
@@ -122,15 +123,31 @@ def test_medical_travel_middleware_short_circuits_fixed_demo_request(
 
     assert isinstance(response, ModelResponse)
     assert isinstance(response.result[0], AIMessage)
-    assert response.result[0].content == "已整理明日出行信息，并创建复诊提醒。"
+    assert response.result[0].content == "已整理明日出行信息，等待你确认是否创建复诊提醒。"
     payload = json.loads(response.result[0].additional_kwargs["medical_travel_sop"])
-    assert payload["reminder_created"] is True
+    assert payload["reminder_created"] is False
+    assert payload["confirmation"]["status"] == "needs_confirmation"
+    confirmation_id = payload["confirmation"]["confirmationId"]
+    assert confirmation_id
+    needs_confirmation_events = [
+        event for event in emitted if event.get("type") == "needs_confirmation"
+    ]
+    assert needs_confirmation_events[-1]["confirmationId"] == confirmation_id
+    assert needs_confirmation_events[-1]["toolName"] == "create_event"
+    assert needs_confirmation_events[-1]["dryRun"] is True
+    waiting_events = [
+        event
+        for event in _progress_steps(emitted)
+        if event.get("status") == "waiting_confirmation"
+    ]
+    assert waiting_events[-1]["confirmationId"] == confirmation_id
+    assert waiting_events[-1]["canCancel"] is True
+    assert waiting_events[-1]["canTakeOver"] is True
     assert [event["toolName"] for event in _progress_steps(emitted)] == [
         "task_complexity",
         "weather_query",
         "amap_mcp_tool",
         "needs_confirmation",
-        "create_event / update_reminders",
     ]
 
 
@@ -180,20 +197,12 @@ def test_medical_travel_runner_adapters_call_real_tool_interfaces() -> None:
 
     assert result["weather_result"] == "真实天气结果"
     assert result["route_result"] == "真实路线结果"
-    assert result["reminder_result"]["eventId"] == 123
-    assert result["reminder_created"] is True
+    assert result["reminder_result"]["skipped"] is True
+    assert result["confirmation"]["status"] == "needs_confirmation"
+    assert result["reminder_created"] is False
     assert [name for name, _args in calls] == [
         "weather_query",
         "amap_mcp_tool",
-        "create_event",
-        "update_reminders",
     ]
     assert calls[0][1] == {"city": "南京"}
     assert calls[1][1]["tool_name"] == "maps_direction_transit_integrated"
-    assert calls[2][1]["device_id"] == "device-1"
-    assert calls[2][1]["event"]["title"] == "医院复诊出行提醒"
-    assert calls[3][1] == {
-        "event_id": 123,
-        "reminders": [{"minutes": 30, "method": "alert"}],
-        "device_id": "device-1",
-    }

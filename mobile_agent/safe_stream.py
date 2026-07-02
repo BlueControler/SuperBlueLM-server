@@ -156,6 +156,9 @@ class SafeStreamFilter:
             if safe is not None:
                 self._record_progress_status(safe)
             return [SafeSseFrame("task_progress", safe)] if safe is not None else []
+        if payload_type == "needs_confirmation":
+            safe = _safe_needs_confirmation_payload(payload)
+            return [SafeSseFrame("needs_confirmation", safe)] if safe is not None else []
         if payload_type == "task_complexity":
             safe = _safe_task_complexity_payload(payload)
             return [SafeSseFrame("task_complexity", safe)] if safe is not None else []
@@ -1049,6 +1052,41 @@ def _safe_progress_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
     completed_steps = _safe_completed_steps(payload.get("completedSteps"))
     if completed_steps:
         safe["completedSteps"] = completed_steps
+    return _fit_payload(safe)
+
+
+def _safe_needs_confirmation_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    confirmation_id = payload.get("confirmationId")
+    operation = payload.get("operation")
+    tool_name = payload.get("toolName")
+    payload_preview = payload.get("payloadPreview")
+    if not all(
+        isinstance(value, str) and value
+        for value in (confirmation_id, operation, tool_name, payload_preview)
+    ):
+        return None
+    safe: dict[str, Any] = {
+        "type": "needs_confirmation",
+        "confirmationId": _bounded(str(confirmation_id), 128),
+        "operation": _safe_description(str(operation), MAX_TRACE_TITLE_CHARS),
+        "toolName": _safe_description(str(tool_name), 128),
+        "payloadPreview": _safe_description(str(payload_preview), MAX_TRACE_SUMMARY_CHARS),
+    }
+    for key, limit in (
+        ("runId", 128),
+        ("threadId", 128),
+        ("taskTitle", MAX_TRACE_TITLE_CHARS),
+        ("targetApp", MAX_TRACE_TITLE_CHARS),
+        ("riskLevel", 32),
+        ("confirmText", 32),
+        ("cancelText", 32),
+    ):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            safe[key] = _safe_description(value, limit)
+    dry_run = payload.get("dryRun")
+    if isinstance(dry_run, bool):
+        safe["dryRun"] = dry_run
     return _fit_payload(safe)
 
 

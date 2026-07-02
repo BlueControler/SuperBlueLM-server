@@ -13,8 +13,9 @@ from typing import Any, Protocol, cast
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
+from ..confirmations import ConfirmationTransaction, create_confirmation
 from ..json_types import JsonObject, to_json_value
-from ..progress import emit_task_complexity, emit_task_progress
+from ..progress import emit_needs_confirmation, emit_task_complexity, emit_task_progress
 from ..tools.external import DEFAULT_TIMEOUT_SECONDS, CommandRunner, SafeCommandRunner
 from .middleware import _message_content_to_text
 from .state import MobileAgentState
@@ -25,6 +26,7 @@ MEETING_MINUTES_PHASE = "meeting_minutes_sop"
 DEFAULT_PROJECT_GROUP = "项目群"
 DEFAULT_SENDER = "wecom"
 MAX_MEETING_FILE_BYTES = 256 * 1024
+WAITING_CONFIRMATION_MESSAGE = "会议纪要已整理完成，等待你确认是否发送到项目群。"
 
 MEETING_FILE_KEYWORDS = (
     "会议",
@@ -51,7 +53,7 @@ class MeetingMinutesSopRunner:
     command_runner: CommandRunner | None = None
     project_group: str = DEFAULT_PROJECT_GROUP
     sender: str = DEFAULT_SENDER
-    auto_confirm: bool = True
+    auto_confirm: bool = False
 
     async def run(self) -> JsonObject:
         today = self._today()
@@ -106,6 +108,42 @@ class MeetingMinutesSopRunner:
             "llm_summary",
         )
 
+        send_tool = "feishu_cli" if self.sender.lower() in {"feishu", "lark"} else "wecom_cli"
+        if not self.auto_confirm:
+            confirmation_transaction = _create_meeting_minutes_confirmation(
+                minutes=minutes,
+                project_group=self.project_group,
+                sender=self.sender,
+                tool_name=send_tool,
+            )
+            _emit_needs_confirmation_event(confirmation_transaction)
+            _emit_waiting_confirmation_progress(
+                confirmation_transaction,
+                completed_steps=completed_steps,
+            )
+            return {
+                "task_type": MEETING_MINUTES_TASK_TYPE,
+                "selected_file": str(selected_file) if selected_file is not None else None,
+                "candidates": [str(candidate) for candidate in candidates],
+                "minutes": minutes,
+                "confirmation": {
+                    "status": "needs_confirmation",
+                    "auto_confirm": False,
+                    "target": self.project_group,
+                    "confirmationId": confirmation_transaction.confirmation_id,
+                    "needsConfirmation": confirmation_transaction.needs_confirmation_event(),
+                },
+                "send_result": {
+                    "skipped": True,
+                    "reason": "needs_confirmation",
+                    "confirmationId": confirmation_transaction.confirmation_id,
+                    "dryRun": confirmation_transaction.dry_run,
+                },
+                "sent": False,
+                "completed_steps": completed_steps,
+                "final_message": WAITING_CONFIRMATION_MESSAGE,
+            }
+
         self._emit_step(
             step=4,
             message="第 4/5 步：等待确认是否发送到项目群",
@@ -124,7 +162,6 @@ class MeetingMinutesSopRunner:
             "needs_confirmation",
         )
 
-        send_tool = "feishu_cli" if self.sender.lower() in {"feishu", "lark"} else "wecom_cli"
         self._emit_step(
             step=5,
             message="第 5/5 步：正在发送到项目群",
@@ -342,6 +379,70 @@ def _model_response(result: JsonObject) -> ModelResponse[Any]:
 
 def _normalize_utterance(text: str) -> str:
     return re.sub(r"[\s，。,.!！?？]+", "", text.strip().lower())
+
+
+def _create_meeting_minutes_confirmation(
+    *,
+    minutes: str,
+    project_group: str,
+    sender: str,
+    tool_name: str,
+) -> ConfirmationTransaction:
+    target_app = "飞书" if sender.lower() in {"feishu", "lark"} else "企业微信"
+    preview = f"发送到：{project_group}\n\n{minutes[:800]}"
+    return create_confirmation(
+        task_title="会议纪要发送",
+        operation="发送会议纪要到项目群",
+        target_app=target_app,
+        tool_name=tool_name,
+        risk_level="high",
+        payload_preview=preview,
+        confirm_text="确认发送",
+        cancel_text="取消",
+        dry_run=True,
+    )
+
+
+def _emit_needs_confirmation_event(transaction: ConfirmationTransaction) -> None:
+    emit_needs_confirmation(
+        confirmation_id=transaction.confirmation_id,
+        run_id=transaction.run_id,
+        thread_id=transaction.thread_id,
+        task_title=transaction.task_title,
+        operation=transaction.operation,
+        target_app=transaction.target_app,
+        tool_name=transaction.tool_name,
+        risk_level=transaction.risk_level,
+        payload_preview=transaction.payload_preview,
+        confirm_text=transaction.confirm_text,
+        cancel_text=transaction.cancel_text,
+        dry_run=transaction.dry_run,
+    )
+
+
+def _emit_waiting_confirmation_progress(
+    transaction: ConfirmationTransaction,
+    *,
+    completed_steps: Sequence[JsonObject],
+) -> None:
+    emit_task_progress(
+        label="needs_confirmation",
+        status="waiting_confirmation",
+        phase=MEETING_MINUTES_PHASE,
+        task_title=transaction.task_title,
+        step_title="等待确认是否发送到项目群",
+        message="会议纪要已整理完成，等待确认后才会发送。",
+        tool_name="needs_confirmation",
+        progress_key=f"meeting-minutes-sop-confirmation-{transaction.confirmation_id}",
+        current_step=4,
+        total_steps=5,
+        completed_steps=completed_steps,
+        requires_confirmation=True,
+        confirmation_id=transaction.confirmation_id,
+        can_cancel=True,
+        can_take_over=True,
+        dry_run=transaction.dry_run,
+    )
 
 
 def _date_tokens(today: str) -> tuple[str, ...]:

@@ -113,6 +113,10 @@ TOOL_DISPLAY_REGISTRY: dict[str, ToolDisplaySpec] = {
     "create_event": _spec("创建日程", "approval", "该操作涉及日程变更，需要用户确认。", "", risk="high"),
     "update_event": _spec("修改日程", "approval", "该操作涉及日程变更，需要用户确认。", "", risk="high"),
     "update_reminders": _spec("修改提醒", "approval", "该操作涉及日程变更，需要用户确认。", "", risk="high"),
+    "archive_file": _spec("归档文件", "approval", "该操作涉及本地文件变更，需要用户确认。", "", risk="high"),
+    "feishu_cli": _spec("执行飞书操作", "approval", "该操作可能写入飞书数据，需要用户确认。", "", risk="high"),
+    "wecom_cli": _spec("执行企业微信操作", "approval", "该操作可能写入企业微信数据，需要用户确认。", "", risk="high"),
+    "run_cli_command": _spec("执行外部命令", "approval", "该操作可能产生外部写入，需要用户确认。", "", risk="high"),
     "interact": _spec("等待你处理", "approval", "该操作需要你确认。我不会继续自动执行。", "", risk="high"),
     "take_over": _spec("等待你接管", "approval", "该操作需要你确认。我不会继续自动执行。", "", risk="high"),
 }

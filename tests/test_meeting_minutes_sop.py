@@ -73,6 +73,7 @@ def test_meeting_minutes_sop_runs_fixed_closed_loop(
         search_roots=(tmp_path,),
         now=lambda: "2026-07-02",
         command_runner=sender,
+        auto_confirm=True,
     )
     monkeypatch.setattr(progress, "get_stream_writer", lambda: emitted.append)
 
@@ -115,6 +116,7 @@ def test_meeting_minutes_middleware_short_circuits_fixed_demo_request(
         search_roots=(tmp_path,),
         now=lambda: "2026-07-02",
         command_runner=_FakeCommandRunner(),
+        auto_confirm=True,
     )
     middleware = MeetingMinutesSopMiddleware(runner)
     request = type(
@@ -141,4 +143,50 @@ def test_meeting_minutes_middleware_short_circuits_fixed_demo_request(
         "llm_summary",
         "needs_confirmation",
         "wecom_cli",
+    ]
+
+
+def test_meeting_minutes_default_waits_for_confirmation_without_sending(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    (tmp_path / "2026-07-02-会议记录.txt").write_text(
+        "赵六：今天完成 SOP 接入。\n",
+        encoding="utf-8",
+    )
+    emitted: list[dict[str, Any]] = []
+    sender = _FakeCommandRunner()
+    runner = MeetingMinutesSopRunner(
+        search_roots=(tmp_path,),
+        now=lambda: "2026-07-02",
+        command_runner=sender,
+    )
+    monkeypatch.setattr(progress, "get_stream_writer", lambda: emitted.append)
+
+    result = asyncio.run(runner.run())
+
+    assert result["sent"] is False
+    assert sender.calls == []
+    assert result["confirmation"]["status"] == "needs_confirmation"
+    confirmation_id = result["confirmation"]["confirmationId"]
+    assert confirmation_id
+    needs_confirmation_events = [
+        event for event in emitted if event.get("type") == "needs_confirmation"
+    ]
+    assert needs_confirmation_events[-1]["confirmationId"] == confirmation_id
+    assert needs_confirmation_events[-1]["toolName"] == "wecom_cli"
+    assert needs_confirmation_events[-1]["dryRun"] is True
+    waiting_events = [
+        event
+        for event in _progress_steps(emitted)
+        if event.get("status") == "waiting_confirmation"
+    ]
+    assert waiting_events[-1]["confirmationId"] == confirmation_id
+    assert waiting_events[-1]["canCancel"] is True
+    assert waiting_events[-1]["canTakeOver"] is True
+    assert [event["toolName"] for event in _progress_steps(emitted)] == [
+        "search_files",
+        "read_text_file",
+        "llm_summary",
+        "needs_confirmation",
     ]

@@ -361,6 +361,46 @@ def test_filter_forwards_progress_task_card_fields_without_unknown_fields() -> N
     }
 
 
+def test_filter_forwards_needs_confirmation_transaction_fields_without_unknown_fields() -> None:
+    stream = SafeStreamFilter()
+    payload = {
+        "type": "needs_confirmation",
+        "runId": "run-1",
+        "threadId": "thread-1",
+        "confirmationId": "confirm-123",
+        "taskTitle": "为会议通知创建提醒",
+        "operation": "创建会议提醒",
+        "targetApp": "系统日历",
+        "toolName": "create_event",
+        "riskLevel": "medium",
+        "payloadPreview": "检测到会议通知，是否创建会议提醒？",
+        "confirmText": "确认创建",
+        "cancelText": "取消",
+        "dryRun": True,
+        "rawPayload": {"token": "secret"},
+    }
+
+    frames = stream.feed(SseFrame(event="custom", data=json.dumps(payload, ensure_ascii=False)))
+
+    assert len(frames) == 1
+    assert frames[0].event == "needs_confirmation"
+    assert frames[0].data == {
+        "type": "needs_confirmation",
+        "runId": "run-1",
+        "threadId": "thread-1",
+        "confirmationId": "confirm-123",
+        "taskTitle": "为会议通知创建提醒",
+        "operation": "创建会议提醒",
+        "targetApp": "系统日历",
+        "toolName": "create_event",
+        "riskLevel": "medium",
+        "payloadPreview": "检测到会议通知，是否创建会议提醒？",
+        "confirmText": "确认创建",
+        "cancelText": "取消",
+        "dryRun": True,
+    }
+
+
 def test_filter_forwards_task_complexity_without_unknown_fields() -> None:
     stream = SafeStreamFilter()
     payload = {

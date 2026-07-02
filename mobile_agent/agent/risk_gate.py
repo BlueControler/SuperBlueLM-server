@@ -10,7 +10,10 @@ from langchain.tools.tool_node import ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
+from ..confirmations import create_high_risk_confirmation
+from ..progress import emit_needs_confirmation, emit_task_progress
 from ..trace import is_high_risk_tool
+from ..trace import current_context
 from .state import MobileAgentState
 
 ToolResult: TypeAlias = ToolMessage | Command[Any]
@@ -52,10 +55,51 @@ class HighRiskActionGateMiddleware(AgentMiddleware[MobileAgentState, None, Any])
         args = tool_call.get("args", {})
         if not isinstance(args, dict) or not is_high_risk_tool(tool_name, args):
             return None
+        context = current_context()
+        transaction = create_high_risk_confirmation(
+            tool_name=tool_name,
+            args=args,
+            run_id=context.run_id if context is not None else None,
+            thread_id=context.thread_id if context is not None else None,
+        )
+        emit_needs_confirmation(
+            confirmation_id=transaction.confirmation_id,
+            run_id=transaction.run_id,
+            thread_id=transaction.thread_id,
+            task_title=transaction.task_title,
+            operation=transaction.operation,
+            target_app=transaction.target_app,
+            tool_name=transaction.tool_name,
+            risk_level=transaction.risk_level,
+            payload_preview=transaction.payload_preview,
+            confirm_text=transaction.confirm_text,
+            cancel_text=transaction.cancel_text,
+            dry_run=transaction.dry_run,
+        )
+        emit_task_progress(
+            label=transaction.operation,
+            run_id=transaction.run_id,
+            thread_id=transaction.thread_id,
+            task_title=transaction.task_title,
+            status="waiting_confirmation",
+            phase="confirmation",
+            current_step=1,
+            total_steps=1,
+            step_title=f"等待确认：{transaction.operation}",
+            tool_name="needs_confirmation",
+            requires_confirmation=True,
+            confirmation_id=transaction.confirmation_id,
+            can_cancel=True,
+            can_take_over=True,
+            message=transaction.payload_preview,
+            progress_key=f"confirmation-{transaction.confirmation_id}",
+            dry_run=transaction.dry_run,
+        )
         return Command(
             update={
                 "awaiting_user_action": True,
                 "awaiting_user_reason": "high_risk_action",
+                "awaiting_confirmation_id": transaction.confirmation_id,
                 "messages": [self._blocked_message(request, _WAITING_MESSAGE)],
             }
         )
