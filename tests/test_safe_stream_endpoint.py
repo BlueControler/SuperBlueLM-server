@@ -177,12 +177,19 @@ def test_unexpected_upstream_failure_is_converted_to_a_safe_sse_error(
 def test_upstream_http_error_body_is_not_exposed_in_stream_error(monkeypatch) -> None:
     monkeypatch.setenv("LANGGRAPH_INTERNAL_BASE_URL", "http://internal.example")
     monkeypatch.setattr("mobile_agent.safe_stream.httpx.AsyncClient", _HttpErrorAsyncClient)
+    logged: list[str] = []
+    from mobile_agent.safe_stream import logger
 
-    response = TestClient(app).post(
-        "/mobile/threads/thread-1/runs/stream",
-        json={"input": {"messages": []}},
-        headers={"Authorization": "Bearer client-token"},
-    )
+    sink_id = logger.add(lambda message: logged.append(str(message)), format="{message}")
+
+    try:
+        response = TestClient(app).post(
+            "/mobile/threads/thread-1/runs/stream",
+            json={"input": {"messages": []}},
+            headers={"Authorization": "Bearer client-token"},
+        )
+    finally:
+        logger.remove(sink_id)
 
     assert response.status_code == 200
     frames = _parse_sse(response.text)
@@ -196,6 +203,12 @@ def test_upstream_http_error_body_is_not_exposed_in_stream_error(monkeypatch) ->
     assert "Bearer" not in response.text
     assert "/internal/admin" not in response.text
     assert "client-token" not in response.text
+    log_text = "\n".join(logged)
+    assert "upstream exploded" in log_text
+    assert "server-secret-token" not in log_text
+    assert "Bearer server-secret-token" not in log_text
+    assert '"token":"***"' in log_text
+    assert '"Authorization":"***"' in log_text
 
 
 def test_safe_stream_route_encodes_only_safe_sse_frames(monkeypatch) -> None:

@@ -34,6 +34,9 @@ MAX_SAFE_ASSISTANT_DELTA_BYTES = 3_800
 _SENSITIVE_VALUE = re.compile(
     r"(?i)\b(api[_-]?key|app[_-]?key|appkey|x-api-key|token|password|secret|authorization|cookie)\s*[:=]\s*[^\s,;，。]+"
 )
+_SENSITIVE_JSON_VALUE = re.compile(
+    r"(?i)([\"']?(?:api[_-]?key|app[_-]?key|appkey|x-api-key|token|password|secret|authorization|cookie)[\"']?\s*:\s*[\"'])[^\"'\r\n]+([\"'])"
+)
 _AUTHORIZATION_VALUE = re.compile(
     r"(?i)\bauthorization\s*[:=]\s*(?:[A-Za-z]+\s+)?[^\s,;，。\r\n]+"
 )
@@ -300,11 +303,12 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
                 ) as response:
                     _bind_backend_run_from_response(run_id, thread_id, response)
                     if response.status_code < 200 or response.status_code >= 300:
-                        await response.aread()
+                        error_body = await response.aread()
+                        error_detail = _safe_upstream_error_detail(error_body)
                         error_category = _upstream_error_category(response.status_code)
                         logger.warning(
-                            "mobile_upstream_stream_error run_id={} thread_id={} upstream_status={} error_category={}",
-                            run_id, thread_id, response.status_code, error_category,
+                            "mobile_upstream_stream_error run_id={} thread_id={} upstream_status={} error_category={} upstream_error_detail={}",
+                            run_id, thread_id, response.status_code, error_category, error_detail,
                         )
                         # 区分 409（线程忙）和其他错误，统一发业务终态
                         if response.status_code == 409:
@@ -1179,6 +1183,7 @@ def _sanitize_assistant_text(text: str) -> str:
     if not text:
         return ""
     redacted = _strip_think_markup(text)
+    redacted = _SENSITIVE_JSON_VALUE.sub(lambda match: f"{match.group(1)}***{match.group(2)}", redacted)
     redacted = _AUTHORIZATION_VALUE.sub("Authorization=***", redacted)
     redacted = _COOKIE_VALUE.sub("Cookie=***", redacted)
     redacted = _RAW_TOOL_TEXT.sub("[已隐藏工具原始数据]", redacted)
@@ -1193,6 +1198,13 @@ def _sanitize_assistant_text(text: str) -> str:
 def _safe_error_message(text: str) -> str:
     without_traceback = _TRACEBACK_TEXT.sub("错误详情已隐藏。", text)
     return _safe_description(without_traceback, MAX_TRACE_SUMMARY_CHARS) or "服务连接中断，请稍后重试。"
+
+
+def _safe_upstream_error_detail(body: bytes) -> str:
+    if not body:
+        return ""
+    text = body[:8192].decode("utf-8", errors="replace")
+    return _safe_description(text, MAX_TRACE_SUMMARY_CHARS)
 
 
 def _safe_description(text: str, limit: int) -> str:
