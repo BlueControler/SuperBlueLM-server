@@ -5,6 +5,7 @@ import json
 import threading
 from pathlib import Path
 from typing import Any, Sequence
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from langchain.agents.middleware.types import ModelResponse
 from langchain_core.messages import AIMessage, HumanMessage
@@ -43,8 +44,46 @@ class _FakeCommandRunner(CommandRunner):
         }
 
 
+class _MissingCommandRunner(CommandRunner):
+    async def run(
+        self,
+        command: str,
+        args: Sequence[str],
+        timeout: float,
+    ) -> dict[str, Any]:
+        return {
+            "error": "command_not_found",
+            "command": command,
+            "message": f"Command {command!r} was not found in PATH.",
+        }
+
+
 def _progress_steps(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [event for event in events if event.get("phase") == "meeting_minutes_sop"]
+
+
+def _write_minimal_docx(path: Path, paragraphs: Sequence[str]) -> None:
+    escaped_paragraphs = "\n".join(
+        f"<w:p><w:r><w:t>{paragraph}</w:t></w:r></w:p>" for paragraph in paragraphs
+    )
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f"<w:body>{escaped_paragraphs}</w:body></w:document>"
+    )
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as docx:
+        docx.writestr(
+            "[Content_Types].xml",
+            (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                '<Default Extension="xml" ContentType="application/xml"/>'
+                '<Override PartName="/word/document.xml" '
+                'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+                "</Types>"
+            ),
+        )
+        docx.writestr("word/document.xml", document_xml)
 
 
 def test_fixed_utterance_is_recognized() -> None:
@@ -105,6 +144,33 @@ def test_meeting_minutes_sop_runs_fixed_closed_loop(
         (5, 5, "第 5/5 步：正在发送到项目群", "wecom_cli"),
     ]
     assert result["final_message"] == "会议纪要已整理完成，并已发送到项目群。"
+
+
+def test_meeting_minutes_sop_reads_today_docx_record(
+    tmp_path: Path,
+) -> None:
+    meeting_file = tmp_path / "2026-07-03-项目会议记录.docx"
+    _write_minimal_docx(
+        meeting_file,
+        [
+            "项目例会",
+            "张三：今天完成会议纪要端到端验证。",
+            "李四：明天确认企业微信发送 CLI。",
+        ],
+    )
+    runner = MeetingMinutesSopRunner(
+        search_roots=(tmp_path,),
+        now=lambda: "2026-07-03",
+        command_runner=_FakeCommandRunner(),
+        auto_confirm=True,
+    )
+
+    result = asyncio.run(runner.run())
+
+    assert result["selected_file"] == str(meeting_file)
+    assert "张三" in result["minutes"]
+    assert "李四" in result["minutes"]
+    assert "今天完成会议纪要端到端验证" in result["minutes"]
 
 
 def test_meeting_minutes_middleware_short_circuits_fixed_demo_request(
@@ -179,7 +245,7 @@ def test_meeting_minutes_default_waits_for_confirmation_without_sending(
     ]
     assert needs_confirmation_events[-1]["confirmationId"] == confirmation_id
     assert needs_confirmation_events[-1]["toolName"] == "wecom_cli"
-    assert needs_confirmation_events[-1]["dryRun"] is True
+    assert needs_confirmation_events[-1]["dryRun"] is False
     waiting_events = [
         event
         for event in _progress_steps(emitted)
@@ -188,6 +254,7 @@ def test_meeting_minutes_default_waits_for_confirmation_without_sending(
     assert waiting_events[-1]["confirmationId"] == confirmation_id
     assert waiting_events[-1]["canCancel"] is True
     assert waiting_events[-1]["canTakeOver"] is True
+    assert waiting_events[-1]["dryRun"] is False
     assert [event["toolName"] for event in _progress_steps(emitted)] == [
         "search_files",
         "read_text_file",
@@ -196,7 +263,7 @@ def test_meeting_minutes_default_waits_for_confirmation_without_sending(
     ]
 
 
-def test_meeting_minutes_confirmation_confirm_completes_step_5_dry_run_without_sending(
+def test_meeting_minutes_confirmation_confirm_sends_minutes_to_project_group(
     tmp_path: Path,
 ) -> None:
     confirmation_store.clear()
@@ -220,16 +287,48 @@ def test_meeting_minutes_confirmation_confirm_completes_step_5_dry_run_without_s
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "confirmed"
-    assert payload["dryRun"] is True
-    assert sender.calls == []
+    assert payload["dryRun"] is False
+    assert sender.calls
+    command, args, _timeout = sender.calls[0]
+    assert command == "wecom-cli"
+    assert args[:4] == ["message", "send", "--to", "项目群"]
+    assert "会议纪要" in args[-1]
     assert [event["status"] for event in payload["events"]] == ["running", "completed"]
-    assert all(event["dryRun"] is True for event in payload["events"])
+    assert all(event["dryRun"] is False for event in payload["events"])
     assert all(event["currentStep"] == 5 for event in payload["events"])
     assert all(event["totalSteps"] == 5 for event in payload["events"])
     assert all(event["phase"] == "meeting_minutes_sop" for event in payload["events"])
     assert payload["events"][0]["toolName"] == "wecom_cli"
-    assert payload["events"][0]["message"] == "第 5/5 步：正在发送到项目群（演示模式）"
-    assert payload["events"][1]["message"] == "第 5/5 步：会议纪要已发送到项目群（演示模式）"
+    assert payload["events"][0]["message"] == "第 5/5 步：正在发送到项目群"
+    assert payload["events"][1]["message"] == "第 5/5 步：会议纪要已发送到项目群"
+
+
+def test_meeting_minutes_confirmation_reports_missing_cli_configuration(
+    tmp_path: Path,
+) -> None:
+    confirmation_store.clear()
+    (tmp_path / "2026-07-02-会议记录.txt").write_text(
+        "赵六：今天完成 SOP 接入。\n",
+        encoding="utf-8",
+    )
+    runner = MeetingMinutesSopRunner(
+        search_roots=(tmp_path,),
+        now=lambda: "2026-07-02",
+        command_runner=_MissingCommandRunner(),
+    )
+
+    result = asyncio.run(runner.run())
+    confirmation_id = result["confirmation"]["confirmationId"]
+    response = TestClient(app).post(f"/mobile/confirmations/{confirmation_id}/confirm")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "confirmed"
+    assert [event["status"] for event in payload["events"]] == ["running", "failed"]
+    assert payload["events"][1]["toolName"] == "wecom_cli"
+    assert payload["events"][1]["message"] == (
+        "企业微信 CLI 未安装或未加入 PATH，请配置 WECOM_CLI_BIN 后重试。"
+    )
 
 
 def test_default_meeting_file_lookup_runs_off_event_loop_thread(

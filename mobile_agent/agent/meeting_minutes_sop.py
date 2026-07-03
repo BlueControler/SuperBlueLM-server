@@ -4,11 +4,13 @@ import asyncio
 import json
 import os
 import re
+import zipfile
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
+from xml.etree import ElementTree
 
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
@@ -118,6 +120,7 @@ class MeetingMinutesSopRunner:
                 minutes=minutes,
                 project_group=self.project_group,
                 sender=self.sender,
+                runner=self.command_runner,
                 tool_name=send_tool,
             )
             _emit_needs_confirmation_event(confirmation_transaction)
@@ -178,6 +181,7 @@ class MeetingMinutesSopRunner:
             sender=self.sender,
             runner=self.command_runner,
         )
+        sent = _send_result_ok(send_result)
         completed_steps = _append_completed_step(
             completed_steps,
             5,
@@ -185,7 +189,11 @@ class MeetingMinutesSopRunner:
             send_tool,
         )
 
-        final_message = "会议纪要已整理完成，并已发送到项目群。"
+        final_message = (
+            "会议纪要已整理完成，并已发送到项目群。"
+            if sent
+            else _send_failure_message(send_result, sender=self.sender)
+        )
         return {
             "task_type": MEETING_MINUTES_TASK_TYPE,
             "selected_file": str(selected_file) if selected_file is not None else None,
@@ -193,7 +201,7 @@ class MeetingMinutesSopRunner:
             "minutes": minutes,
             "confirmation": confirmation,
             "send_result": send_result,
-            "sent": True,
+            "sent": sent,
             "completed_steps": completed_steps,
             "final_message": final_message,
         }
@@ -298,6 +306,8 @@ def search_files(search_roots: Sequence[Path], today: str) -> list[Path]:
 def read_text_file(path: Path | None) -> str:
     if path is None:
         return ""
+    if path.suffix.lower() == ".docx":
+        return _read_docx_text(path)
     raw = path.read_bytes()[:MAX_MEETING_FILE_BYTES]
     for encoding in ("utf-8", "utf-8-sig", "gb18030"):
         try:
@@ -305,6 +315,31 @@ def read_text_file(path: Path | None) -> str:
         except UnicodeDecodeError:
             continue
     return raw.decode("utf-8", errors="replace")
+
+
+def _read_docx_text(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(path) as docx:
+            document_xml = docx.read("word/document.xml")
+    except (KeyError, OSError, zipfile.BadZipFile):
+        return ""
+
+    try:
+        root = ElementTree.fromstring(document_xml)
+    except ElementTree.ParseError:
+        return ""
+
+    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    paragraphs: list[str] = []
+    for paragraph in root.findall(".//w:p", namespace):
+        text_parts = [
+            text_node.text or ""
+            for text_node in paragraph.findall(".//w:t", namespace)
+        ]
+        paragraph_text = "".join(text_parts).strip()
+        if paragraph_text:
+            paragraphs.append(paragraph_text)
+    return "\n".join(paragraphs)
 
 
 def summarize_meeting(content: str, today: str) -> str:
@@ -354,14 +389,19 @@ async def send_minutes(
 
     result = await command_runner.run(command=command, args=args, timeout=timeout)
     result_object = cast(JsonObject, to_json_value(result))
-    if result_object.get("error") == "command_not_found":
-        return {
-            **result_object,
-            "ok": True,
-            "demo_fallback": True,
-            "message": "CLI 未安装，演示模式按已发送处理。",
-        }
     return result_object
+
+
+def _send_result_ok(send_result: JsonObject) -> bool:
+    return bool(send_result.get("ok")) and not send_result.get("error")
+
+
+def _send_failure_message(send_result: JsonObject, *, sender: str) -> str:
+    if send_result.get("error") == "command_not_found":
+        env_var = "LARK_CLI_BIN" if sender.lower() in {"feishu", "lark"} else "WECOM_CLI_BIN"
+        app_name = "飞书" if sender.lower() in {"feishu", "lark"} else "企业微信"
+        return f"{app_name} CLI 未安装或未加入 PATH，请配置 {env_var} 后重试。"
+    return "会议纪要已整理完成，但发送到项目群失败，请检查 CLI 输出后重试。"
 
 
 def _request_matches(messages: Sequence[BaseMessage]) -> bool:
@@ -393,6 +433,7 @@ def _create_meeting_minutes_confirmation(
     minutes: str,
     project_group: str,
     sender: str,
+    runner: CommandRunner | None,
     tool_name: str,
 ) -> ConfirmationTransaction:
     target_app = "飞书" if sender.lower() in {"feishu", "lark"} else "企业微信"
@@ -406,34 +447,61 @@ def _create_meeting_minutes_confirmation(
         payload_preview=preview,
         confirm_text="确认发送",
         cancel_text="取消",
-        dry_run=True,
-        confirm_handler=_meeting_minutes_confirm_handler(tool_name=tool_name),
+        dry_run=False,
+        confirm_handler=_meeting_minutes_confirm_handler(
+            minutes=minutes,
+            project_group=project_group,
+            sender=sender,
+            runner=runner,
+            tool_name=tool_name,
+        ),
     )
 
 
 def _meeting_minutes_confirm_handler(
     *,
+    minutes: str,
+    project_group: str,
+    sender: str,
+    runner: CommandRunner | None,
     tool_name: str,
-) -> Callable[[ConfirmationTransaction], list[JsonObject]]:
-    def handle(transaction: ConfirmationTransaction) -> list[JsonObject]:
-        return [
-            _meeting_minutes_confirmation_task_progress_event(
-                transaction,
-                status="running",
-                step_title="正在发送到项目群（演示模式）",
-                message="第 5/5 步：正在发送到项目群（演示模式）",
-                tool_name=tool_name,
-                confirmation_id=transaction.confirmation_id,
-            ),
-            _meeting_minutes_confirmation_task_progress_event(
+) -> Callable[[ConfirmationTransaction], Awaitable[list[JsonObject]]]:
+    async def handle(transaction: ConfirmationTransaction) -> list[JsonObject]:
+        running = _meeting_minutes_confirmation_task_progress_event(
+            transaction,
+            status="running",
+            step_title="正在发送到项目群",
+            message="第 5/5 步：正在发送到项目群",
+            tool_name=tool_name,
+            confirmation_id=transaction.confirmation_id,
+        )
+        send_result = await send_minutes(
+            minutes,
+            project_group=project_group,
+            sender=sender,
+            runner=runner,
+        )
+        if _send_result_ok(send_result):
+            terminal = _meeting_minutes_confirmation_task_progress_event(
                 transaction,
                 status="completed",
-                step_title="会议纪要已发送到项目群（演示模式）",
-                message="第 5/5 步：会议纪要已发送到项目群（演示模式）",
+                step_title="会议纪要已发送到项目群",
+                message="第 5/5 步：会议纪要已发送到项目群",
                 tool_name=tool_name,
                 confirmation_id=None,
-            ),
-        ]
+                send_result=send_result,
+            )
+        else:
+            terminal = _meeting_minutes_confirmation_task_progress_event(
+                transaction,
+                status="failed",
+                step_title="发送到项目群失败",
+                message=_send_failure_message(send_result, sender=sender),
+                tool_name=tool_name,
+                confirmation_id=None,
+                send_result=send_result,
+            )
+        return [running, terminal]
 
     return handle
 
@@ -446,6 +514,7 @@ def _meeting_minutes_confirmation_task_progress_event(
     message: str,
     tool_name: str,
     confirmation_id: str | None,
+    send_result: JsonObject | None = None,
 ) -> JsonObject:
     event: JsonObject = {
         "type": "task_progress",
@@ -470,6 +539,8 @@ def _meeting_minutes_confirmation_task_progress_event(
         event["runId"] = transaction.run_id
     if transaction.thread_id:
         event["threadId"] = transaction.thread_id
+    if send_result is not None:
+        event["result"] = send_result
     return event
 
 
