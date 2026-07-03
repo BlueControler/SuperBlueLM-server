@@ -71,7 +71,7 @@ class MeetingMinutesSopRunner:
             tool_name="search_files",
             completed_steps=completed_steps,
         )
-        candidates = search_files(self._search_roots(), today)
+        candidates = await asyncio.to_thread(self._search_files_for_today, today)
         selected_file = candidates[0] if candidates else None
         completed_steps = _append_completed_step(
             completed_steps,
@@ -86,7 +86,11 @@ class MeetingMinutesSopRunner:
             tool_name="read_text_file",
             completed_steps=completed_steps,
         )
-        meeting_text = read_text_file(selected_file) if selected_file is not None else ""
+        meeting_text = (
+            await asyncio.to_thread(read_text_file, selected_file)
+            if selected_file is not None
+            else ""
+        )
         completed_steps = _append_completed_step(
             completed_steps,
             2,
@@ -218,6 +222,9 @@ class MeetingMinutesSopRunner:
         if self.now is not None:
             return self.now()
         return datetime.now().strftime("%Y-%m-%d")
+
+    def _search_files_for_today(self, today: str) -> list[Path]:
+        return search_files(self._search_roots(), today)
 
     def _search_roots(self) -> tuple[Path, ...]:
         if self.search_roots is not None:

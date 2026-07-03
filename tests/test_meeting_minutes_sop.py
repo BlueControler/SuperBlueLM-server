@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -229,3 +230,43 @@ def test_meeting_minutes_confirmation_confirm_completes_step_5_dry_run_without_s
     assert payload["events"][0]["toolName"] == "wecom_cli"
     assert payload["events"][0]["message"] == "第 5/5 步：正在发送到项目群（演示模式）"
     assert payload["events"][1]["message"] == "第 5/5 步：会议纪要已发送到项目群（演示模式）"
+
+
+def test_default_meeting_file_lookup_runs_off_event_loop_thread(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    search_threads: list[str] = []
+    read_threads: list[str] = []
+    meeting_file = tmp_path / "2026-07-03-会议记录.txt"
+    meeting_file.write_text("钱七：今天完成阻塞调用修复。\n", encoding="utf-8")
+
+    def fake_search_files(search_roots: Sequence[Path], today: str) -> list[Path]:
+        search_threads.append(threading.current_thread().name)
+        return [meeting_file]
+
+    def fake_read_text_file(path: Path | None) -> str:
+        read_threads.append(threading.current_thread().name)
+        return "钱七：今天完成阻塞调用修复。"
+
+    monkeypatch.setattr(
+        "mobile_agent.agent.meeting_minutes_sop.search_files",
+        fake_search_files,
+    )
+    monkeypatch.setattr(
+        "mobile_agent.agent.meeting_minutes_sop.read_text_file",
+        fake_read_text_file,
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    runner = MeetingMinutesSopRunner(
+        now=lambda: "2026-07-03",
+        command_runner=_FakeCommandRunner(),
+        auto_confirm=True,
+    )
+
+    result = asyncio.run(runner.run())
+
+    assert result["sent"] is True
+    assert search_threads and search_threads[0] != threading.current_thread().name
+    assert read_threads and read_threads[0] != threading.current_thread().name
