@@ -54,6 +54,9 @@ def test_fixed_medical_travel_utterance_is_recognized() -> None:
     assert module.is_medical_travel_sop_request(
         "明天上午我要去医院复诊，帮我查天气和路线，并设置提醒"
     )
+    assert module.is_medical_travel_sop_request(
+        "请按照就医出行场景，帮我规划明天上午去医院复诊的天气、路线和提醒"
+    )
     assert not module.is_medical_travel_sop_request("明天帮我查一下天气")
 
 
@@ -88,7 +91,7 @@ def test_medical_travel_sop_runs_fixed_confirmed_demo_flow(monkeypatch: Any) -> 
         "create_event / update_reminders",
     ]
     assert tools.calls[0][1]["city"] == "南京"
-    assert tools.calls[1][1]["destination"] == "医院"
+    assert tools.calls[1][1]["destination"] == "江苏省人民医院"
     assert "复诊" in tools.calls[2][1]["message"]
     assert tools.calls[3][1]["title"] == "医院复诊出行提醒"
 

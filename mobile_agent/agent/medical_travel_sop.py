@@ -30,7 +30,7 @@ DEFAULT_ROUTE_RESULT = "高德地图路线：预计 42 分钟，建议优先选�
 DEFAULT_TRAVEL_ADVICE = "建议提前 20 分钟出发，带好医保卡、身份证和既往检查资料。"
 DEFAULT_REMINDER_TIME = "明天上午出发前 30 分钟"
 DEFAULT_CITY = "南京"
-DEFAULT_ROUTE_DESTINATION = "医院"
+DEFAULT_ROUTE_DESTINATION = "江苏省人民医院"
 FINAL_MESSAGE = "已整理明日出行信息，并创建复诊提醒。"
 WAITING_CONFIRMATION_MESSAGE = "已整理明日出行信息，等待你确认是否创建复诊提醒。"
 
@@ -45,7 +45,17 @@ class AsyncToolCall(Protocol):
 
 def is_medical_travel_sop_request(text: str) -> bool:
     normalized = _normalize_utterance(text)
-    return normalized == _normalize_utterance(FIXED_MEDICAL_TRAVEL_UTTERANCE)
+    if normalized == _normalize_utterance(FIXED_MEDICAL_TRAVEL_UTTERANCE):
+        return True
+    if "就医出行场景" in normalized:
+        return True
+    return (
+        "复诊" in normalized
+        and "医院" in normalized
+        and "天气" in normalized
+        and "路线" in normalized
+        and "提醒" in normalized
+    )
 
 
 @dataclass(frozen=True)
