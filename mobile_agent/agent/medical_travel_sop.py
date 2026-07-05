@@ -161,6 +161,7 @@ class MedicalTravelSopRunner:
     confirmation_request: AsyncToolCall | None = None
     reminder_writer: AsyncToolCall | None = None
     memory_reader: MemoryReader | None = None
+    location_query: AsyncToolCall | None = None
 
     async def run(
         self,
@@ -223,6 +224,11 @@ class MedicalTravelSopRunner:
             ),
             tool_name="read_user_memory",
             completed_steps=completed_steps,
+        )
+        enriched_intent = await self._resolve_origin_with_location(
+            enriched_intent,
+            memory,
+            device_id,
         )
 
         self._emit_step(
@@ -402,6 +408,26 @@ class MedicalTravelSopRunner:
             values=values,
         )
 
+    async def _resolve_origin_with_location(
+        self,
+        intent: MedicalTravelIntent,
+        memory: MedicalMemory,
+        device_id: str | None,
+    ) -> MedicalTravelIntent:
+        if intent.origin and intent.origin != DEFAULT_ROUTE_ORIGIN:
+            return intent
+        if _memory_origin(memory.values):
+            return intent
+        if self.location_query is not None:
+            arguments: JsonObject = {}
+            if device_id:
+                arguments["device_id"] = device_id
+            result = await _call_tool(self.location_query, arguments)
+            origin = _location_origin(result)
+            if origin:
+                return _copy_intent_with_origin(intent, origin)
+        return _copy_intent_with_origin(intent, intent.origin or DEFAULT_ROUTE_ORIGIN)
+
     def _emit_step(
         self,
         *,
@@ -489,6 +515,7 @@ def build_medical_travel_sop_runner(
             system.get("create_event"),
             system.get("update_reminders"),
         ),
+        location_query=_location_tool_adapter(system.get("get_location")),
     )
 
 
@@ -643,7 +670,7 @@ def _result(payload: JsonObject, final_message: str) -> JsonObject:
 
 def _apply_memory_to_intent(intent: MedicalTravelIntent, memory: MedicalMemory) -> MedicalTravelIntent:
     values = memory.values
-    origin = _memory_origin(values) or intent.origin or os.getenv("ECHO_MEDICAL_ROUTE_ORIGIN", DEFAULT_ROUTE_ORIGIN)
+    origin = _memory_origin(values) or intent.origin or os.getenv("ECHO_MEDICAL_ROUTE_ORIGIN")
     destination = (
         intent.destination
         if intent.destination != "医院"
@@ -874,6 +901,20 @@ def _route_tool_adapter(tool: BaseTool | None) -> AsyncToolCall:
     return call
 
 
+def _location_tool_adapter(tool: BaseTool | None) -> AsyncToolCall | None:
+    if tool is None:
+        return None
+
+    async def call(arguments: JsonObject) -> Any:
+        tool_args: JsonObject = {}
+        device_id = arguments.get("device_id")
+        if isinstance(device_id, str) and device_id:
+            tool_args["device_id"] = device_id
+        return await tool.ainvoke(tool_args)
+
+    return call
+
+
 def _reminder_tool_adapter(
     create_event_tool: BaseTool | None,
     update_reminders_tool: BaseTool | None,
@@ -1087,6 +1128,44 @@ def _memory_origin(values: Mapping[str, Any]) -> str | None:
         value = _optional_str(values.get(key))
         if value:
             return value
+    return None
+
+
+def _copy_intent_with_origin(intent: MedicalTravelIntent, origin: str) -> MedicalTravelIntent:
+    return MedicalTravelIntent(
+        raw_text=intent.raw_text,
+        date_text=intent.date_text,
+        time_text=intent.time_text,
+        city=intent.city,
+        origin=origin,
+        destination=intent.destination,
+        purpose=intent.purpose,
+        reminder_offset_minutes=intent.reminder_offset_minutes,
+        needs_weather=intent.needs_weather,
+        needs_route=intent.needs_route,
+        needs_reminder=intent.needs_reminder,
+        for_elderly=intent.for_elderly,
+    )
+
+
+def _location_origin(result: Any) -> str | None:
+    payload = _json_payload(result)
+    if isinstance(payload, Mapping):
+        for key in ("address", "formattedAddress", "addressText", "locationName", "name", "text", "message"):
+            value = _optional_str(payload.get(key))
+            if value:
+                return value
+        location = payload.get("location")
+        if isinstance(location, Mapping):
+            nested = _location_origin(location)
+            if nested:
+                return nested
+        latitude = payload.get("latitude") or payload.get("lat")
+        longitude = payload.get("longitude") or payload.get("lng") or payload.get("lon")
+        if latitude is not None and longitude is not None:
+            return f"{latitude},{longitude}"
+    if isinstance(result, str) and result.strip() and not result.strip().startswith(("{", "[")):
+        return result.strip()
     return None
 
 

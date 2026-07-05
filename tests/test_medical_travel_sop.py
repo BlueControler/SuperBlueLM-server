@@ -31,6 +31,10 @@ class _FakeMedicalTravelTools:
         self.calls.append(("create_event / update_reminders", arguments))
         return {"ok": True, "eventId": "demo-event-1", "reminderId": "demo-reminder-1"}
 
+    async def get_location(self, arguments: dict[str, Any]) -> str:
+        self.calls.append(("get_location", arguments))
+        return json.dumps({"address": "天津市南开区学生公寓"}, ensure_ascii=False)
+
 
 def _medical_module() -> Any:
     return importlib.import_module("mobile_agent.agent.medical_travel_sop")
@@ -143,6 +147,35 @@ def test_medical_travel_without_memory_uses_defaults() -> None:
     assert payload["memory"]["memorySource"] == "none"
     assert payload["intent"]["origin"] == "当前位置"
     assert payload["intent"]["destination"]
+
+
+def test_medical_travel_uses_location_tool_when_memory_has_no_origin() -> None:
+    module = _medical_module()
+    tools = _FakeMedicalTravelTools()
+    runner = module.MedicalTravelSopRunner(
+        weather_query=tools.weather_query,
+        route_query=tools.amap_mcp_tool,
+        reminder_writer=tools.write_reminder,
+        memory_reader=lambda _keys, _context=None: {},
+        location_query=tools.get_location,
+    )
+
+    result = asyncio.run(
+        runner.run(
+            intent=module.parse_medical_travel_intent("明天上午我要去医院复诊，帮我查天气和路线，并设置提醒。"),
+            device_id="device-1",
+        )
+    )
+
+    assert [name for name, _args in tools.calls] == [
+        "get_location",
+        "weather_query",
+        "amap_mcp_tool",
+    ]
+    assert tools.calls[0][1] == {"device_id": "device-1"}
+    assert tools.calls[2][1]["origin"] == "天津市南开区学生公寓"
+    assert result["medical_travel"]["intent"]["origin"] == "天津市南开区学生公寓"
+    assert result["medical_travel"]["decision"]["origin"] == "天津市南开区学生公寓"
 
 
 def test_medical_travel_middleware_returns_structured_payload(monkeypatch: Any) -> None:
