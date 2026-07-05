@@ -31,6 +31,7 @@ from .medical_travel_sop import (
 from .meeting_minutes_sop import MeetingMinutesSopMiddleware
 from .risk_gate import HighRiskActionGateMiddleware
 from .scenario3_demo import Scenario3DemoMiddleware
+from .scenarios.open_app_skill import OpenAppSkillMiddleware
 from .trace_middleware import TraceMiddleware
 
 
@@ -48,6 +49,7 @@ def build_middleware_stack(
         [
             ResetAgentRunStateMiddleware(),
             TraceMiddleware(),
+            OpenAppSkillMiddleware(phone_gateway, system_gateway),
             AppInventoryQueryMiddleware(system_gateway),
             MeetingMinutesSopMiddleware(),
             Scenario3DemoMiddleware(),
