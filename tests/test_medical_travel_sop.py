@@ -25,11 +25,7 @@ class _FakeMedicalTravelTools:
 
     async def amap_mcp_tool(self, arguments: dict[str, Any]) -> str:
         self.calls.append(("amap_mcp_tool", arguments))
-        return "高德地图路线：地铁 2 号线转 5 号线，预计 42 分钟。"
-
-    async def needs_confirmation(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        self.calls.append(("needs_confirmation", arguments))
-        return {"status": "confirmed", "confirmed": True}
+        return "高德地图路线：地铁 2 号线转 5 号线，预计 42 分钟，少步行。"
 
     async def write_reminder(self, arguments: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(("create_event / update_reminders", arguments))
@@ -37,141 +33,170 @@ class _FakeMedicalTravelTools:
 
 
 def _medical_module() -> Any:
-    try:
-        return importlib.import_module("mobile_agent.agent.medical_travel_sop")
-    except ModuleNotFoundError as exc:
-        raise AssertionError("medical travel SOP module is missing") from exc
+    return importlib.import_module("mobile_agent.agent.medical_travel_sop")
 
 
 def _progress_steps(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [event for event in events if event.get("phase") == "medical_travel_sop"]
+    return [event for event in events if event.get("phase") == "medical_travel"]
 
 
-def test_fixed_medical_travel_utterance_is_recognized() -> None:
+def test_medical_travel_request_recognizes_travel_but_not_medical_advice() -> None:
     module = _medical_module()
 
-    assert module.is_medical_travel_sop_request(module.FIXED_MEDICAL_TRAVEL_UTTERANCE)
-    assert module.is_medical_travel_sop_request(
-        "明天上午我要去医院复诊，帮我查天气和路线，并设置提醒"
-    )
-    assert module.is_medical_travel_sop_request(
-        "请按照就医出行场景，帮我规划明天上午去医院复诊的天气、路线和提醒"
-    )
-    assert not module.is_medical_travel_sop_request("明天帮我查一下天气")
+    assert module.is_medical_travel_request("明天上午我要去医院复诊，帮我查天气和路线，并设置提醒。")
+    assert module.is_medical_travel_request("后天上午 9 点去医院检查，帮我看看天气和出行时间。")
+    assert module.is_medical_travel_request("明天陪老人去医院复诊，帮我整理出行注意事项，并设置提醒。")
+    assert not module.is_medical_travel_request("我头疼怎么办？")
+    assert not module.is_medical_travel_request("这个药怎么吃？")
 
 
-def test_medical_travel_sop_runs_fixed_confirmed_demo_flow(monkeypatch: Any) -> None:
+def test_parse_medical_travel_intent_extracts_time_destination_and_elderly() -> None:
+    module = _medical_module()
+
+    intent = module.parse_medical_travel_intent("后天上午 9 点陪老人去天津医科大学总医院检查，提前 60 分钟提醒。")
+
+    assert intent.date_text == "后天"
+    assert intent.time_text == "上午9点"
+    assert intent.city == "天津"
+    assert intent.destination == "天津医科大学总医院"
+    assert intent.purpose == "检查"
+    assert intent.reminder_offset_minutes == 60
+    assert intent.for_elderly is True
+
+
+def test_medical_travel_reads_memory_and_returns_decision_payload(monkeypatch: Any) -> None:
+    module = _medical_module()
+    emitted: list[dict[str, Any]] = []
+    tools = _FakeMedicalTravelTools()
+    memory = {
+        "origin": "南开大学宿舍",
+        "preferred_hospital": "天津医科大学总医院",
+        "city": "天津",
+        "travel_preference": "优先地铁，少步行",
+        "medical_checklist": "身份证、医保卡、既往检查资料",
+        "reminder_offset_minutes": 30,
+    }
+    runner = module.MedicalTravelSopRunner(
+        weather_query=tools.weather_query,
+        route_query=tools.amap_mcp_tool,
+        reminder_writer=tools.write_reminder,
+        memory_reader=lambda _keys, _context=None: memory,
+    )
+    intent = module.parse_medical_travel_intent("明天上午我要去医院复诊，帮我查天气和路线，并设置提醒。")
+    monkeypatch.setattr(progress, "get_stream_writer", lambda: emitted.append)
+
+    result = asyncio.run(runner.run(intent=intent, device_id="device-1"))
+
+    assert result["medical_travel"]["intent"]["origin"] == "南开大学宿舍"
+    assert result["medical_travel"]["intent"]["destination"] == "天津医科大学总医院"
+    assert result["medical_travel"]["memory"]["memoryUsed"] is True
+    assert result["medical_travel"]["memory"]["memorySource"] == "user_memory"
+    assert result["medical_travel"]["memory"]["items"] == [
+        {"key": "origin", "value": "南开大学宿舍"},
+        {"key": "preferred_hospital", "value": "天津医科大学总医院"},
+        {"key": "city", "value": "天津"},
+        {"key": "travel_preference", "value": "优先地铁，少步行"},
+        {"key": "medical_checklist", "value": "身份证、医保卡、既往检查资料"},
+        {"key": "reminder_offset_minutes", "value": 30},
+    ]
+    assert result["medical_travel"]["decision"]["origin"] == "南开大学宿舍"
+    assert "优先地铁" in result["medical_travel"]["decision"]["routeChoiceReason"]
+    assert result["medical_travel"]["decision"]["checklist"] == [
+        "身份证",
+        "医保卡",
+        "既往检查资料",
+    ]
+    assert result["medical_travel"]["confirmation"]["status"] == "needs_confirmation"
+    assert result["medical_travel"]["reminder"]["created"] is False
+    assert [name for name, _args in tools.calls] == ["weather_query", "amap_mcp_tool"]
+
+    step_events = _progress_steps(emitted)
+    titles = [event["stepTitle"] for event in step_events if event["status"] in {"running", "waiting_confirmation"}]
+    assert titles == [
+        "识别就医需求",
+        "读取过往记忆",
+        "查询天气",
+        "规划出行路线",
+        "形成出行决策",
+        "等待确认",
+    ]
+    assert all(event["totalSteps"] == 7 for event in step_events)
+    assert step_events[1]["message"] == "已识别为：明天上午前往天津医科大学总医院复诊。"
+    assert any(event["toolName"] == "read_user_memory" for event in step_events)
+    assert any("已参考过往偏好" in event["message"] for event in step_events)
+
+
+def test_medical_travel_without_memory_uses_defaults() -> None:
+    module = _medical_module()
+    tools = _FakeMedicalTravelTools()
+    runner = module.MedicalTravelSopRunner(
+        weather_query=tools.weather_query,
+        route_query=tools.amap_mcp_tool,
+        reminder_writer=tools.write_reminder,
+        memory_reader=lambda _keys, _context=None: {},
+    )
+
+    result = asyncio.run(runner.run(intent=module.parse_medical_travel_intent("明天上午我要去医院复诊，帮我查天气和路线，并设置提醒。")))
+
+    payload = result["medical_travel"]
+    assert payload["memory"]["memoryUsed"] is False
+    assert payload["memory"]["memorySource"] == "none"
+    assert payload["intent"]["origin"] == "当前位置"
+    assert payload["intent"]["destination"]
+
+
+def test_medical_travel_middleware_returns_structured_payload(monkeypatch: Any) -> None:
     module = _medical_module()
     emitted: list[dict[str, Any]] = []
     tools = _FakeMedicalTravelTools()
     runner = module.MedicalTravelSopRunner(
         weather_query=tools.weather_query,
         route_query=tools.amap_mcp_tool,
-        confirmation_request=tools.needs_confirmation,
         reminder_writer=tools.write_reminder,
-        auto_confirm=True,
-        now=lambda: "2026-07-02",
+        memory_reader=lambda _keys, _context=None: {"travel_preference": "少换乘"},
     )
-    monkeypatch.setattr(progress, "get_stream_writer", lambda: emitted.append)
-
-    result = asyncio.run(runner.run())
-
-    assert result["task_type"] == "medical_travel_reminder"
-    assert result["weather_result"] == "明天多云，18-24℃，上午体感舒适。"
-    assert result["route_result"] == "高德地图路线：地铁 2 号线转 5 号线，预计 42 分钟。"
-    assert "建议提前" in result["travel_advice"]
-    assert result["confirmation"]["status"] == "confirmed"
-    assert result["reminder_created"] is True
-    assert result["reminder_result"]["eventId"] == "demo-event-1"
-    assert result["final_message"] == "已整理明日出行信息，并创建复诊提醒。"
-    assert [name for name, _args in tools.calls] == [
-        "weather_query",
-        "amap_mcp_tool",
-        "needs_confirmation",
-        "create_event / update_reminders",
-    ]
-    assert tools.calls[0][1]["city"] == "南京"
-    assert tools.calls[1][1]["destination"] == "江苏省人民医院"
-    assert "复诊" in tools.calls[2][1]["message"]
-    assert tools.calls[3][1]["title"] == "医院复诊出行提醒"
-
-    steps = _progress_steps(emitted)
-    assert [
-        (step["currentStep"], step["totalSteps"], step["message"], step["toolName"])
-        for step in steps
-    ] == [
-        (1, 5, "第 1/5 步：正在识别出行需求", "task_complexity"),
-        (2, 5, "第 2/5 步：正在查询天气", "weather_query"),
-        (3, 5, "第 3/5 步：正在规划路线", "amap_mcp_tool"),
-        (4, 5, "第 4/5 步：等待确认是否创建提醒", "needs_confirmation"),
-        (5, 5, "第 5/5 步：正在写入日程提醒", "create_event / update_reminders"),
-    ]
-
-
-def test_medical_travel_middleware_short_circuits_fixed_demo_request(
-    monkeypatch: Any,
-) -> None:
-    module = _medical_module()
-    emitted: list[dict[str, Any]] = []
-    runner = module.MedicalTravelSopRunner()
     middleware = module.MedicalTravelSopMiddleware(runner)
     request = type(
         "Request",
         (),
-        {"messages": [HumanMessage(content=module.FIXED_MEDICAL_TRAVEL_UTTERANCE)]},
+        {
+            "messages": [HumanMessage(content="明天陪老人去医院复诊，帮我查天气和路线，并设置提醒。")],
+            "runtime": type("Runtime", (), {"config": {"configurable": {"device_id": "device-1"}}})(),
+            "state": {},
+        },
     )()
     monkeypatch.setattr(progress, "get_stream_writer", lambda: emitted.append)
 
     async def fail_handler(_request: Any) -> ModelResponse[Any]:
-        raise AssertionError("fixed SOP request should not reach the model")
+        raise AssertionError("medical travel skill should not reach the model")
 
     response = asyncio.run(middleware.awrap_model_call(request, fail_handler))
 
-    assert isinstance(response, ModelResponse)
     assert isinstance(response.result[0], AIMessage)
-    assert response.result[0].content == "已整理明日出行信息，等待你确认是否创建复诊提醒。"
-    payload = json.loads(response.result[0].additional_kwargs["medical_travel_sop"])
-    assert payload["reminder_created"] is False
-    assert payload["confirmation"]["status"] == "needs_confirmation"
-    confirmation_id = payload["confirmation"]["confirmationId"]
-    assert confirmation_id
-    needs_confirmation_events = [
-        event for event in emitted if event.get("type") == "needs_confirmation"
-    ]
-    assert needs_confirmation_events[-1]["confirmationId"] == confirmation_id
-    assert needs_confirmation_events[-1]["toolName"] == "create_event"
-    assert needs_confirmation_events[-1]["dryRun"] is True
-    waiting_events = [
-        event
-        for event in _progress_steps(emitted)
-        if event.get("status") == "waiting_confirmation"
-    ]
-    assert waiting_events[-1]["confirmationId"] == confirmation_id
-    assert waiting_events[-1]["canCancel"] is True
-    assert waiting_events[-1]["canTakeOver"] is True
-    assert [event["toolName"] for event in _progress_steps(emitted)] == [
-        "task_complexity",
-        "weather_query",
-        "amap_mcp_tool",
-        "needs_confirmation",
-    ]
+    payload = response.result[0].additional_kwargs["medical_travel"]
+    assert payload["intent"]["forElderly"] is True
+    assert payload["memory"]["memoryUsed"] is True
+    assert payload["decision"]["reminderOffsetMinutes"] == 30
+    assert "身份证" in payload["decision"]["checklist"]
+    assert json.loads(response.result[0].additional_kwargs["medical_travel_sop"])["medical_travel"]["intent"]["forElderly"] is True
 
 
-def test_medical_travel_runner_adapters_call_real_tool_interfaces() -> None:
+def test_medical_travel_confirmation_confirm_creates_calendar_with_device_id() -> None:
     module = _medical_module()
+    confirmation_store.clear()
     calls: list[tuple[str, dict[str, Any]]] = []
 
     @tool("weather_query")
     async def weather_query(city: str | None = None) -> str:
         """Query weather."""
         calls.append(("weather_query", {"city": city}))
-        return "真实天气结果"
+        return "明天多云，18-24℃。"
 
     @tool("amap_mcp_tool")
     async def amap_mcp_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> str:
-        """Call AMap MCP."""
+        """Call AMap."""
         calls.append(("amap_mcp_tool", {"tool_name": tool_name, "arguments": arguments or {}}))
-        return "真实路线结果"
+        return "预计 42 分钟，地铁优先。"
 
     @tool("create_event")
     async def create_event(event: dict[str, Any], device_id: str | None = None) -> dict[str, Any]:
@@ -186,70 +211,36 @@ def test_medical_travel_runner_adapters_call_real_tool_interfaces() -> None:
         device_id: str | None = None,
     ) -> dict[str, Any]:
         """Update reminders."""
-        calls.append(
-            (
-                "update_reminders",
-                {"event_id": event_id, "reminders": reminders, "device_id": device_id},
-            )
-        )
+        calls.append(("update_reminders", {"event_id": event_id, "reminders": reminders, "device_id": device_id}))
         return {"ok": True}
 
     runner = module.build_medical_travel_sop_runner(
         external_tools=[weather_query, amap_mcp_tool],
         system_tools=[create_event, update_reminders],
     )
-
-    result = asyncio.run(runner.run(device_id="device-1"))
-
-    assert result["weather_result"] == "真实天气结果"
-    assert result["route_result"] == "真实路线结果"
-    assert result["reminder_result"]["skipped"] is True
-    assert result["confirmation"]["status"] == "needs_confirmation"
-    assert result["reminder_created"] is False
-    assert [name for name, _args in calls] == [
-        "weather_query",
-        "amap_mcp_tool",
-    ]
-    assert calls[0][1] == {"city": "南京"}
-    assert calls[1][1]["tool_name"] == "maps_direction_transit_integrated"
-
-
-def test_medical_travel_confirmation_confirm_completes_dry_run_without_writing() -> None:
-    module = _medical_module()
-    confirmation_store.clear()
-    calls: list[tuple[str, dict[str, Any]]] = []
-    tools = _FakeMedicalTravelTools()
-
-    async def write_reminder(arguments: dict[str, Any]) -> dict[str, Any]:
-        calls.append(("create_event / update_reminders", arguments))
-        return {"ok": True, "eventId": "event-1", "reminderId": "reminder-1"}
-
-    runner = module.MedicalTravelSopRunner(
-        weather_query=tools.weather_query,
-        route_query=tools.amap_mcp_tool,
-        reminder_writer=write_reminder,
+    result = asyncio.run(
+        runner.run(
+            intent=module.parse_medical_travel_intent("明天上午我要去医院复诊，帮我查天气和路线，并设置提醒。"),
+            device_id="device-1",
+        )
     )
+    confirmation_id = result["medical_travel"]["confirmation"]["confirmationId"]
 
-    result = asyncio.run(runner.run(device_id="device-1"))
-    confirmation_id = result["confirmation"]["confirmationId"]
-
-    assert calls == []
+    assert [name for name, _args in calls] == ["weather_query", "amap_mcp_tool"]
     response = TestClient(app).post(f"/mobile/confirmations/{confirmation_id}/confirm")
 
     assert response.status_code == 200
-    payload = response.json()
-    assert payload["status"] == "confirmed"
-    assert payload["dryRun"] is True
-    assert calls == []
-    assert [event["status"] for event in payload["events"]] == ["running", "completed"]
-    assert all(event["dryRun"] is True for event in payload["events"])
-    assert all(event["currentStep"] == 5 for event in payload["events"])
-    assert all(event["totalSteps"] == 5 for event in payload["events"])
-    assert payload["events"][0]["toolName"] == "create_event / update_reminders"
-    assert payload["events"][0]["requiresConfirmation"] is False
-    assert payload["events"][0]["message"] == "第 5/5 步：正在创建复诊提醒（演示模式）"
-    assert payload["events"][1]["message"] == "第 5/5 步：创建提醒 dry-run 已完成"
-
-    second = TestClient(app).post(f"/mobile/confirmations/{confirmation_id}/confirm")
-    assert second.status_code == 409
-    assert calls == []
+    assert [name for name, _args in calls] == [
+        "weather_query",
+        "amap_mcp_tool",
+        "create_event",
+        "update_reminders",
+    ]
+    assert calls[2][1]["device_id"] == "device-1"
+    assert calls[3][1]["device_id"] == "device-1"
+    assert calls[3][1]["reminders"] == [{"minutes": 30, "method": "alert"}]
+    events = response.json()["events"]
+    assert [event["status"] for event in events] == ["running", "completed"]
+    assert all(event["currentStep"] == 7 for event in events)
+    assert all(event["totalSteps"] == 7 for event in events)
+    assert events[-1]["message"] == "已创建就医出行提醒。"
