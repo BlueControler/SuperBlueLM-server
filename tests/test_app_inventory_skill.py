@@ -8,7 +8,7 @@ from langchain.agents.middleware.types import ModelResponse
 from langchain_core.messages import AIMessage, HumanMessage
 
 from mobile_agent import progress
-from mobile_agent.agent.app_inventory_skill import (
+from mobile_agent.agent.scenarios.app_inventory_skill import (
     AppInventoryIntent,
     AppInventoryQueryMiddleware,
     AppInventoryQueryRunner,

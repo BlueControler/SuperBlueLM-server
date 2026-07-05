@@ -8,8 +8,8 @@ from mobile_agent.agent.middleware import (
     SyncPhoneStateMiddleware,
 )
 from mobile_agent.agent.medical_travel_sop import MedicalTravelSopMiddleware
-from mobile_agent.agent.app_inventory_skill import AppInventoryQueryMiddleware
 from mobile_agent.agent.meeting_minutes_sop import MeetingMinutesSopMiddleware
+from mobile_agent.agent.scenarios.app_inventory_skill import AppInventoryQueryMiddleware
 
 
 class _Gateway:

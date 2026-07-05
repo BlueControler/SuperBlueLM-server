@@ -14,7 +14,6 @@ from ..tools.memory import create_memory_tools
 from ..tools.phone import create_phone_tools
 from ..tools.scenario_system import create_scenario_system_tools
 from ..tools.system import create_system_tools
-from .app_inventory_skill import AppInventoryQueryMiddleware
 from .middleware import (
     ModeToolAccessMiddleware,
     ResetAgentRunStateMiddleware,
@@ -31,6 +30,7 @@ from .medical_travel_sop import (
 from .meeting_minutes_sop import MeetingMinutesSopMiddleware
 from .risk_gate import HighRiskActionGateMiddleware
 from .scenario3_demo import Scenario3DemoMiddleware
+from .scenarios.app_inventory_skill import AppInventoryQueryMiddleware
 from .scenarios.open_app_skill import OpenAppSkillMiddleware
 from .trace_middleware import TraceMiddleware
 
