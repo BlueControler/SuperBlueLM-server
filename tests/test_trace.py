@@ -122,6 +122,24 @@ def test_unknown_tool_never_exposes_its_raw_name_or_arguments() -> None:
     assert spec["safe_args_summary"]({"token": "secret", "password": "raw"}) == "正在执行受控操作。"
 
 
+def test_medical_travel_tools_have_user_facing_titles() -> None:
+    expected = {
+        "medical_travel_intent": "识别就医需求",
+        "read_user_memory": "读取过往记忆",
+        "weather_query": "查询天气",
+        "amap_mcp_tool": "规划出行路线",
+        "medical_travel_decision": "形成出行决策",
+        "needs_confirmation": "等待确认",
+        "create_event / update_reminders": "创建日历提醒",
+        "finish": "完成",
+    }
+
+    assert {
+        tool_name: trace.display_spec_for(tool_name)["title"]
+        for tool_name in expected
+    } == expected
+
+
 def test_trace_writer_failure_never_breaks_agent_execution_or_size_limit() -> None:
     def broken_writer(_: dict[str, Any]) -> None:
         raise RuntimeError("custom stream unavailable")
