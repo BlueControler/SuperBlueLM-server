@@ -58,6 +58,34 @@ class _MissingCommandRunner(CommandRunner):
         }
 
 
+class _FakeScenarioFileTools:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def search_files(self, arguments: dict[str, Any]) -> str:
+        self.calls.append(("search_files", dict(arguments)))
+        return json.dumps(
+            {
+                "files": [
+                    {
+                        "path": "/sdcard/Documents/2026-07-02-项目会议记录.txt",
+                        "name": "2026-07-02-项目会议记录.txt",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+    async def read_text_file(self, arguments: dict[str, Any]) -> str:
+        self.calls.append(("read_text_file", dict(arguments)))
+        return json.dumps(
+            {
+                "text": "张三：今天完成手机侧会议记录读取。\n李四：明天补齐项目群发送配置。"
+            },
+            ensure_ascii=False,
+        )
+
+
 def _progress_steps(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [event for event in events if event.get("phase") == "meeting_minutes_sop"]
 
@@ -173,6 +201,41 @@ def test_meeting_minutes_sop_reads_today_docx_record(
     assert "张三" in result["minutes"]
     assert "李四" in result["minutes"]
     assert "今天完成会议纪要端到端验证" in result["minutes"]
+
+
+def test_meeting_minutes_sop_prefers_scenario_file_tools_with_device_id() -> None:
+    tools = _FakeScenarioFileTools()
+    runner = MeetingMinutesSopRunner(
+        now=lambda: "2026-07-02",
+        command_runner=_FakeCommandRunner(),
+        auto_confirm=True,
+        file_search=tools.search_files,
+        file_reader=tools.read_text_file,
+    )
+
+    result = asyncio.run(runner.run(device_id="device-1"))
+
+    assert result["selected_file"] == "/sdcard/Documents/2026-07-02-项目会议记录.txt"
+    assert result["candidates"] == ["/sdcard/Documents/2026-07-02-项目会议记录.txt"]
+    assert "手机侧会议记录读取" in result["minutes"]
+    assert tools.calls == [
+        (
+            "search_files",
+            {
+                "keywords": ["会议", "2026-07-02"],
+                "limit": 20,
+                "device_id": "device-1",
+            },
+        ),
+        (
+            "read_text_file",
+            {
+                "path": "/sdcard/Documents/2026-07-02-项目会议记录.txt",
+                "max_bytes": 262144,
+                "device_id": "device-1",
+            },
+        ),
+    ]
 
 
 def test_meeting_minutes_middleware_short_circuits_fixed_demo_request(

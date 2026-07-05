@@ -14,13 +14,14 @@ from xml.etree import ElementTree
 
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.tools import BaseTool
 
 from ..confirmations import ConfirmationTransaction, create_confirmation
 from ..json_types import JsonObject, to_json_value
 from ..progress import emit_needs_confirmation, emit_task_complexity, emit_task_progress
 from ..tools.external import DEFAULT_TIMEOUT_SECONDS, CommandRunner, SafeCommandRunner
 from .middleware import _message_content_to_text
-from .state import MobileAgentState
+from .state import MobileAgentState, device_id_from_mapping
 
 FIXED_MEETING_MINUTES_UTTERANCE = "帮我把今天的会议记录整理成纪要，提取待办事项，并发送到项目群。"
 MEETING_MINUTES_TASK_TYPE = "meeting_minutes_send"
@@ -41,6 +42,10 @@ MEETING_FILE_KEYWORDS = (
 
 class DateProvider(Protocol):
     def __call__(self) -> str: ...
+
+
+class AsyncToolCall(Protocol):
+    def __call__(self, arguments: JsonObject) -> Awaitable[Any]: ...
 
 
 def is_meeting_minutes_sop_request(text: str) -> bool:
@@ -67,8 +72,10 @@ class MeetingMinutesSopRunner:
     project_group: str = DEFAULT_PROJECT_GROUP
     sender: str = DEFAULT_SENDER
     auto_confirm: bool = False
+    file_search: AsyncToolCall | None = None
+    file_reader: AsyncToolCall | None = None
 
-    async def run(self) -> JsonObject:
+    async def run(self, device_id: str | None = None) -> JsonObject:
         today = self._today()
         completed_steps: list[JsonObject] = []
         emit_task_complexity(
@@ -84,7 +91,7 @@ class MeetingMinutesSopRunner:
             tool_name="search_files",
             completed_steps=completed_steps,
         )
-        candidates = await asyncio.to_thread(self._search_files_for_today, today)
+        candidates = await self._search_candidates(today, device_id)
         selected_file = candidates[0] if candidates else None
         completed_steps = _append_completed_step(
             completed_steps,
@@ -99,11 +106,7 @@ class MeetingMinutesSopRunner:
             tool_name="read_text_file",
             completed_steps=completed_steps,
         )
-        meeting_text = (
-            await asyncio.to_thread(read_text_file, selected_file)
-            if selected_file is not None
-            else ""
-        )
+        meeting_text = await self._read_meeting_text(selected_file, device_id)
         completed_steps = _append_completed_step(
             completed_steps,
             2,
@@ -141,8 +144,8 @@ class MeetingMinutesSopRunner:
             )
             return {
                 "task_type": MEETING_MINUTES_TASK_TYPE,
-                "selected_file": str(selected_file) if selected_file is not None else None,
-                "candidates": [str(candidate) for candidate in candidates],
+                "selected_file": _display_path(selected_file),
+                "candidates": [_display_path(candidate) for candidate in candidates],
                 "minutes": minutes,
                 "confirmation": {
                     "status": "needs_confirmation",
@@ -207,8 +210,8 @@ class MeetingMinutesSopRunner:
         )
         return {
             "task_type": MEETING_MINUTES_TASK_TYPE,
-            "selected_file": str(selected_file) if selected_file is not None else None,
-            "candidates": [str(candidate) for candidate in candidates],
+            "selected_file": _display_path(selected_file),
+            "candidates": [_display_path(candidate) for candidate in candidates],
             "minutes": minutes,
             "confirmation": confirmation,
             "send_result": send_result,
@@ -245,6 +248,40 @@ class MeetingMinutesSopRunner:
     def _search_files_for_today(self, today: str) -> list[Path]:
         return search_files(self._search_roots(), today)
 
+    async def _search_candidates(self, today: str, device_id: str | None) -> list[Path | str]:
+        if self.file_search is not None:
+            arguments: JsonObject = {
+                "keywords": ["会议", today],
+                "limit": 20,
+            }
+            roots = [str(root) for root in self._search_roots()] if self.search_roots else []
+            if roots:
+                arguments["roots"] = roots
+            if device_id:
+                arguments["device_id"] = device_id
+            result = await _call_tool(self.file_search, arguments)
+            candidates = _file_candidates_from_tool_result(result)
+            if candidates:
+                return candidates
+        return await asyncio.to_thread(self._search_files_for_today, today)
+
+    async def _read_meeting_text(self, selected_file: Path | str | None, device_id: str | None) -> str:
+        if selected_file is None:
+            return ""
+        if self.file_reader is not None:
+            arguments: JsonObject = {
+                "path": str(selected_file),
+                "max_bytes": MAX_MEETING_FILE_BYTES,
+            }
+            if device_id:
+                arguments["device_id"] = device_id
+            result = await _call_tool(self.file_reader, arguments)
+            text = _text_from_tool_result(result)
+            if text:
+                return text
+        path = selected_file if isinstance(selected_file, Path) else Path(selected_file)
+        return await asyncio.to_thread(read_text_file, path)
+
     def _search_roots(self) -> tuple[Path, ...]:
         if self.search_roots is not None:
             return tuple(Path(root) for root in self.search_roots)
@@ -276,7 +313,7 @@ class MeetingMinutesSopMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
     ) -> ModelResponse[Any]:
         if not _request_matches(request.messages):
             return handler(request)
-        result = asyncio.run(self.runner.run())
+        result = asyncio.run(self.runner.run(_request_device_id(request)))
         return _model_response(result)
 
     async def awrap_model_call(
@@ -286,8 +323,19 @@ class MeetingMinutesSopMiddleware(AgentMiddleware[MobileAgentState, None, Any]):
     ) -> ModelResponse[Any]:
         if not _request_matches(request.messages):
             return await handler(request)
-        result = await self.runner.run()
+        result = await self.runner.run(_request_device_id(request))
         return _model_response(result)
+
+
+def build_meeting_minutes_sop_runner(
+    *,
+    scenario_system_tools: Sequence[BaseTool],
+) -> MeetingMinutesSopRunner:
+    tools = _tools_by_name(scenario_system_tools)
+    return MeetingMinutesSopRunner(
+        file_search=_base_tool_adapter(tools.get("search_files")),
+        file_reader=_base_tool_adapter(tools.get("read_text_file")),
+    )
 
 
 def search_files(search_roots: Sequence[Path], today: str) -> list[Path]:
@@ -326,6 +374,88 @@ def read_text_file(path: Path | None) -> str:
         except UnicodeDecodeError:
             continue
     return raw.decode("utf-8", errors="replace")
+
+
+async def _call_tool(tool_call: AsyncToolCall, arguments: JsonObject) -> Any:
+    return await tool_call(arguments)
+
+
+def _base_tool_adapter(tool: BaseTool | None) -> AsyncToolCall | None:
+    if tool is None:
+        return None
+
+    async def call(arguments: JsonObject) -> Any:
+        return await tool.ainvoke(arguments)
+
+    return call
+
+
+def _tools_by_name(tools: Sequence[BaseTool]) -> dict[str, BaseTool]:
+    return {tool.name: tool for tool in tools}
+
+
+def _request_device_id(request: object) -> str | None:
+    state_device_id = device_id_from_mapping(getattr(request, "state", None))
+    if state_device_id is not None:
+        return state_device_id
+    runtime = getattr(request, "runtime", None)
+    config = getattr(runtime, "config", None)
+    if isinstance(config, dict):
+        return device_id_from_mapping(config.get("configurable")) or device_id_from_mapping(
+            config.get("metadata")
+        )
+    return None
+
+
+def _file_candidates_from_tool_result(result: Any) -> list[str]:
+    payload = _json_payload(result)
+    candidates: list[str] = []
+    for item in _candidate_items(payload):
+        if isinstance(item, str) and item.strip():
+            candidates.append(item.strip())
+        elif isinstance(item, dict):
+            path = item.get("path") or item.get("absolutePath") or item.get("uri")
+            if isinstance(path, str) and path.strip():
+                candidates.append(path.strip())
+    return list(dict.fromkeys(candidates))
+
+
+def _candidate_items(payload: Any) -> list[Any]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("files", "matches", "results", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        if isinstance(payload.get("path"), str):
+            return [payload]
+    return []
+
+
+def _text_from_tool_result(result: Any) -> str:
+    payload = _json_payload(result)
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("text", "content", "result", "data"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return ""
+
+
+def _json_payload(result: Any) -> Any:
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except ValueError:
+            return result
+    return result
+
+
+def _display_path(path: Path | str | None) -> str | None:
+    return str(path) if path is not None else None
 
 
 def _read_docx_text(path: Path) -> str:

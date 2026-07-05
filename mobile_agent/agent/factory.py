@@ -27,7 +27,11 @@ from .medical_travel_sop import (
     MedicalTravelSopRunner,
     build_medical_travel_sop_runner,
 )
-from .meeting_minutes_sop import MeetingMinutesSopMiddleware
+from .meeting_minutes_sop import (
+    MeetingMinutesSopMiddleware,
+    MeetingMinutesSopRunner,
+    build_meeting_minutes_sop_runner,
+)
 from .risk_gate import HighRiskActionGateMiddleware
 from .scenario3_demo import Scenario3DemoMiddleware
 from .scenarios.app_inventory_skill import AppInventoryQueryMiddleware
@@ -42,6 +46,7 @@ def build_middleware_stack(
     system_gateway: SystemToolGateway,
     phone_tool_names: set[str],
     device_scoped_tool_names: set[str],
+    meeting_minutes_runner: MeetingMinutesSopRunner | None = None,
     medical_travel_runner: MedicalTravelSopRunner | None = None,
 ) -> list[AgentMiddleware[AgentState[Any], None, Any]]:
     """Returns the security-sensitive middleware order used by the main agent."""
@@ -53,7 +58,7 @@ def build_middleware_stack(
             OpenAppSkillMiddleware(phone_gateway, system_gateway),
             AppInventoryQueryMiddleware(system_gateway),
             WeatherAdviceMiddleware(),
-            MeetingMinutesSopMiddleware(),
+            MeetingMinutesSopMiddleware(meeting_minutes_runner),
             Scenario3DemoMiddleware(),
             MedicalTravelSopMiddleware(medical_travel_runner),
             HighRiskActionGateMiddleware(),
@@ -83,6 +88,9 @@ def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway)
         system_gateway=system_gateway,
         phone_tool_names=phone_tool_names,
         device_scoped_tool_names=device_scoped_tool_names,
+        meeting_minutes_runner=build_meeting_minutes_sop_runner(
+            scenario_system_tools=scenario_system_tools,
+        ),
         medical_travel_runner=build_medical_travel_sop_runner(
             external_tools=external_tools,
             system_tools=system_tools,
