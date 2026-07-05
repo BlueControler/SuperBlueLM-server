@@ -60,8 +60,36 @@ def test_upstream_run_config_carries_the_client_owned_mobile_run_id() -> None:
     payload = json.loads(body)
     assert payload["config"]["configurable"] == {
         "device_id": "device-1",
+        "deviceId": "device-1",
         "mobile_run_id": "run-1",
         "thread_id": "thread-1",
+    }
+    assert payload["config"]["metadata"] == {
+        "device_id": "device-1",
+        "deviceId": "device-1",
+    }
+
+
+def test_upstream_run_config_carries_request_device_id() -> None:
+    body = _with_mobile_run_config(
+        b'{"input":{"messages":[]},"config":{"metadata":{"client":"android"}}}',
+        run_id="run-1",
+        thread_id="thread-1",
+        device_id="device-from-header",
+    )
+
+    payload = json.loads(body)
+
+    assert payload["config"]["configurable"] == {
+        "mobile_run_id": "run-1",
+        "thread_id": "thread-1",
+        "device_id": "device-from-header",
+        "deviceId": "device-from-header",
+    }
+    assert payload["config"]["metadata"] == {
+        "client": "android",
+        "device_id": "device-from-header",
+        "deviceId": "device-from-header",
     }
 
 

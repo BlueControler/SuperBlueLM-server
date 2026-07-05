@@ -234,7 +234,13 @@ async def safe_run_stream(request: Request) -> StreamingResponse | JSONResponse:
         upstream_url = f"{base_url}/threads/{thread_id}/runs/stream"
         run_id = _mobile_run_id(request)
         phone_action_registry.start_run(run_id, thread_id)
-        body = _with_mobile_run_config(await request.body(), run_id=run_id, thread_id=thread_id)
+        raw_body = await request.body()
+        body = _with_mobile_run_config(
+            raw_body,
+            run_id=run_id,
+            thread_id=thread_id,
+            device_id=_request_device_id(request, raw_body),
+        )
         headers = _forward_headers(request)
     except Exception:
         logger.warning(
@@ -456,7 +462,24 @@ def _mobile_run_id(request: Request) -> str:
     return f"run_{uuid4().hex}"
 
 
-def _with_mobile_run_config(raw: bytes, *, run_id: str, thread_id: str) -> bytes:
+def _request_device_id(request: Request, raw: bytes) -> str | None:
+    header_value = _normal_device_id(request.headers.get("x-device-id"))
+    if header_value is not None:
+        return header_value
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return _payload_device_id(payload)
+
+
+def _with_mobile_run_config(
+    raw: bytes,
+    *,
+    run_id: str,
+    thread_id: str,
+    device_id: str | None = None,
+) -> bytes:
     """Inject only server-recognised config; malformed bodies remain upstream errors."""
     try:
         payload = json.loads(raw)
@@ -468,8 +491,19 @@ def _with_mobile_run_config(raw: bytes, *, run_id: str, thread_id: str) -> bytes
     config = dict(config) if isinstance(config, Mapping) else {}
     configurable = config.get("configurable")
     configurable = dict(configurable) if isinstance(configurable, Mapping) else {}
+    selected_device_id = _normal_device_id(device_id) or _payload_device_id(payload)
+    if selected_device_id is not None:
+        configurable["device_id"] = selected_device_id
+        configurable["deviceId"] = selected_device_id
     configurable.update({"mobile_run_id": run_id, "thread_id": thread_id})
     config["configurable"] = configurable
+    metadata = config.get("metadata")
+    metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+    if selected_device_id is not None:
+        metadata["device_id"] = selected_device_id
+        metadata["deviceId"] = selected_device_id
+    if metadata:
+        config["metadata"] = metadata
     # deep_agent (create_deep_agent) 已内置 recursion_limit=9,999，
     # 不再用 MOBILE_AGENT_MAX_RECURSION 覆盖它。
     payload["config"] = config
@@ -480,6 +514,27 @@ def _with_mobile_run_config(raw: bytes, *, run_id: str, thread_id: str) -> bytes
     # thread. The client must receive a deterministic rejection instead.
     payload["multitask_strategy"] = "reject"
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _payload_device_id(payload: object) -> str | None:
+    if not isinstance(payload, Mapping):
+        return None
+    config = payload.get("config")
+    if not isinstance(config, Mapping):
+        return None
+    configurable = config.get("configurable")
+    if not isinstance(configurable, Mapping):
+        return None
+    return _normal_device_id(configurable.get("device_id")) or _normal_device_id(
+        configurable.get("deviceId")
+    )
+
+
+def _normal_device_id(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
 
 
 def _positive_float_env(name: str, default: float) -> float:
