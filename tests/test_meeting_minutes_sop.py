@@ -91,6 +91,8 @@ def test_fixed_utterance_is_recognized() -> None:
     assert is_meeting_minutes_sop_request(
         "帮我把今天的会议记录整理成纪要，提取待办事项，并发送到项目群"
     )
+    assert is_meeting_minutes_sop_request("帮我整理今天的会议总结，提取待办事项")
+    assert is_meeting_minutes_sop_request("把今天会议纪要总结一下，整理后续行动项")
     assert not is_meeting_minutes_sop_request("帮我总结一下这段会议记录")
 
 
@@ -204,6 +206,10 @@ def test_meeting_minutes_middleware_short_circuits_fixed_demo_request(
     assert isinstance(response, ModelResponse)
     assert isinstance(response.result[0], AIMessage)
     assert response.result[0].content == "会议纪要已整理完成，并已发送到项目群。"
+    structured_payload = response.result[0].additional_kwargs["meeting_minutes"]
+    assert structured_payload["taskType"] == "meeting_minutes_send"
+    assert structured_payload["sent"] is True
+    assert structured_payload["confirmation"]["status"] == "confirmed"
     assert json.loads(response.result[0].additional_kwargs["meeting_minutes_sop"])[
         "sent"
     ] is True

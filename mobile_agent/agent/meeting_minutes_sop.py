@@ -45,7 +45,18 @@ class DateProvider(Protocol):
 
 def is_meeting_minutes_sop_request(text: str) -> bool:
     normalized = _normalize_utterance(text)
-    return normalized == _normalize_utterance(FIXED_MEETING_MINUTES_UTTERANCE)
+    if normalized == _normalize_utterance(FIXED_MEETING_MINUTES_UTTERANCE):
+        return True
+    has_meeting_target = any(
+        marker in normalized
+        for marker in ("会议纪要", "会议总结", "会议记录", "会议")
+    )
+    has_summary_action = any(
+        marker in normalized
+        for marker in ("整理", "总结", "提取待办", "待办事项", "行动项", "发送到项目群")
+    )
+    has_demo_scope = any(marker in normalized for marker in ("今天", "会议纪要", "会议总结"))
+    return has_meeting_target and has_summary_action and has_demo_scope
 
 
 @dataclass(frozen=True)
@@ -417,11 +428,26 @@ def _model_response(result: JsonObject) -> ModelResponse[Any]:
             AIMessage(
                 content=str(result["final_message"]),
                 additional_kwargs={
-                    "meeting_minutes_sop": json.dumps(result, ensure_ascii=False)
+                    "meeting_minutes": _meeting_minutes_payload(result),
+                    "meeting_minutes_sop": json.dumps(result, ensure_ascii=False),
                 },
             )
         ]
     )
+
+
+def _meeting_minutes_payload(result: JsonObject) -> JsonObject:
+    return {
+        "taskType": result.get("task_type"),
+        "selectedFile": result.get("selected_file"),
+        "candidates": result.get("candidates", []),
+        "minutes": result.get("minutes"),
+        "confirmation": result.get("confirmation", {}),
+        "sendResult": result.get("send_result", {}),
+        "sent": result.get("sent", False),
+        "completedSteps": result.get("completed_steps", []),
+        "finalMessage": result.get("final_message"),
+    }
 
 
 def _normalize_utterance(text: str) -> str:
