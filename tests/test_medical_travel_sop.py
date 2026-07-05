@@ -176,6 +176,105 @@ def test_medical_travel_uses_location_tool_when_memory_has_no_origin() -> None:
     assert tools.calls[2][1]["origin"] == "天津市南开区学生公寓"
     assert result["medical_travel"]["intent"]["origin"] == "天津市南开区学生公寓"
     assert result["medical_travel"]["decision"]["origin"] == "天津市南开区学生公寓"
+    assert result["medical_travel"]["intent"]["originSource"] == "get_location"
+    assert result["medical_travel"]["intent"]["hospitalSource"] == "default_demo"
+
+
+def test_medical_travel_uses_preferred_hospital_source_from_memory() -> None:
+    module = _medical_module()
+    tools = _FakeMedicalTravelTools()
+    runner = module.MedicalTravelSopRunner(
+        weather_query=tools.weather_query,
+        route_query=tools.amap_mcp_tool,
+        reminder_writer=tools.write_reminder,
+        memory_reader=lambda _keys, _context=None: {
+            "preferred_hospital": "天津医科大学总医院",
+            "city": "天津",
+        },
+        location_query=tools.get_location,
+    )
+
+    result = asyncio.run(
+        runner.run(
+            intent=module.parse_medical_travel_intent("请按照就医出行场景，帮我规划明天上午去医院复诊的天气、路线和提醒。"),
+            device_id="device-1",
+        )
+    )
+
+    assert result["medical_travel"]["intent"]["destination"] == "天津医科大学总医院"
+    assert result["medical_travel"]["intent"]["hospitalSource"] == "user_memory"
+    assert result["medical_travel"]["intent"]["originSource"] == "get_location"
+
+
+def test_medical_travel_amap_adapter_calls_full_route_chain() -> None:
+    module = _medical_module()
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    @tool("weather_query")
+    async def weather_query(city: str | None = None) -> str:
+        """Query weather."""
+        calls.append(("weather_query", {"city": city}))
+        return "明天上午多云，18-24℃，适合出行。"
+
+    @tool("amap_mcp_tool")
+    async def amap_mcp_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Call AMap."""
+        args = arguments or {}
+        calls.append((tool_name, args))
+        if tool_name == "maps_text_search":
+            return {"ok": True, "pois": [{"name": "天津医科大学总医院", "address": "天津市和平区", "location": "117.19,39.12"}]}
+        if tool_name == "maps_geo":
+            return {"ok": True, "geocodes": [{"location": "117.19,39.12"}]}
+        if tool_name == "maps_regeocode":
+            return {"ok": True, "regeocode": {"formatted_address": "天津市南开区学生公寓"}}
+        if tool_name == "maps_direction_transit_integrated":
+            return {"ok": True, "route": {"transits": [{"duration": "2520", "walking_distance": "500"}]}, "summary": "公交/地铁约 42 分钟，步行 500 米。"}
+        if tool_name == "maps_direction_driving":
+            return {"ok": True, "route": {"paths": [{"duration": "1680", "distance": "11000"}]}, "summary": "打车约 28 分钟。"}
+        if tool_name == "maps_distance":
+            return {"ok": True, "results": [{"distance": "11000", "duration": "1800"}]}
+        raise AssertionError(tool_name)
+
+    @tool("create_event")
+    async def create_event(event: dict[str, Any], device_id: str | None = None) -> dict[str, Any]:
+        """Create event."""
+        return {"ok": True, "eventId": 123}
+
+    @tool("update_reminders")
+    async def update_reminders(
+        event_id: int,
+        reminders: list[dict[str, Any]],
+        device_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Update reminders."""
+        return {"ok": True}
+
+    runner = module.build_medical_travel_sop_runner(
+        external_tools=[weather_query, amap_mcp_tool],
+        system_tools=[create_event, update_reminders],
+    )
+
+    result = asyncio.run(
+        runner.run(
+            intent=module.parse_medical_travel_intent("明天上午去天津医科大学总医院复诊，帮我查天气路线并设置提醒。"),
+            memory_context={"medical_travel_memory": {"origin": "天津市南开区学生公寓", "city": "天津"}},
+        )
+    )
+
+    assert [name for name, _args in calls] == [
+        "weather_query",
+        "maps_text_search",
+        "maps_geo",
+        "maps_regeocode",
+        "maps_direction_transit_integrated",
+        "maps_direction_driving",
+        "maps_distance",
+    ]
+    route = result["medical_travel"]["route"]
+    assert "recommended" in route
+    assert "backup" in route
+    assert "公交/地铁约 42 分钟" in route["summary"]
+    assert "打车约 28 分钟" in route["backup"]["summary"]
 
 
 def test_medical_travel_middleware_returns_structured_payload(monkeypatch: Any) -> None:
@@ -259,21 +358,60 @@ def test_medical_travel_confirmation_confirm_creates_calendar_with_device_id() -
     )
     confirmation_id = result["medical_travel"]["confirmation"]["confirmationId"]
 
-    assert [name for name, _args in calls] == ["weather_query", "amap_mcp_tool"]
-    response = TestClient(app).post(f"/mobile/confirmations/{confirmation_id}/confirm")
-
-    assert response.status_code == 200
     assert [name for name, _args in calls] == [
         "weather_query",
         "amap_mcp_tool",
-        "create_event",
-        "update_reminders",
+        "amap_mcp_tool",
+        "amap_mcp_tool",
+        "amap_mcp_tool",
+        "amap_mcp_tool",
+        "amap_mcp_tool",
     ]
-    assert calls[2][1]["device_id"] == "device-1"
-    assert calls[3][1]["device_id"] == "device-1"
-    assert calls[3][1]["reminders"] == [{"minutes": 30, "method": "alert"}]
+    response = TestClient(app).post(f"/mobile/confirmations/{confirmation_id}/confirm")
+
+    assert response.status_code == 200
+    assert [name for name, _args in calls][-2:] == ["create_event", "update_reminders"]
+    assert calls[-2][1]["device_id"] == "device-1"
+    assert calls[-1][1]["device_id"] == "device-1"
+    assert calls[-1][1]["reminders"] == [{"minutes": 30, "method": "alert"}]
     events = response.json()["events"]
-    assert [event["status"] for event in events] == ["running", "completed"]
-    assert all(event["currentStep"] == 7 for event in events)
-    assert all(event["totalSteps"] == 7 for event in events)
-    assert events[-1]["message"] == "已创建就医出行提醒。"
+    progress_events = [event for event in events if event["type"] == "task_progress"]
+    assert [event["status"] for event in progress_events] == ["running", "completed"]
+    assert all(event["currentStep"] == 7 for event in progress_events)
+    assert all(event["totalSteps"] == 7 for event in progress_events)
+    assert progress_events[-1]["message"] == "已创建就医出行提醒。"
+    assert progress_events[1]["result"]["eventId"] == 123
+    assert response.json()["events"][2]["type"] == "task_result"
+    assert response.json()["events"][2]["status"] == "completed"
+    assert "已完成就医出行准备" in response.json()["events"][2]["finalMessage"]
+
+
+def test_medical_travel_confirmation_reports_reminder_failure() -> None:
+    module = _medical_module()
+    confirmation_store.clear()
+
+    async def failing_writer(_arguments: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": False, "message": "日历权限未开启"}
+
+    runner = module.MedicalTravelSopRunner(
+        weather_query=lambda _args: "明天多云。",
+        route_query=lambda _args: "推荐地铁，预计 42 分钟。",
+        reminder_writer=failing_writer,
+        memory_reader=lambda _keys, _context=None: {"origin": "当前位置"},
+    )
+    result = asyncio.run(
+        runner.run(
+            intent=module.parse_medical_travel_intent("明天上午我要去医院复诊，帮我查天气和路线，并设置提醒。"),
+            device_id="device-1",
+        )
+    )
+    confirmation_id = result["medical_travel"]["confirmation"]["confirmationId"]
+
+    response = TestClient(app).post(f"/mobile/confirmations/{confirmation_id}/confirm")
+
+    assert response.status_code == 200
+    events = response.json()["events"]
+    assert [event["status"] for event in events if event["type"] == "task_progress"] == ["running", "failed"]
+    result_event = [event for event in events if event["type"] == "task_result"][0]
+    assert result_event["status"] == "failed"
+    assert "日历权限未开启" in result_event["finalMessage"]

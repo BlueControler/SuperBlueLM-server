@@ -95,6 +95,8 @@ class MedicalTravelIntent:
     needs_route: bool
     needs_reminder: bool
     for_elderly: bool
+    origin_source: str | None = None
+    hospital_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +149,8 @@ def parse_medical_travel_intent(text: str) -> MedicalTravelIntent:
         needs_route=any(marker in normalized for marker in ("路线", "导航", "出行", "规划", "出发")),
         needs_reminder=any(marker in normalized for marker in ("提醒", "日历")),
         for_elderly=any(marker in normalized for marker in ("老人", "父母", "家人", "陪老人")),
+        origin_source=None,
+        hospital_source="user_input" if destination != "医院" else None,
     )
 
 
@@ -279,7 +283,8 @@ class MedicalTravelSopRunner:
                 "purpose": enriched_intent.purpose,
             },
         )
-        route_summary = _summary_text(route_result, DEFAULT_ROUTE_RESULT)
+        route_payload = _route_payload(route_result, DEFAULT_ROUTE_RESULT)
+        route_summary = str(route_payload["summary"])
         route_duration = _extract_duration(route_summary)
         route_advice = _route_advice(route_summary, memory)
         completed_steps = _append_completed_step(completed_steps, 4, "规划出行路线", "amap_mcp_tool")
@@ -317,6 +322,7 @@ class MedicalTravelSopRunner:
             memory=memory,
             weather_summary=weather_summary,
             route_summary=route_summary,
+            route_payload=route_payload,
             route_duration=route_duration,
             route_advice=route_advice,
             decision=decision,
@@ -425,8 +431,12 @@ class MedicalTravelSopRunner:
             result = await _call_tool(self.location_query, arguments)
             origin = _location_origin(result)
             if origin:
-                return _copy_intent_with_origin(intent, origin)
-        return _copy_intent_with_origin(intent, intent.origin or DEFAULT_ROUTE_ORIGIN)
+                return _copy_intent_with_origin(intent, origin, origin_source="get_location")
+        return _copy_intent_with_origin(
+            intent,
+            intent.origin or DEFAULT_ROUTE_ORIGIN,
+            origin_source=intent.origin_source or "default_demo",
+        )
 
     def _emit_step(
         self,
@@ -599,6 +609,7 @@ def _medical_travel_payload(
     memory: MedicalMemory,
     weather_summary: str,
     route_summary: str,
+    route_payload: JsonObject,
     route_duration: str,
     route_advice: str,
     decision: MedicalDecision,
@@ -611,7 +622,9 @@ def _medical_travel_payload(
             "timeText": intent.time_text,
             "city": intent.city or DEFAULT_CITY,
             "origin": decision.origin,
+            "originSource": intent.origin_source or "default_demo",
             "destination": intent.destination,
+            "hospitalSource": intent.hospital_source or "default_demo",
             "purpose": intent.purpose,
             "reminderOffsetMinutes": decision.reminder_offset_minutes,
             "forElderly": intent.for_elderly,
@@ -634,6 +647,11 @@ def _medical_travel_payload(
             "summary": route_summary,
             "duration": route_duration,
             "transitType": route_advice,
+            "recommended": route_payload.get("recommended"),
+            "backup": route_payload.get("backup"),
+            "distance": route_payload.get("distance"),
+            "hospital": route_payload.get("hospital"),
+            "originAddress": route_payload.get("originAddress"),
             "demo": False,
         },
         "decision": {
@@ -670,16 +688,35 @@ def _result(payload: JsonObject, final_message: str) -> JsonObject:
 
 def _apply_memory_to_intent(intent: MedicalTravelIntent, memory: MedicalMemory) -> MedicalTravelIntent:
     values = memory.values
-    origin = _memory_origin(values) or intent.origin or os.getenv("ECHO_MEDICAL_ROUTE_ORIGIN")
+    memory_origin = _memory_origin(values)
+    env_origin = os.getenv("ECHO_MEDICAL_ROUTE_ORIGIN")
+    origin = memory_origin or intent.origin or env_origin
+    preferred_hospital = values.get("preferred_hospital")
+    env_destination = os.getenv("ECHO_MEDICAL_ROUTE_DESTINATION")
     destination = (
         intent.destination
         if intent.destination != "医院"
         else str(
-            values.get("preferred_hospital")
-            or os.getenv("ECHO_MEDICAL_ROUTE_DESTINATION")
+            preferred_hospital
+            or env_destination
             or DEFAULT_ROUTE_DESTINATION
         )
     )
+    hospital_source = intent.hospital_source
+    if intent.destination == "医院":
+        if preferred_hospital:
+            hospital_source = "user_memory"
+        elif env_destination:
+            hospital_source = "env"
+        else:
+            hospital_source = "default_demo"
+    origin_source = intent.origin_source
+    if memory_origin:
+        origin_source = "user_memory"
+    elif intent.origin and intent.origin != DEFAULT_ROUTE_ORIGIN:
+        origin_source = "user_input"
+    elif env_origin:
+        origin_source = "env"
     city = intent.city or _optional_str(values.get("city")) or os.getenv("DEFAULT_AMAP_CITY_NAME") or DEFAULT_CITY
     reminder_offset = _int_value(values.get("reminder_offset_minutes")) or intent.reminder_offset_minutes
     return MedicalTravelIntent(
@@ -695,6 +732,8 @@ def _apply_memory_to_intent(intent: MedicalTravelIntent, memory: MedicalMemory) 
         needs_route=intent.needs_route,
         needs_reminder=intent.needs_reminder,
         for_elderly=intent.for_elderly,
+        origin_source=origin_source,
+        hospital_source=hospital_source,
     )
 
 
@@ -739,10 +778,12 @@ def _create_medical_travel_confirmation(
             f"目的：{payload['intent']['purpose']}",
             f"医院：{payload['intent']['destination']}",
             f"时间：{payload['intent']['dateText']}{payload['intent'].get('timeText') or ''}",
+            f"建议出发时间：{payload['decision']['departureAdvice']}",
             f"天气：{payload['weather']['summary']}",
-            f"路线：{payload['route']['summary']}",
-            f"建议：{payload['decision']['departureAdvice']}",
-            f"提醒：提前 {payload['decision']['reminderOffsetMinutes']} 分钟",
+            f"推荐路线：{payload['route']['summary']}",
+            f"提醒时间：提前 {payload['decision']['reminderOffsetMinutes']} 分钟",
+            f"日历标题：{payload['intent']['destination']}{payload['intent']['purpose']}出行提醒",
+            f"备注预览：{_medical_notes(payload)}",
         ]
     )
     return create_confirmation(
@@ -780,7 +821,10 @@ def _medical_travel_confirm_handler(
             confirmation_id=transaction.confirmation_id,
         )
         reminder_result = await _call_tool(reminder_writer, _reminder_arguments(payload, device_id))
+        reminder_payload = _reminder_payload(reminder_result)
         if _tool_result_ok(reminder_result):
+            completed_payload = dict(payload)
+            completed_payload["reminder"] = reminder_payload
             completed = _confirmation_task_progress_event(
                 transaction,
                 status="completed",
@@ -788,7 +832,12 @@ def _medical_travel_confirm_handler(
                 message="已创建就医出行提醒。",
                 tool_name="finish",
                 confirmation_id=None,
-                result=_reminder_payload(reminder_result),
+                result=reminder_payload,
+            )
+            result_event = _medical_travel_task_result_event(
+                status="completed",
+                payload=cast(JsonObject, completed_payload),
+                reminder_payload=reminder_payload,
             )
         else:
             completed = _confirmation_task_progress_event(
@@ -798,11 +847,39 @@ def _medical_travel_confirm_handler(
                 message=f"创建就医出行提醒失败：{_safe_error_text(reminder_result)}",
                 tool_name="create_event / update_reminders",
                 confirmation_id=None,
-                result=_reminder_payload(reminder_result),
+                result=reminder_payload,
             )
-        return [running, completed]
+            failed_payload = dict(payload)
+            failed_payload["reminder"] = reminder_payload
+            result_event = _medical_travel_task_result_event(
+                status="failed",
+                payload=cast(JsonObject, failed_payload),
+                reminder_payload=reminder_payload,
+                error=_safe_error_text(reminder_result),
+            )
+        return [running, completed, result_event]
 
     return handle
+
+
+def _medical_travel_task_result_event(
+    *,
+    status: str,
+    payload: JsonObject,
+    reminder_payload: JsonObject,
+    error: str | None = None,
+) -> JsonObject:
+    return {
+        "type": "task_result",
+        "taskType": MEDICAL_TRAVEL_TASK_TYPE,
+        "status": status,
+        "eventId": reminder_payload.get("eventId"),
+        "reminder": reminder_payload,
+        "finalMessage": _final_message(payload)
+        if status == "completed"
+        else _failed_final_message(payload, error or "创建提醒失败，请检查日历权限后重试。"),
+        "resultCard": payload,
+    }
 
 
 def _confirmation_task_progress_event(
@@ -886,19 +963,78 @@ def _route_tool_adapter(tool: BaseTool | None) -> AsyncToolCall:
         return _demo_route_query
 
     async def call(arguments: JsonObject) -> Any:
-        return await tool.ainvoke(
-            {
-                "tool_name": "maps_direction_transit_integrated",
-                "arguments": {
-                    "origin": arguments.get("origin") or DEFAULT_ROUTE_ORIGIN,
-                    "destination": arguments.get("destination") or DEFAULT_ROUTE_DESTINATION,
-                    "city": arguments.get("city") or DEFAULT_CITY,
-                    "cityd": arguments.get("city") or DEFAULT_CITY,
-                },
-            }
+        origin = str(arguments.get("origin") or DEFAULT_ROUTE_ORIGIN)
+        destination = str(arguments.get("destination") or DEFAULT_ROUTE_DESTINATION)
+        city = str(arguments.get("city") or DEFAULT_CITY)
+        hospital = await _call_amap(
+            tool,
+            "maps_text_search",
+            {"keywords": destination, "city": city},
         )
+        geo = await _call_amap(
+            tool,
+            "maps_geo",
+            {"address": destination, "city": city},
+        )
+        origin_address = await _call_amap(
+            tool,
+            "maps_regeocode",
+            {"location": origin},
+        )
+        transit = await _call_amap(
+            tool,
+            "maps_direction_transit_integrated",
+            {
+                "origin": origin,
+                "destination": destination,
+                "city": city,
+                "cityd": city,
+            },
+        )
+        driving = await _call_amap(
+            tool,
+            "maps_direction_driving",
+            {
+                "origin": origin,
+                "destination": destination,
+                "city": city,
+            },
+        )
+        distance = await _call_amap(
+            tool,
+            "maps_distance",
+            {
+                "origins": origin,
+                "destination": destination,
+                "type": "1",
+            },
+        )
+        transit_summary = _summary_text(transit, DEFAULT_ROUTE_RESULT)
+        driving_summary = _summary_text(driving, "打车/驾车方案暂未返回，建议作为备选并提前叫车。")
+        return {
+            "ok": True,
+            "summary": f"推荐路线：{transit_summary} 备选路线：{driving_summary}",
+            "hospital": _json_payload(hospital),
+            "geo": _json_payload(geo),
+            "originAddress": _json_payload(origin_address),
+            "recommended": {
+                "mode": "公交/地铁",
+                "summary": transit_summary,
+                "raw": _json_payload(transit),
+            },
+            "backup": {
+                "mode": "打车/驾车",
+                "summary": driving_summary,
+                "raw": _json_payload(driving),
+            },
+            "distance": _json_payload(distance),
+        }
 
     return call
+
+
+async def _call_amap(tool: BaseTool, tool_name: str, arguments: JsonObject) -> Any:
+    return await tool.ainvoke({"tool_name": tool_name, "arguments": arguments})
 
 
 def _location_tool_adapter(tool: BaseTool | None) -> AsyncToolCall | None:
@@ -950,11 +1086,20 @@ def _reminder_tool_adapter(
         if isinstance(device_id, str) and device_id:
             reminder_args["device_id"] = device_id
         reminder_result = await update_reminders_tool.ainvoke(reminder_args)
+        reminder_payload = _json_payload(reminder_result)
+        if reminder_payload.get("ok") is False or reminder_payload.get("error"):
+            return {
+                "ok": False,
+                "eventId": event_id,
+                "create_event": create_payload,
+                "update_reminders": reminder_payload,
+                "message": _safe_error_text(reminder_payload),
+            }
         return {
             "ok": True,
             "eventId": event_id,
             "create_event": create_payload,
-            "update_reminders": _json_payload(reminder_result),
+            "update_reminders": reminder_payload,
         }
 
     return call
@@ -990,6 +1135,7 @@ async def _demo_reminder_writer(arguments: JsonObject) -> JsonObject:
 def _reminder_arguments(payload: JsonObject, device_id: str | None) -> JsonObject:
     intent = cast(Mapping[str, Any], payload["intent"])
     decision = cast(Mapping[str, Any], payload["decision"])
+    checklist = "、".join(str(item) for item in cast(Sequence[Any], decision.get("checklist") or []))
     args: JsonObject = {
         "title": f"{intent['destination']}{intent['purpose']}出行提醒",
         "time": f"{intent['dateText']}{intent.get('timeText') or ''}",
@@ -998,6 +1144,8 @@ def _reminder_arguments(payload: JsonObject, device_id: str | None) -> JsonObjec
         "weather": str(cast(Mapping[str, Any], payload["weather"])["summary"]),
         "route": str(cast(Mapping[str, Any], payload["route"])["summary"]),
         "advice": str(decision["departureAdvice"]),
+        "checklist": checklist,
+        "notes": _medical_notes(payload),
         "reminder_offset_minutes": int(decision["reminderOffsetMinutes"]),
     }
     if device_id:
@@ -1021,7 +1169,7 @@ def _calendar_event(arguments: JsonObject) -> JsonObject:
     end = start + 60 * 60 * 1000
     description = "\n".join(
         str(arguments.get(key) or "")
-        for key in ("weather", "route", "advice")
+        for key in ("weather", "route", "advice", "checklist", "notes")
         if arguments.get(key)
     )
     return {
@@ -1085,6 +1233,20 @@ def _summary_text(result: Any, fallback: str) -> str:
     return fallback
 
 
+def _route_payload(result: Any, fallback: str) -> JsonObject:
+    if isinstance(result, Mapping):
+        payload = cast(JsonObject, to_json_value(result))
+        summary = _summary_text(payload, fallback)
+        payload["summary"] = summary
+        return payload
+    summary = _summary_text(result, fallback)
+    return {
+        "summary": summary,
+        "recommended": {"mode": "公交/地铁", "summary": summary},
+        "backup": {"mode": "打车/驾车", "summary": "可作为备选，建议根据天气和体力决定。"},
+    }
+
+
 def _extract_duration(route_summary: str) -> str:
     match = re.search(r"预计\s*(?P<duration>[^，。；;\s]+(?:\s*分钟|\s*小时)?)", route_summary)
     if match:
@@ -1131,7 +1293,12 @@ def _memory_origin(values: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _copy_intent_with_origin(intent: MedicalTravelIntent, origin: str) -> MedicalTravelIntent:
+def _copy_intent_with_origin(
+    intent: MedicalTravelIntent,
+    origin: str,
+    *,
+    origin_source: str | None = None,
+) -> MedicalTravelIntent:
     return MedicalTravelIntent(
         raw_text=intent.raw_text,
         date_text=intent.date_text,
@@ -1145,6 +1312,8 @@ def _copy_intent_with_origin(intent: MedicalTravelIntent, origin: str) -> Medica
         needs_route=intent.needs_route,
         needs_reminder=intent.needs_reminder,
         for_elderly=intent.for_elderly,
+        origin_source=origin_source or intent.origin_source,
+        hospital_source=intent.hospital_source,
     )
 
 
@@ -1237,13 +1406,70 @@ def _auto_confirm_enabled(auto_confirm: bool) -> bool:
 def _final_message(payload: JsonObject) -> str:
     intent = cast(Mapping[str, Any], payload["intent"])
     decision = cast(Mapping[str, Any], payload["decision"])
+    route = cast(Mapping[str, Any], payload["route"])
+    reminder = cast(Mapping[str, Any], payload["reminder"])
+    checklist = "、".join(str(item) for item in cast(Sequence[Any], decision.get("checklist") or []))
+    backup = route.get("backup")
+    backup_summary = (
+        str(cast(Mapping[str, Any], backup).get("summary"))
+        if isinstance(backup, Mapping)
+        else "打车/驾车作为备选。"
+    )
+    event_id = reminder.get("eventId") or "已写入系统日历"
     return (
         f"{FINAL_MESSAGE}\n\n"
+        f"目的：{intent['dateText']}{intent.get('timeText') or ''}{intent['purpose']}\n"
+        f"出发地：{intent['origin']}（来源：{_source_label(intent.get('originSource'))}）\n"
+        f"医院：{intent['destination']}（来源：{_source_label(intent.get('hospitalSource'))}）\n"
         f"天气：{cast(Mapping[str, Any], payload['weather'])['summary']}\n"
-        f"路线：{cast(Mapping[str, Any], payload['route'])['summary']}\n"
-        f"建议：{decision['departureAdvice']}\n"
-        f"提醒：已创建 {intent['dateText']}{intent.get('timeText') or ''} 的就医出行提醒，"
-        f"并提前 {decision['reminderOffsetMinutes']} 分钟提醒。"
+        f"推荐路线：{route['summary']}\n"
+        f"备选路线：{backup_summary}\n"
+        f"建议出发：{decision['departureAdvice']}，到院前预留 20 分钟缓冲。\n"
+        f"携带清单：{checklist}\n"
+        f"复诊提醒：少步行、少换乘，提前到院，避免赶路；不包含诊断或用药建议。\n\n"
+        f"已创建提醒：提前 {decision['reminderOffsetMinutes']} 分钟提醒\n"
+        f"日历事件：{intent['destination']}{intent['purpose']}出行提醒\n"
+        f"事件 ID：{event_id}"
+    )
+
+
+def _failed_final_message(payload: JsonObject, error: str) -> str:
+    return f"{_final_message_without_reminder(payload)}\n\n提醒创建失败：{error}"
+
+
+def _final_message_without_reminder(payload: JsonObject) -> str:
+    intent = cast(Mapping[str, Any], payload["intent"])
+    decision = cast(Mapping[str, Any], payload["decision"])
+    route = cast(Mapping[str, Any], payload["route"])
+    checklist = "、".join(str(item) for item in cast(Sequence[Any], decision.get("checklist") or []))
+    return (
+        f"{FINAL_MESSAGE}\n\n"
+        f"目的：{intent['dateText']}{intent.get('timeText') or ''}{intent['purpose']}\n"
+        f"出发地：{intent['origin']}（来源：{_source_label(intent.get('originSource'))}）\n"
+        f"医院：{intent['destination']}（来源：{_source_label(intent.get('hospitalSource'))}）\n"
+        f"天气：{cast(Mapping[str, Any], payload['weather'])['summary']}\n"
+        f"推荐路线：{route['summary']}\n"
+        f"建议出发：{decision['departureAdvice']}，到院前预留 20 分钟缓冲。\n"
+        f"携带清单：{checklist}\n"
+        f"复诊提醒：少步行、少换乘，提前到院，避免赶路；不包含诊断或用药建议。"
+    )
+
+
+def _source_label(value: Any) -> str:
+    return {
+        "get_location": "当前位置",
+        "user_memory": "用户记忆",
+        "user_input": "用户输入",
+        "env": "环境配置",
+        "default_demo": "默认演示值",
+    }.get(str(value or ""), "默认演示值")
+
+
+def _medical_notes(payload: JsonObject) -> str:
+    intent = cast(Mapping[str, Any], payload["intent"])
+    return (
+        f"{intent['dateText']}{intent.get('timeText') or ''}前往{intent['destination']}"
+        "，建议少步行、少换乘，提前到院，避免赶路。"
     )
 
 
