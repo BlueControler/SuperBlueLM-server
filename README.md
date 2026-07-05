@@ -6,17 +6,18 @@
 
 它通过 WebSocket 与手机侧工具通信，并在服务端把手机能力包装成工具（observe、tap、swipe、type、keyevent 等）。云端模式下，主 agent 直接规划、调用手机工具、读取工具结果、验收和纠错。
 
-当前代码已按单设备模型实现：
+当前代码支持默认单设备通道，也支持按设备 ID 区分多台设备：
 
-- 手机操作 WebSocket 路径固定为 `/adb`
-- 系统工具 WebSocket 路径固定为 `/system`
-- 同一时刻只允许 1 台设备连接
+- 手机操作 WebSocket 路径为 `/adb` 或 `/adb/{device_id}`
+- 系统工具 WebSocket 路径为 `/system` 或 `/system/{device_id}`
+- 多台设备或多个系统工具客户端同时连接时，Agent run 必须携带 `device_id`
+- 移动端 SSE 入口会从 `X-Device-Id` 或 run config 中注入 `device_id`
 - Agent 每轮可基于最新截图和 UI 树决策
 
 ## 核心流程
 
-1. 手机操作客户端连接 `/adb`，首条消息发送 `connect`。
-2. 系统工具客户端连接 `/system`，提供应用列表、日程、提醒、定位等 API。
+1. 手机操作客户端连接 `/adb/{device_id}`（或默认 `/adb`），首条消息发送 `connect`。
+2. 系统工具客户端连接 `/system/{device_id}`（或默认 `/system`），提供应用列表、日程、提醒、定位等 API。
 3. 主 agent 直接调用手机工具、系统工具和外部业务工具。
 4. 手机端或系统工具端返回结果，服务端更新状态并继续下一步。
 
