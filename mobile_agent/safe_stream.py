@@ -523,11 +523,20 @@ def _payload_device_id(payload: object) -> str | None:
     if not isinstance(config, Mapping):
         return None
     configurable = config.get("configurable")
-    if not isinstance(configurable, Mapping):
-        return None
-    return _normal_device_id(configurable.get("device_id")) or _normal_device_id(
-        configurable.get("deviceId")
+    metadata = config.get("metadata")
+    configurable_id = (
+        _normal_device_id(configurable.get("device_id"))
+        or _normal_device_id(configurable.get("deviceId"))
+        if isinstance(configurable, Mapping)
+        else None
     )
+    metadata_id = (
+        _normal_device_id(metadata.get("device_id"))
+        or _normal_device_id(metadata.get("deviceId"))
+        if isinstance(metadata, Mapping)
+        else None
+    )
+    return configurable_id or metadata_id
 
 
 def _normal_device_id(value: object) -> str | None:

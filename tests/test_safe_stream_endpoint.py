@@ -93,6 +93,21 @@ def test_upstream_run_config_carries_request_device_id() -> None:
     }
 
 
+def test_upstream_run_config_reads_device_id_from_metadata() -> None:
+    body = _with_mobile_run_config(
+        b'{"input":{"messages":[]},"config":{"metadata":{"deviceId":"device-from-metadata"}}}',
+        run_id="run-1",
+        thread_id="thread-1",
+    )
+
+    payload = json.loads(body)
+
+    assert payload["config"]["configurable"]["device_id"] == "device-from-metadata"
+    assert payload["config"]["configurable"]["deviceId"] == "device-from-metadata"
+    assert payload["config"]["metadata"]["device_id"] == "device-from-metadata"
+    assert payload["config"]["metadata"]["deviceId"] == "device-from-metadata"
+
+
 def test_safe_stream_keeps_langgraph_running_when_its_sse_client_disconnects() -> None:
     body = _with_mobile_run_config(
         b'{"input":{"messages":[]},"on_disconnect":"cancel"}',

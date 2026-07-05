@@ -8,6 +8,7 @@ from mobile_agent.agent.middleware import (
     SyncPhoneStateMiddleware,
 )
 from mobile_agent.agent.medical_travel_sop import MedicalTravelSopMiddleware
+from mobile_agent.agent.app_inventory_skill import AppInventoryQueryMiddleware
 from mobile_agent.agent.meeting_minutes_sop import MeetingMinutesSopMiddleware
 
 
@@ -42,6 +43,10 @@ def test_factory_wires_main_agent_to_raw_phone_tools(
     assert "execute_phone_todo" not in {tool.name for tool in captured["tools"]}
     assert any(
         item.__class__.__name__ == "ResetAgentRunStateMiddleware"
+        for item in captured["middleware"]
+    )
+    assert any(
+        isinstance(item, AppInventoryQueryMiddleware)
         for item in captured["middleware"]
     )
     assert any(

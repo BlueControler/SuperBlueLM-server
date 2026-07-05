@@ -14,6 +14,7 @@ from ..tools.memory import create_memory_tools
 from ..tools.phone import create_phone_tools
 from ..tools.scenario_system import create_scenario_system_tools
 from ..tools.system import create_system_tools
+from .app_inventory_skill import AppInventoryQueryMiddleware
 from .middleware import (
     ModeToolAccessMiddleware,
     ResetAgentRunStateMiddleware,
@@ -36,6 +37,7 @@ from .trace_middleware import TraceMiddleware
 def build_middleware_stack(
     *,
     phone_gateway: DeviceGateway,
+    system_gateway: SystemToolGateway,
     phone_tool_names: set[str],
     device_scoped_tool_names: set[str],
     medical_travel_runner: MedicalTravelSopRunner | None = None,
@@ -46,6 +48,7 @@ def build_middleware_stack(
         [
             ResetAgentRunStateMiddleware(),
             TraceMiddleware(),
+            AppInventoryQueryMiddleware(system_gateway),
             MeetingMinutesSopMiddleware(),
             Scenario3DemoMiddleware(),
             MedicalTravelSopMiddleware(medical_travel_runner),
@@ -73,6 +76,7 @@ def build_agent(phone_gateway: DeviceGateway, system_gateway: SystemToolGateway)
     )
     middleware = build_middleware_stack(
         phone_gateway=phone_gateway,
+        system_gateway=system_gateway,
         phone_tool_names=phone_tool_names,
         device_scoped_tool_names=device_scoped_tool_names,
         medical_travel_runner=build_medical_travel_sop_runner(

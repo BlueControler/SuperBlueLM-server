@@ -15,6 +15,7 @@ from mobile_agent.trace import TraceEmitter
 def test_trace_stack_order_is_locked() -> None:
     stack = build_middleware_stack(
         phone_gateway=object(),
+        system_gateway=object(),
         phone_tool_names={"tap"},
         device_scoped_tool_names={"tap"},
     )
@@ -22,6 +23,7 @@ def test_trace_stack_order_is_locked() -> None:
     assert [type(item).__name__ for item in stack] == [
         "ResetAgentRunStateMiddleware",
         "TraceMiddleware",
+        "AppInventoryQueryMiddleware",
         "MeetingMinutesSopMiddleware",
         "Scenario3DemoMiddleware",
         "MedicalTravelSopMiddleware",
