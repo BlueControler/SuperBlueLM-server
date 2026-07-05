@@ -5,7 +5,7 @@ import json
 import os
 import re
 import zipfile
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -62,6 +62,36 @@ def is_meeting_minutes_sop_request(text: str) -> bool:
     )
     has_demo_scope = any(marker in normalized for marker in ("今天", "会议纪要", "会议总结"))
     return has_meeting_target and has_summary_action and has_demo_scope
+
+
+@dataclass(frozen=True)
+class MeetingMaterialCandidate:
+    title: str
+    path: str | None
+    uri: str | None
+    source: str
+    modified_time: str
+    snippet: str
+    confidence: float
+    content_length: int = 0
+
+    def ref(self) -> str:
+        return self.path or self.uri or self.title
+
+    def to_json(self) -> JsonObject:
+        payload: JsonObject = {
+            "title": self.title,
+            "source": self.source,
+            "modifiedTime": self.modified_time,
+            "snippet": self.snippet,
+            "confidence": round(self.confidence, 3),
+            "contentLength": self.content_length,
+        }
+        if self.path:
+            payload["path"] = self.path
+        if self.uri:
+            payload["uri"] = self.uri
+        return payload
 
 
 @dataclass(frozen=True)
@@ -146,6 +176,7 @@ class MeetingMinutesSopRunner:
                 "task_type": MEETING_MINUTES_TASK_TYPE,
                 "selected_file": _display_path(selected_file),
                 "candidates": [_display_path(candidate) for candidate in candidates],
+                "candidate_details": [candidate.to_json() for candidate in candidates],
                 "minutes": minutes,
                 "confirmation": {
                     "status": "needs_confirmation",
@@ -162,7 +193,12 @@ class MeetingMinutesSopRunner:
                 },
                 "sent": False,
                 "completed_steps": completed_steps,
-                "final_message": WAITING_CONFIRMATION_MESSAGE,
+                "final_message": _meeting_minutes_waiting_message(
+                    minutes=minutes,
+                    selected_file=selected_file,
+                    candidates=candidates,
+                    project_group=self.project_group,
+                ),
             }
 
         self._emit_step(
@@ -203,15 +239,19 @@ class MeetingMinutesSopRunner:
             send_tool,
         )
 
-        final_message = (
-            "会议纪要已整理完成，并已发送到项目群。"
-            if sent
-            else _send_failure_message(send_result, sender=self.sender)
+        final_message = _meeting_minutes_final_message(
+            minutes=minutes,
+            selected_file=selected_file,
+            candidates=candidates,
+            send_result=send_result,
+            sender=self.sender,
+            project_group=self.project_group,
         )
         return {
             "task_type": MEETING_MINUTES_TASK_TYPE,
             "selected_file": _display_path(selected_file),
             "candidates": [_display_path(candidate) for candidate in candidates],
+            "candidate_details": [candidate.to_json() for candidate in candidates],
             "minutes": minutes,
             "confirmation": confirmation,
             "send_result": send_result,
@@ -248,11 +288,12 @@ class MeetingMinutesSopRunner:
     def _search_files_for_today(self, today: str) -> list[Path]:
         return search_files(self._search_roots(), today)
 
-    async def _search_candidates(self, today: str, device_id: str | None) -> list[Path | str]:
+    async def _search_candidates(self, today: str, device_id: str | None) -> list[MeetingMaterialCandidate]:
         if self.file_search is not None:
             arguments: JsonObject = {
-                "keywords": ["会议", today],
+                "keywords": ["会议", "纪要", "记录", today],
                 "limit": 20,
+                "includeMetadata": True,
             }
             roots = [str(root) for root in self._search_roots()] if self.search_roots else []
             if roots:
@@ -262,15 +303,22 @@ class MeetingMinutesSopRunner:
             result = await _call_tool(self.file_search, arguments)
             candidates = _file_candidates_from_tool_result(result)
             if candidates:
-                return candidates
-        return await asyncio.to_thread(self._search_files_for_today, today)
+                return _rank_candidates(candidates, today)
+        paths = await asyncio.to_thread(self._search_files_for_today, today)
+        local_candidates = [
+            _candidate_from_path(path, today)
+            for path in paths
+        ]
+        return _rank_candidates(local_candidates, today)
 
-    async def _read_meeting_text(self, selected_file: Path | str | None, device_id: str | None) -> str:
+    async def _read_meeting_text(self, selected_file: MeetingMaterialCandidate | None, device_id: str | None) -> str:
         if selected_file is None:
             return ""
         if self.file_reader is not None:
             arguments: JsonObject = {
-                "path": str(selected_file),
+                "path": selected_file.ref(),
+                "uri": selected_file.uri or selected_file.ref(),
+                "source": selected_file.source,
                 "max_bytes": MAX_MEETING_FILE_BYTES,
             }
             if device_id:
@@ -279,7 +327,7 @@ class MeetingMinutesSopRunner:
             text = _text_from_tool_result(result)
             if text:
                 return text
-        path = selected_file if isinstance(selected_file, Path) else Path(selected_file)
+        path = Path(selected_file.ref())
         return await asyncio.to_thread(read_text_file, path)
 
     def _search_roots(self) -> tuple[Path, ...]:
@@ -407,17 +455,45 @@ def _request_device_id(request: object) -> str | None:
     return None
 
 
-def _file_candidates_from_tool_result(result: Any) -> list[str]:
+def _file_candidates_from_tool_result(result: Any) -> list[MeetingMaterialCandidate]:
     payload = _json_payload(result)
-    candidates: list[str] = []
+    candidates: list[MeetingMaterialCandidate] = []
     for item in _candidate_items(payload):
         if isinstance(item, str) and item.strip():
-            candidates.append(item.strip())
+            ref = item.strip()
+            candidates.append(
+                MeetingMaterialCandidate(
+                    title=Path(ref).name or ref,
+                    path=ref,
+                    uri=None,
+                    source="search_files",
+                    modified_time="",
+                    snippet="",
+                    confidence=0.55,
+                )
+            )
         elif isinstance(item, dict):
             path = item.get("path") or item.get("absolutePath") or item.get("uri")
             if isinstance(path, str) and path.strip():
-                candidates.append(path.strip())
-    return list(dict.fromkeys(candidates))
+                ref = path.strip()
+                title = item.get("title") or item.get("name") or Path(ref).name or ref
+                confidence = item.get("confidence")
+                candidates.append(
+                    MeetingMaterialCandidate(
+                        title=str(title),
+                        path=str(item.get("path") or item.get("absolutePath") or "") or None,
+                        uri=str(item.get("uri") or "") or None,
+                        source=str(item.get("source") or "search_files"),
+                        modified_time=str(item.get("modifiedTime") or item.get("modified_time") or ""),
+                        snippet=str(item.get("snippet") or item.get("preview") or ""),
+                        confidence=float(confidence) if isinstance(confidence, (int, float)) else 0.6,
+                        content_length=int(item.get("contentLength") or item.get("size") or 0),
+                    )
+                )
+    deduped: dict[str, MeetingMaterialCandidate] = {}
+    for candidate in candidates:
+        deduped.setdefault(candidate.ref(), candidate)
+    return list(deduped.values())
 
 
 def _candidate_items(payload: Any) -> list[Any]:
@@ -454,8 +530,120 @@ def _json_payload(result: Any) -> Any:
     return result
 
 
-def _display_path(path: Path | str | None) -> str | None:
-    return str(path) if path is not None else None
+def _display_path(path: MeetingMaterialCandidate | Path | str | None) -> str | None:
+    if path is None:
+        return None
+    if isinstance(path, MeetingMaterialCandidate):
+        return path.ref()
+    return str(path)
+
+
+def _candidate_from_path(path: Path, today: str) -> MeetingMaterialCandidate:
+    stat = path.stat()
+    snippet = _snippet_from_path(path)
+    modified_time = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+    return MeetingMaterialCandidate(
+        title=path.name,
+        path=str(path),
+        uri=path.as_uri() if path.is_absolute() else None,
+        source="local_file",
+        modified_time=modified_time,
+        snippet=snippet,
+        confidence=_candidate_confidence(
+            title=path.name,
+            modified_time=modified_time,
+            snippet=snippet,
+            content_length=stat.st_size,
+            today=today,
+        ),
+        content_length=stat.st_size,
+    )
+
+
+def _snippet_from_path(path: Path) -> str:
+    if path.suffix.lower() == ".docx":
+        text = _read_docx_text(path)
+    else:
+        raw = path.read_bytes()[:4096]
+        for encoding in ("utf-8", "utf-8-sig", "gb18030"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            text = raw.decode("utf-8", errors="replace")
+    return " ".join(_meaningful_lines(text)[:4])[:240]
+
+
+def _rank_candidates(
+    candidates: Sequence[MeetingMaterialCandidate],
+    today: str,
+) -> list[MeetingMaterialCandidate]:
+    rescored = [
+        MeetingMaterialCandidate(
+            title=candidate.title,
+            path=candidate.path,
+            uri=candidate.uri,
+            source=candidate.source,
+            modified_time=candidate.modified_time,
+            snippet=candidate.snippet,
+            confidence=max(
+                candidate.confidence,
+                _candidate_confidence(
+                    title=candidate.title,
+                    modified_time=candidate.modified_time,
+                    snippet=candidate.snippet,
+                    content_length=candidate.content_length,
+                    today=today,
+                ),
+            ),
+            content_length=candidate.content_length,
+        )
+        for candidate in candidates
+    ]
+    return sorted(
+        rescored,
+        key=lambda candidate: (
+            candidate.confidence,
+            _modified_sort_key(candidate.modified_time),
+            candidate.content_length,
+            candidate.title,
+        ),
+        reverse=True,
+    )
+
+
+def _candidate_confidence(
+    *,
+    title: str,
+    modified_time: str,
+    snippet: str,
+    content_length: int,
+    today: str,
+) -> float:
+    score = 0.2
+    lowered_title = title.lower()
+    if any(keyword.lower() in lowered_title for keyword in MEETING_FILE_KEYWORDS):
+        score += 0.25
+    if any(token.lower() in lowered_title for token in _date_tokens(today)):
+        score += 0.2
+    if today in modified_time:
+        score += 0.15
+    if 80 <= content_length <= MAX_MEETING_FILE_BYTES:
+        score += 0.1
+    if any(marker in snippet for marker in ("待办", "结论", "讨论", "风险", "负责")):
+        score += 0.1
+    return min(score, 0.99)
+
+
+def _modified_sort_key(value: str) -> float:
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def _read_docx_text(path: Path) -> str:
@@ -485,27 +673,45 @@ def _read_docx_text(path: Path) -> str:
 
 def summarize_meeting(content: str, today: str) -> str:
     lines = _meaningful_lines(content)
+    topic = _meeting_topic(lines, today)
+    conclusions = _section_lines(lines, ("结论", "决定", "共识", "目标"), fallback_count=2)
+    discussion_points = _discussion_points(lines)
     action_items = _extract_action_items(lines)
-    summary_lines = lines[:3] or ["未找到会议正文，已生成空纪要模板。"]
+    risks = _section_lines(lines, ("风险", "待确认", "阻塞", "问题"), fallback_count=0)
 
     action_table = "\n".join(
-        f"| {item['task']} | {item['owner']} | {item['deadline']} |"
+        f"| {item['task']} | {item['owner']} | {item['deadline']} | {item['evidence']} |"
         for item in action_items
     )
     if not action_table:
-        action_table = "| 暂无明确待办 | 待确认 | 待确认 |"
+        action_table = "| 暂无明确待办 | 待确认 | 待确认 | 未在会议资料中识别到明确行动项 |"
+
+    risk_lines = risks or ["暂无明确风险；发送前仍建议确认项目群、负责人和截止时间是否准确。"]
+    message_body = _group_message_body(topic, conclusions, action_items, risk_lines)
 
     return "\n".join(
         [
             f"# 会议纪要（{today}）",
             "",
-            "## 摘要",
-            *[f"- {line}" for line in summary_lines],
+            "## 会议主题",
+            topic,
+            "",
+            "## 核心结论",
+            *[f"- {line}" for line in (conclusions or ["会议资料未给出明确结论，需会后补充确认。"])],
+            "",
+            "## 讨论要点",
+            *[f"- {line}" for line in (discussion_points or ["会议正文较短，未识别到更多讨论要点。"])],
             "",
             "## 待办事项",
-            "| 事项 | 责任人 | 时间 |",
-            "| --- | --- | --- |",
+            "| 事项 | 负责人 | 截止时间 | 来源证据 |",
+            "| --- | --- | --- | --- |",
             action_table,
+            "",
+            "## 风险或待确认事项",
+            *[f"- {line}" for line in risk_lines],
+            "",
+            "## 可发送消息正文",
+            message_body,
         ]
     )
 
@@ -530,6 +736,11 @@ async def send_minutes(
 
     result = await command_runner.run(command=command, args=args, timeout=timeout)
     result_object = cast(JsonObject, to_json_value(result))
+    result_object["target"] = project_group
+    result_object["toolName"] = "feishu_cli" if sender_name in {"feishu", "lark"} else "wecom_cli"
+    message_id = _message_id_from_send_result(result_object)
+    if message_id is not None:
+        result_object["messageId"] = message_id
     return result_object
 
 
@@ -543,6 +754,79 @@ def _send_failure_message(send_result: JsonObject, *, sender: str) -> str:
         app_name = "飞书" if sender.lower() in {"feishu", "lark"} else "企业微信"
         return f"{app_name} CLI 未安装或未加入 PATH，请配置 {env_var} 后重试。"
     return "会议纪要已整理完成，但发送到项目群失败，请检查 CLI 输出后重试。"
+
+
+def _message_id_from_send_result(send_result: Mapping[str, Any]) -> str | None:
+    for key in ("messageId", "message_id", "id"):
+        value = send_result.get(key)
+        if isinstance(value, (str, int)) and str(value):
+            return str(value)
+    stdout = send_result.get("stdout")
+    if isinstance(stdout, Mapping):
+        return _message_id_from_send_result(stdout)
+    return None
+
+
+def _meeting_minutes_waiting_message(
+    *,
+    minutes: str,
+    selected_file: MeetingMaterialCandidate | None,
+    candidates: Sequence[MeetingMaterialCandidate],
+    project_group: str,
+) -> str:
+    material_line = _material_line(selected_file, candidates)
+    return "\n".join(
+        [
+            "已整理会议后处理草稿，发送到项目群前需要你确认。",
+            "",
+            material_line,
+            "",
+            minutes,
+            "",
+            f"待确认动作：发送到 {project_group}。",
+        ]
+    )
+
+
+def _meeting_minutes_final_message(
+    *,
+    minutes: str,
+    selected_file: MeetingMaterialCandidate | None,
+    candidates: Sequence[MeetingMaterialCandidate],
+    send_result: JsonObject,
+    sender: str,
+    project_group: str,
+) -> str:
+    sender_label = "飞书" if sender.lower() in {"feishu", "lark"} else "企业微信"
+    status = "成功" if _send_result_ok(send_result) else f"失败：{_send_failure_message(send_result, sender=sender)}"
+    message_id = send_result.get("messageId") or send_result.get("stdout")
+    message_line = f"消息编号/输出：{message_id}" if message_id else ""
+    return "\n".join(
+        part
+        for part in [
+            "已完成会议后处理。",
+            "",
+            _material_line(selected_file, candidates),
+            "",
+            minutes,
+            "",
+            f"已发送到：{sender_label} / {project_group}",
+            f"发送状态：{status}",
+            message_line,
+        ]
+        if part
+    )
+
+
+def _material_line(
+    selected_file: MeetingMaterialCandidate | None,
+    candidates: Sequence[MeetingMaterialCandidate],
+) -> str:
+    if selected_file is None:
+        return "会议资料：未找到匹配资料，已基于空内容生成待补充纪要。"
+    if len(candidates) > 1:
+        return f"会议资料：已找到 {len(candidates)} 份会议资料，采用 {selected_file.title}。"
+    return f"会议资料：{selected_file.title}"
 
 
 def _request_matches(messages: Sequence[BaseMessage]) -> bool:
@@ -571,6 +855,7 @@ def _meeting_minutes_payload(result: JsonObject) -> JsonObject:
         "taskType": result.get("task_type"),
         "selectedFile": result.get("selected_file"),
         "candidates": result.get("candidates", []),
+        "candidateDetails": result.get("candidate_details", []),
         "minutes": result.get("minutes"),
         "confirmation": result.get("confirmation", {}),
         "sendResult": result.get("send_result", {}),
@@ -593,7 +878,15 @@ def _create_meeting_minutes_confirmation(
     tool_name: str,
 ) -> ConfirmationTransaction:
     target_app = "飞书" if sender.lower() in {"feishu", "lark"} else "企业微信"
-    preview = f"发送到：{project_group}\n\n{minutes[:800]}"
+    preview = "\n".join(
+        [
+            f"发送对象：{target_app} / {project_group}",
+            f"待办数量：{_action_item_count(minutes)}",
+            f"风险提示：请确认项目群、负责人和截止时间准确，确认后将真实发送。",
+            "正文预览：",
+            minutes[:900],
+        ]
+    )
     return create_confirmation(
         task_title="会议纪要发送",
         operation="发送会议纪要到项目群",
@@ -612,6 +905,21 @@ def _create_meeting_minutes_confirmation(
             tool_name=tool_name,
         ),
     )
+
+
+def _action_item_count(minutes: str) -> int:
+    count = 0
+    in_table = False
+    for line in minutes.splitlines():
+        if line.startswith("| 事项 |") or line.startswith("| --- |"):
+            in_table = True
+            continue
+        if in_table and line.startswith("|"):
+            if "暂无明确待办" not in line:
+                count += 1
+        elif in_table and not line.strip():
+            break
+    return count
 
 
 def _meeting_minutes_confirm_handler(
@@ -647,6 +955,13 @@ def _meeting_minutes_confirm_handler(
                 confirmation_id=None,
                 send_result=send_result,
             )
+            result_event = _meeting_minutes_task_result_event(
+                status="completed",
+                minutes=minutes,
+                project_group=project_group,
+                sender=sender,
+                send_result=send_result,
+            )
         else:
             terminal = _meeting_minutes_confirmation_task_progress_event(
                 transaction,
@@ -657,9 +972,44 @@ def _meeting_minutes_confirm_handler(
                 confirmation_id=None,
                 send_result=send_result,
             )
-        return [running, terminal]
+            result_event = _meeting_minutes_task_result_event(
+                status="failed",
+                minutes=minutes,
+                project_group=project_group,
+                sender=sender,
+                send_result=send_result,
+            )
+        return [running, terminal, result_event]
 
     return handle
+
+
+def _meeting_minutes_task_result_event(
+    *,
+    status: str,
+    minutes: str,
+    project_group: str,
+    sender: str,
+    send_result: JsonObject,
+) -> JsonObject:
+    return {
+        "type": "task_result",
+        "taskType": MEETING_MINUTES_TASK_TYPE,
+        "status": status,
+        "target": project_group,
+        "toolName": send_result.get("toolName")
+        or ("feishu_cli" if sender.lower() in {"feishu", "lark"} else "wecom_cli"),
+        "messageId": send_result.get("messageId"),
+        "result": send_result,
+        "finalMessage": _meeting_minutes_final_message(
+            minutes=minutes,
+            selected_file=None,
+            candidates=[],
+            send_result=send_result,
+            sender=sender,
+            project_group=project_group,
+        ),
+    }
 
 
 def _meeting_minutes_confirmation_task_progress_event(
@@ -777,12 +1127,15 @@ def _extract_action_items(lines: Sequence[str]) -> list[JsonObject]:
                 "task": task,
                 "owner": owner,
                 "deadline": _extract_deadline(line),
+                "evidence": line,
             }
         )
     return items[:12]
 
 
 def _looks_like_action_item(line: str) -> bool:
+    if re.match(r"^(主题|结论|决定|共识|讨论|风险|问题|待确认)[：:]", line):
+        return False
     return any(
         keyword in line
         for keyword in (
@@ -814,6 +1167,79 @@ def _extract_deadline(line: str) -> str:
         if match:
             return match.group(0)
     return "待确认"
+
+
+def _meeting_topic(lines: Sequence[str], today: str) -> str:
+    for line in lines:
+        match = re.match(r"^(?:主题|会议主题|标题)[：:]\s*(?P<topic>.+)$", line)
+        if match:
+            return match.group("topic").strip()
+    for line in lines:
+        if any(keyword in line for keyword in ("会议", "例会", "复盘", "评审")) and len(line) <= 48:
+            return line
+    return f"{today} 项目会议"
+
+
+def _section_lines(
+    lines: Sequence[str],
+    prefixes: Sequence[str],
+    *,
+    fallback_count: int,
+) -> list[str]:
+    matched: list[str] = []
+    for line in lines:
+        for prefix in prefixes:
+            match = re.match(rf"^{re.escape(prefix)}[：:]\s*(?P<value>.+)$", line)
+            if match:
+                matched.append(match.group("value").strip())
+                break
+    if matched:
+        return matched[:6]
+    if fallback_count <= 0:
+        return []
+    return [
+        line
+        for line in lines
+        if not _looks_like_action_item(line)
+        and not re.match(r"^(主题|风险|问题|待确认)[：:]", line)
+    ][:fallback_count]
+
+
+def _discussion_points(lines: Sequence[str]) -> list[str]:
+    explicit = _section_lines(lines, ("讨论", "议题", "要点"), fallback_count=0)
+    if explicit:
+        return explicit[:8]
+    points = []
+    for line in lines:
+        if _looks_like_action_item(line):
+            continue
+        if re.match(r"^(主题|结论|决定|共识|风险|问题|待确认)[：:]", line):
+            continue
+        points.append(line)
+    return points[:8]
+
+
+def _group_message_body(
+    topic: str,
+    conclusions: Sequence[str],
+    action_items: Sequence[JsonObject],
+    risks: Sequence[str],
+) -> str:
+    actions = "\n".join(
+        f"{index}. {item['owner']}：{item['task']}（截止：{item['deadline']}）"
+        for index, item in enumerate(action_items, start=1)
+    ) or "暂无明确待办，需会后确认。"
+    conclusion_text = "；".join(conclusions) if conclusions else "会议结论待补充确认。"
+    risk_text = "；".join(risks) if risks else "暂无明确风险。"
+    return "\n".join(
+        [
+            f"【会议纪要】{topic}",
+            f"核心结论：{conclusion_text}",
+            "待办事项：",
+            actions,
+            f"风险/待确认：{risk_text}",
+        ]
+    )
 
 
 def _append_completed_step(

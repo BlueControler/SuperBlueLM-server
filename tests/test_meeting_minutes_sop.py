@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from pathlib import Path
 from typing import Any, Sequence
@@ -173,7 +174,9 @@ def test_meeting_minutes_sop_runs_fixed_closed_loop(
         (4, 5, "第 4/5 步：等待确认是否发送到项目群", "needs_confirmation"),
         (5, 5, "第 5/5 步：正在发送到项目群", "wecom_cli"),
     ]
-    assert result["final_message"] == "会议纪要已整理完成，并已发送到项目群。"
+    assert "已完成会议后处理" in result["final_message"]
+    assert "待办事项" in result["final_message"]
+    assert "发送状态：成功" in result["final_message"]
 
 
 def test_meeting_minutes_sop_reads_today_docx_record(
@@ -220,22 +223,106 @@ def test_meeting_minutes_sop_prefers_scenario_file_tools_with_device_id() -> Non
     assert "手机侧会议记录读取" in result["minutes"]
     assert tools.calls == [
         (
-            "search_files",
-            {
-                "keywords": ["会议", "2026-07-02"],
-                "limit": 20,
-                "device_id": "device-1",
-            },
-        ),
+                "search_files",
+                {
+                    "keywords": ["会议", "纪要", "记录", "2026-07-02"],
+                    "limit": 20,
+                    "includeMetadata": True,
+                    "device_id": "device-1",
+                },
+            ),
         (
             "read_text_file",
-            {
-                "path": "/sdcard/Documents/2026-07-02-项目会议记录.txt",
-                "max_bytes": 262144,
-                "device_id": "device-1",
-            },
+                {
+                    "path": "/sdcard/Documents/2026-07-02-项目会议记录.txt",
+                    "uri": "/sdcard/Documents/2026-07-02-项目会议记录.txt",
+                    "source": "search_files",
+                    "max_bytes": 262144,
+                    "device_id": "device-1",
+                },
         ),
     ]
+
+
+def test_meeting_minutes_selects_recent_meeting_candidate_and_returns_structured_materials(
+    tmp_path: Path,
+) -> None:
+    old_notes = tmp_path / "2026-07-02-会议记录.md"
+    recent_notes = tmp_path / "2026-07-02-项目会议纪要.md"
+    random_notes = tmp_path / "2026-07-02-随手记.md"
+    old_notes.write_text("旧会议记录\n张三：明天整理旧风险。", encoding="utf-8")
+    recent_notes.write_text(
+        "\n".join(
+            [
+                "主题：Echo 端到端演示推进会",
+                "结论：优先打通会议资料搜索、用户确认和项目群发送闭环。",
+                "讨论：前端需要展示确认后的执行结果。",
+                "张乐：今晚前完成高德多方案规划自测。",
+                "潘华宇：明天前补齐确认后状态卡联动。",
+                "风险：企业微信 CLI 可能未登录。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    random_notes.write_text("这不是会议资料", encoding="utf-8")
+    old_ts = 1_788_200_000
+    recent_ts = 1_788_300_000
+    os.utime(old_notes, (old_ts, old_ts))
+    os.utime(recent_notes, (recent_ts, recent_ts))
+    os.utime(random_notes, (recent_ts + 100, recent_ts + 100))
+    runner = MeetingMinutesSopRunner(
+        search_roots=(tmp_path,),
+        now=lambda: "2026-07-02",
+        command_runner=_FakeCommandRunner(),
+        auto_confirm=True,
+    )
+
+    result = asyncio.run(runner.run())
+
+    assert result["selected_file"] == str(recent_notes)
+    candidates = result["candidate_details"]
+    assert len(candidates) == 2
+    assert candidates[0]["title"] == "2026-07-02-项目会议纪要.md"
+    assert candidates[0]["path"] == str(recent_notes)
+    assert candidates[0]["source"] == "local_file"
+    assert candidates[0]["modifiedTime"]
+    assert "Echo 端到端演示推进会" in candidates[0]["snippet"]
+    assert candidates[0]["confidence"] > candidates[1]["confidence"]
+    assert "已找到 2 份会议资料，采用 2026-07-02-项目会议纪要.md" in result["final_message"]
+
+
+def test_meeting_minutes_generates_full_structured_minutes() -> None:
+    content = "\n".join(
+        [
+            "主题：Echo 端到端演示推进会",
+            "结论：会议场景先打通真实搜索、确认和发送。",
+            "讨论：不能只返回模板文本。",
+            "讨论：前端要把确认后的结果写回聊天区。",
+            "张乐：今晚前完成高德多方案规划自测。",
+            "潘华宇：明天前补齐确认后状态卡联动。",
+            "风险：企业微信 CLI 可能未登录。",
+        ]
+    )
+
+    minutes = json.loads(
+        json.dumps(
+            __import__(
+                "mobile_agent.agent.meeting_minutes_sop",
+                fromlist=["summarize_meeting"],
+            ).summarize_meeting(content, "2026-07-02"),
+            ensure_ascii=False,
+        )
+    )
+
+    assert "会议主题" in minutes
+    assert "核心结论" in minutes
+    assert "讨论要点" in minutes
+    assert "待办事项" in minutes
+    assert "风险或待确认事项" in minutes
+    assert "可发送消息正文" in minutes
+    assert "来源证据" in minutes
+    assert "张乐" in minutes
+    assert "潘华宇" in minutes
 
 
 def test_meeting_minutes_middleware_short_circuits_fixed_demo_request(
@@ -268,7 +355,8 @@ def test_meeting_minutes_middleware_short_circuits_fixed_demo_request(
 
     assert isinstance(response, ModelResponse)
     assert isinstance(response.result[0], AIMessage)
-    assert response.result[0].content == "会议纪要已整理完成，并已发送到项目群。"
+    assert "已完成会议后处理" in response.result[0].content
+    assert "待办事项" in response.result[0].content
     structured_payload = response.result[0].additional_kwargs["meeting_minutes"]
     assert structured_payload["taskType"] == "meeting_minutes_send"
     assert structured_payload["sent"] is True
@@ -362,14 +450,20 @@ def test_meeting_minutes_confirmation_confirm_sends_minutes_to_project_group(
     assert command == "wecom-cli"
     assert args[:4] == ["message", "send", "--to", "项目群"]
     assert "会议纪要" in args[-1]
-    assert [event["status"] for event in payload["events"]] == ["running", "completed"]
-    assert all(event["dryRun"] is False for event in payload["events"])
-    assert all(event["currentStep"] == 5 for event in payload["events"])
-    assert all(event["totalSteps"] == 5 for event in payload["events"])
-    assert all(event["phase"] == "meeting_minutes_sop" for event in payload["events"])
-    assert payload["events"][0]["toolName"] == "wecom_cli"
-    assert payload["events"][0]["message"] == "第 5/5 步：正在发送到项目群"
-    assert payload["events"][1]["message"] == "第 5/5 步：会议纪要已发送到项目群"
+    progress_events = [event for event in payload["events"] if event["type"] == "task_progress"]
+    result_events = [event for event in payload["events"] if event["type"] == "task_result"]
+    assert [event["status"] for event in progress_events] == ["running", "completed"]
+    assert all(event["dryRun"] is False for event in progress_events)
+    assert all(event["currentStep"] == 5 for event in progress_events)
+    assert all(event["totalSteps"] == 5 for event in progress_events)
+    assert all(event["phase"] == "meeting_minutes_sop" for event in progress_events)
+    assert progress_events[0]["toolName"] == "wecom_cli"
+    assert progress_events[0]["message"] == "第 5/5 步：正在发送到项目群"
+    assert progress_events[1]["message"] == "第 5/5 步：会议纪要已发送到项目群"
+    assert progress_events[1]["result"]["target"] == "项目群"
+    assert progress_events[1]["result"]["toolName"] == "wecom_cli"
+    assert result_events[0]["status"] == "completed"
+    assert "已完成会议后处理" in result_events[0]["finalMessage"]
 
 
 def test_meeting_minutes_confirmation_reports_missing_cli_configuration(
@@ -393,11 +487,15 @@ def test_meeting_minutes_confirmation_reports_missing_cli_configuration(
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "confirmed"
-    assert [event["status"] for event in payload["events"]] == ["running", "failed"]
-    assert payload["events"][1]["toolName"] == "wecom_cli"
-    assert payload["events"][1]["message"] == (
+    progress_events = [event for event in payload["events"] if event["type"] == "task_progress"]
+    result_events = [event for event in payload["events"] if event["type"] == "task_result"]
+    assert [event["status"] for event in progress_events] == ["running", "failed"]
+    assert progress_events[1]["toolName"] == "wecom_cli"
+    assert progress_events[1]["message"] == (
         "企业微信 CLI 未安装或未加入 PATH，请配置 WECOM_CLI_BIN 后重试。"
     )
+    assert result_events[0]["status"] == "failed"
+    assert "企业微信 CLI 未安装或未加入 PATH" in result_events[0]["finalMessage"]
 
 
 def test_default_meeting_file_lookup_runs_off_event_loop_thread(
