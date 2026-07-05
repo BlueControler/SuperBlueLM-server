@@ -10,6 +10,7 @@ from mobile_agent.agent.middleware import (
 from mobile_agent.agent.medical_travel_sop import MedicalTravelSopMiddleware
 from mobile_agent.agent.meeting_minutes_sop import MeetingMinutesSopMiddleware
 from mobile_agent.agent.scenarios.app_inventory_skill import AppInventoryQueryMiddleware
+from mobile_agent.agent.scenarios.weather_advice_skill import WeatherAdviceMiddleware
 
 
 class _Gateway:
@@ -47,6 +48,10 @@ def test_factory_wires_main_agent_to_raw_phone_tools(
     )
     assert any(
         isinstance(item, AppInventoryQueryMiddleware)
+        for item in captured["middleware"]
+    )
+    assert any(
+        isinstance(item, WeatherAdviceMiddleware)
         for item in captured["middleware"]
     )
     assert any(

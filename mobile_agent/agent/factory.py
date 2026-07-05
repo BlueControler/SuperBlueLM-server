@@ -32,6 +32,7 @@ from .risk_gate import HighRiskActionGateMiddleware
 from .scenario3_demo import Scenario3DemoMiddleware
 from .scenarios.app_inventory_skill import AppInventoryQueryMiddleware
 from .scenarios.open_app_skill import OpenAppSkillMiddleware
+from .scenarios.weather_advice_skill import WeatherAdviceMiddleware
 from .trace_middleware import TraceMiddleware
 
 
@@ -51,6 +52,7 @@ def build_middleware_stack(
             TraceMiddleware(),
             OpenAppSkillMiddleware(phone_gateway, system_gateway),
             AppInventoryQueryMiddleware(system_gateway),
+            WeatherAdviceMiddleware(),
             MeetingMinutesSopMiddleware(),
             Scenario3DemoMiddleware(),
             MedicalTravelSopMiddleware(medical_travel_runner),
